@@ -1,0 +1,28 @@
+# =============================================================================
+# HELOC VoIP Bridge — Python Dependencies
+# =============================================================================
+# Install: pip install -r requirements.txt
+# Recommended: Use a virtual environment (venv, uv, or conda)
+# =============================================================================
+
+# -- Core Framework --
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# -- Cartesia Line SDK (Voice Agent Orchestration) --
+# Provides: LlmAgent, LlmConfig, VoiceAgentApp, tool decorators
+# Internally uses LiteLLM for 100+ LLM provider support
+cartesia-line>=0.2.8
+
+# -- WebSocket Client --
+# For connecting to Cartesia's agent streaming endpoint from our bridge
+websockets>=12.0
+
+# -- Environment & Config --
+python-dotenv>=1.0.0
+
+# -- Audio Transcoding --
+# audioop is deprecated in Python 3.11+ and removed in 3.13.
+# audioop-lts is a drop-in replacement maintained for newer Python versions.
+# Only installed when needed (Python 3.13+).
+audioop-lts>=0.0.1; python_version >= "3.13"

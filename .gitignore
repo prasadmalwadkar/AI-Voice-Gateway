@@ -1,0 +1,28 @@
+# Secret Credentials
+.env
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDEs / Editor defaults
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+
+# Log files
+*.log
