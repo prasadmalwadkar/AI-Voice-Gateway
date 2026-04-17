@@ -8,6 +8,7 @@
 # -- Core Framework --
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
 
 # -- Cartesia Line SDK (Voice Agent Orchestration) --
 # Provides: LlmAgent, LlmConfig, VoiceAgentApp, tool decorators
