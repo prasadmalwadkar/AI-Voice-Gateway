@@ -12,7 +12,7 @@ Usage:
     uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
     # For Cartesia-native testing (no Twilio required)
-    python -m agent.heloc_agent
+    python -m agent.main_agent
 
 Endpoints once running:
     GET  /voice         → TwiML for Twilio webhook

@@ -16,10 +16,10 @@ WebSocket handling). This separation exists for two reasons:
 
 Usage:
     # For Cartesia native testing (CLI / browser):
-    python -m agent.heloc_agent
+    python -m agent.main_agent
 
     # For Twilio telephony bridge (imported by app/main.py):
-    from agent.heloc_agent import get_agent, create_voice_app
+    from agent.main_agent import get_agent, create_voice_app
 """
 
 import os
@@ -160,7 +160,7 @@ def create_voice_app() -> VoiceAgentApp:
 # Standalone entry point for Cartesia-native testing (no Twilio required).
 #
 # Usage:
-#   GEMINI_API_KEY=your-key python -m agent.heloc_agent
+#   GEMINI_API_KEY=your-key python -m agent.main_agent
 #
 # Then in another terminal:
 #   cartesia chat 8000

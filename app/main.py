@@ -34,7 +34,7 @@ import uuid
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from agent.heloc_agent import create_voice_app
+from agent.main_agent import create_voice_app
 from app.logging_config import CallLogger, setup_logging
 from app.twilio_bridge import TwilioBridge
 
@@ -53,25 +53,25 @@ module_logger = logging.getLogger("voip.main")
 voice_app = create_voice_app()
 
 # Access the internal FastAPI app from VoiceAgentApp.
-# The VoiceAgentApp stores it as `.app` in the current SDK version (v0.2.8).
-# If this changes, the except block creates a standalone app as fallback.
+# The SDK stores it as `.fastapi_app` (confirmed in cartesia-line v0.2.8 source).
+# If this changes in a future SDK version, the fallback creates a standalone app.
 try:
-    app: FastAPI = voice_app.app  # type: ignore[union-attr]
+    app: FastAPI = voice_app.fastapi_app  # type: ignore[union-attr]
     module_logger.info(
         "Successfully extended VoiceAgentApp — "
         "Cartesia native routes + Twilio routes on same server"
     )
 except AttributeError:
-    # Fallback: VoiceAgentApp doesn't expose .app in this SDK version.
+    # Fallback: VoiceAgentApp's internal structure changed.
     # Create a standalone FastAPI app. Cartesia native testing can still
-    # be done by running `python -m agent.heloc_agent` separately.
+    # be done by running `python -m agent.main_agent` separately.
     module_logger.warning(
-        "VoiceAgentApp.app not accessible — creating standalone FastAPI. "
-        "Run `python -m agent.heloc_agent` separately for Cartesia CLI testing."
+        "VoiceAgentApp.fastapi_app not accessible — creating standalone FastAPI. "
+        "Run `python -m agent.main_agent` separately for Cartesia CLI testing."
     )
     app = FastAPI(
-        title="HELOC VoIP Bridge",
-        description="West Capital Lending — HELOC Application Voice Agent",
+        title="AI Voice Gateway",
+        description="AI Voice Gateway — Telephony Agent Bridge",
         version="1.0.0-stage1",
     )
 
@@ -249,7 +249,7 @@ async def health_check():
     """
     return {
         "status": "healthy",
-        "service": "heloc-voip-bridge",
+        "service": "AI-Voice-Gateway",
         "version": "1.0.0-stage1",
         "stage": "1",
     }

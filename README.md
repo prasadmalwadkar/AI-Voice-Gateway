@@ -42,7 +42,7 @@ You can chat directly with your LLM reasoning agent right in your terminal, enti
 
 Start the standalone Agent:
 ```bash
-python -m agent.heloc_agent
+python -m agent.main_agent
 ```
 
 Then, in a second terminal, utilize the Cartesia CLI. *If you haven't installed it, run: `curl -fsSL https://cartesia.sh | sh`*.
