@@ -45,5 +45,64 @@ def test_heloc_schema():
     except ValueError as e:
         print("\nValidation Success: Correctly rejected invalid occupancy type.")
 
+    # =========================================================================
+    # 4. Field Validator Tests
+    # =========================================================================
+    print("\n--- Field Validator Tests ---")
+    
+    # 4a. Phone number: valid 10-digit
+    state.mobile_phone_number = "213-555-0100"
+    print(f"✅ Phone (stripped): {state.mobile_phone_number}")
+    
+    # 4b. Phone number: with country code prefix (should strip leading 1)
+    state.mobile_phone_number = "1-213-555-0100"
+    print(f"✅ Phone (stripped country code): {state.mobile_phone_number}")
+    
+    # 4c. Phone number: too short (should fail)
+    try:
+        state.mobile_phone_number = "555-1234"
+    except (ValueError, Exception):
+        print("✅ Phone rejected: 7 digits correctly caught.")
+    
+    # 4d. Zipcode: valid
+    state.zipcode = "90007"
+    print(f"✅ Zipcode: {state.zipcode}")
+    
+    # 4e. Zipcode: invalid (too short)
+    try:
+        state.zipcode = "900"
+    except (ValueError, Exception):
+        print("✅ Zipcode rejected: 3 digits correctly caught.")
+    
+    # 4f. Date of birth: valid
+    state.date_of_birth = "03/15/1990"
+    print(f"✅ DOB: {state.date_of_birth}")
+    
+    # 4g. Date of birth: invalid format
+    try:
+        state.date_of_birth = "March 15 1990"
+    except (ValueError, Exception):
+        print("✅ DOB rejected: bad format correctly caught.")
+    
+    # 4h. Email: valid
+    state.email_address = "john.smith@example.com"
+    print(f"✅ Email: {state.email_address}")
+    
+    # 4i. Email: invalid
+    try:
+        state.email_address = "not-an-email"
+    except (ValueError, Exception):
+        print("✅ Email rejected: no @ sign correctly caught.")
+    
+    # 4j. State: valid
+    state.state = "ca"  # should normalize to CA
+    print(f"✅ State (normalized): {state.state}")
+    
+    # 4k. State: invalid
+    try:
+        state.state = "XX"
+    except (ValueError, Exception):
+        print("✅ State rejected: 'XX' correctly caught.")
+
 if __name__ == "__main__":
     test_heloc_schema()

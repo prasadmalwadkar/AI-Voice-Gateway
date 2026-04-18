@@ -28,6 +28,8 @@ import logging
 from line.llm_agent import LlmAgent, LlmConfig, end_call
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 
+from agent.state_manager import update_application_state, reset_state
+
 logger = logging.getLogger("voip.agent")
 
 
@@ -43,9 +45,16 @@ logger = logging.getLogger("voip.agent")
 #   responses cause the caller to zone out or interrupt mid-sentence.
 # =============================================================================
 SYSTEM_PROMPT = """\
-You are a professional mortgage assistant for West Capital Lending. \
-Your goal is to help users start their HELOC (Home Equity Line of Credit) \
-application.
+You are a mortgage intake specialist for West Capital Lending. Your primary \
+directive is to populate the HELOC application state using the \
+update_application_state tool.
+
+# Core Directive
+- After every piece of information the caller shares, IMMEDIATELY call the \
+  update_application_state tool with the extracted fields.
+- Wait for the tool's response to see which fields are still missing.
+- Do NOT ask for information that has already been captured.
+- Ask for ONE or TWO related fields at a time — never overwhelm the caller.
 
 # Communication Guidelines
 - Keep responses under 35 words. Phone callers lose patience with long answers.
@@ -55,15 +64,17 @@ application.
 - Speak naturally — no bullet points, numbered lists, or special characters.
 - Spell out numbers and dates verbally: "January fifteenth" not "1/15".
 
-# Conversation Flow
-1. Greet the caller and ask for the property address (this is always first \
-   because the property is the HELOC collateral).
-2. Ask for the estimated property value.
-3. Ask for the desired credit line amount.
-4. Ask for the caller's full name.
-5. Ask for their best contact phone number.
-6. Confirm the information back to the caller.
-7. Thank them and let them know a loan officer will follow up within 24 hours.
+# Conversation Flow (follow the tool's guidance on what to ask next)
+1. Property address (street, city, state, zipcode).
+2. Ownership type (sole or joint) and occupancy (primary, secondary, investment).
+3. Whether the property is currently for sale.
+4. Annual pre-tax income and primary source of income.
+5. Legal name (first, middle, last, suffix).
+6. Date of birth.
+7. Mobile phone number and email address.
+8. Verbal consent to Privacy Policy / Terms of Service.
+9. Verbal consent to Electronic Communications Policy and soft credit pull.
+10. Once ALL fields are collected, confirm the details back to the caller.
 
 # Rules
 - If the caller asks about rates or terms, say: "Our loan officers can \
@@ -115,16 +126,21 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
         getattr(call_request, "call_id", "unknown"),
     )
 
+    # Reset application state for this new call — prevents cross-call
+    # data leakage (e.g., caller B seeing caller A's address).
+    reset_state()
+
     agent = LlmAgent(
         # LiteLLM model string: "provider/model-name"
-        # gemini/gemini-2.0-flash is cost-effective with fast inference,
+        # gemini/gemini-2.5-flash is cost-effective with fast inference,
         # ideal for real-time voice where latency = bad UX.
         model="gemini/gemini-2.5-flash",
         api_key=os.getenv("GEMINI_API_KEY"),
         tools=[
-            # Stage 1: Only end_call is needed.
-            # Stage 2 will add: save_property_address, validate_zipcode,
-            # lookup_property_value, submit_application, etc.
+            # Loopback tool: extracts caller data → updates state → returns
+            # missing fields back to the LLM so it knows what to ask next.
+            update_application_state,
+            # End call: agent calls this after saying goodbye.
             end_call,
         ],
         config=LlmConfig(

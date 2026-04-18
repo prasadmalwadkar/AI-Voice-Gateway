@@ -24,6 +24,7 @@ Design decisions:
 import logging
 from typing import Annotated, Optional
 
+from pydantic import ValidationError
 from line.llm_agent import loopback_tool
 
 from agent.schema import HelocApplicationState, OccupancyType, OwnershipType, IncomeSource
@@ -150,6 +151,7 @@ async def update_application_state(
     
     # Collect which fields were actually provided in this call
     updates = {}
+    validation_errors = []
     local_vars = {
         "address_line_1": address_line_1,
         "apt_suite": apt_suite,
@@ -175,28 +177,41 @@ async def update_application_state(
     
     for field_name, value in local_vars.items():
         if value is not None:
-            setattr(application_state, field_name, value)
-            updates[field_name] = value
+            try:
+                setattr(application_state, field_name, value)
+                updates[field_name] = value
+            except (ValidationError, ValueError) as e:
+                # Validator rejected this value — tell the LLM what went wrong
+                # so it can ask the caller to correct it.
+                error_msg = str(e).split("\n")[-1].strip() if "\n" in str(e) else str(e)
+                validation_errors.append(f"{field_name}: {error_msg}")
+                logger.warning("Validation failed for %s='%s': %s", field_name, value, error_msg)
     
-    if not updates:
+    if not updates and not validation_errors:
         return "No fields were updated. Please extract information from the user's speech before calling this tool."
     
-    # Log the update
-    updated_names = ", ".join(updates.keys())
-    logger.info("State updated — fields: %s", updated_names)
-    logger.debug("Current state: %s", application_state.model_dump(exclude_none=True))
+    # Build response parts
+    parts = []
+    
+    # Report validation errors first so the LLM knows to re-ask
+    if validation_errors:
+        parts.append(f"VALIDATION ERRORS — please ask the caller to correct: {'; '.join(validation_errors)}")
+    
+    if updates:
+        updated_names = ", ".join(updates.keys())
+        logger.info("State updated — fields: %s", updated_names)
+        logger.debug("Current state: %s", application_state.model_dump(exclude_none=True))
+        parts.append(f"Updated: {updated_names}")
     
     # Build the feedback message for the LLM
     missing = get_missing_fields()
     
     if not missing:
-        return (
-            f"Updated: {updated_names}. "
+        parts.append(
             "ALL required fields are now collected! "
             "Please confirm the information with the caller and proceed to submit."
         )
+    else:
+        parts.append(f"Still needed from the caller: {', '.join(missing)}")
     
-    return (
-        f"Updated: {updated_names}. "
-        f"Still needed from the caller: {', '.join(missing)}."
-    )
+    return ". ".join(parts) + "."
