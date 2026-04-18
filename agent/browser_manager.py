@@ -43,6 +43,15 @@ logger = logging.getLogger("voip.browser")
 # The entry-point URL for the HELOC registration form.
 HELOC_REGISTER_URL = "https://heloc.westcapitallending.com/account/heloc/register"
 
+# ---------------------------------------------------------------------------
+# CSS Selectors — captured from the live West Capital Lending form.
+# Centralised here so a future UI change only requires one update.
+# ---------------------------------------------------------------------------
+SEL_ADDRESS_INPUT = "input[placeholder='Search for your address']"
+SEL_AUTOCOMPLETE_LIST = "ul[role='listbox']"
+# Skips the "Address not listed" option at the top of the dropdown.
+SEL_FIRST_SUGGESTION = "li[role='option']:not([id*='not-listed'])"
+
 
 class BrowserManager:
     """Manages the full lifecycle of a Chromium browser for HELOC form automation.
@@ -169,6 +178,81 @@ class BrowserManager:
                 "Navigation failed — url=%s. The page may be down or unreachable.",
                 HELOC_REGISTER_URL,
             )
+            raise
+
+    # ------------------------------------------------------------------
+    # Form Interaction — address autocomplete
+    # ------------------------------------------------------------------
+
+    async def select_address(self, address: str) -> None:
+        """Type an address into the search field and select the first autocomplete match.
+
+        Workflow:
+        1. Simulate human-speed typing (``delay=100``) into the address
+           input to trigger the site's autocomplete API.
+        2. Wait up to 3 seconds for the suggestion dropdown to appear.
+        3. Click the first real suggestion (skipping "Address not listed").
+        4. Wait for ``networkidle`` so City, State, and Zipcode fields are
+           auto-populated by the site.
+
+        If the dropdown never appears (API timeout, network issue, etc.),
+        the method falls back to ``page.fill()`` and logs a warning so
+        the caller can handle City/State/Zip manually.
+
+        Args:
+            address: The street address string to type (e.g. "325 W Adams Blvd").
+
+        Raises:
+            RuntimeError: If the browser is not running.
+        """
+        page = self.page  # will raise if not running
+
+        logger.info("Selecting address — typing '%s' into autocomplete field.", address)
+
+        try:
+            # 1. Clear any previous value and type slowly to trigger autocomplete
+            await page.click(SEL_ADDRESS_INPUT)
+            await page.fill(SEL_ADDRESS_INPUT, "")  # clear existing text
+            await page.type(SEL_ADDRESS_INPUT, address, delay=100)
+            logger.debug("Typed '%s' into address field.", address)
+
+            # 2. Wait for the autocomplete dropdown to appear (3s timeout)
+            try:
+                await page.wait_for_selector(
+                    SEL_AUTOCOMPLETE_LIST,
+                    state="visible",
+                    timeout=3_000,
+                )
+                logger.debug("Autocomplete dropdown visible.")
+
+                # 3. Click the first real suggestion
+                first_option = page.locator(SEL_FIRST_SUGGESTION).first
+                suggestion_text = await first_option.text_content()
+                await first_option.click()
+                logger.info(
+                    "Selected autocomplete suggestion — '%s'",
+                    (suggestion_text or "").strip(),
+                )
+
+                # 4. Wait for the site to auto-populate City / State / Zip
+                await page.wait_for_load_state("networkidle")
+                logger.info(
+                    "Address fields auto-populated after selecting '%s'.",
+                    (suggestion_text or "").strip(),
+                )
+
+            except Exception:
+                # ---------- SAFETY FALLBACK ----------
+                # Dropdown never appeared — fill the field directly.
+                logger.warning(
+                    "Autocomplete dropdown did not appear within 3s for '%s'. "
+                    "Falling back to direct fill — City/State/Zip may need manual entry.",
+                    address,
+                )
+                await page.fill(SEL_ADDRESS_INPUT, address)
+
+        except Exception:
+            logger.exception("Failed during address selection for '%s'.", address)
             raise
 
     async def shutdown(self) -> None:
