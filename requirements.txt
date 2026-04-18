@@ -27,3 +27,8 @@ python-dotenv>=1.0.0
 # audioop-lts is a drop-in replacement maintained for newer Python versions.
 # Only installed when needed (Python 3.13+).
 audioop-lts>=0.0.1; python_version >= "3.13"
+
+# -- Browser Automation --
+# Playwright powers the headless/headed Chromium automation for form-filling.
+# After pip install, run: playwright install chromium
+playwright>=1.44.0
