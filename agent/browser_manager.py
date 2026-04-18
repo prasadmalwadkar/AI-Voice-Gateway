@@ -64,6 +64,32 @@ class BrowserManager:
         _is_running: Guard flag to prevent double-start or use-after-shutdown.
     """
 
+    # Selector map mapping Pydantic keys to West Capital CSS selectors
+    FIELD_MAP = {
+        "address_line_1": "input[name='address_line_1']",
+        "apt_suite": "input[name='apt_suite']",
+        "city": "input[name='city']",
+        "state": "input[name='state']",
+        "zipcode": "input[name='zipcode']",
+        "ownership_type": "select[name='ownership']",
+        "occupancy_type": "select[name='occupancy_type']",
+        "is_currently_for_sale": "input[name='is_currently_for_sale']",
+        "annual_pre_tax_income": "input[data-test-id='income-amount']",
+        "other_income": "input[data-test-id='other-income-amount']",
+        "primary_source_of_income": "select[name='employmentType']",
+        "first_name": "input[data-test-id='first-name']",
+        "middle_name": "input[data-test-id='middle-name']",
+        "last_name": "input[data-test-id='last-name']",
+        "suffix": "select[name='suffix']",
+        "date_of_birth": "custom",
+        "mobile_phone_number": "input[data-test-id='phone-number']",
+        "email_address": "input[data-test-id='email']",
+        "password": "input[data-test-id='password']",
+        "confirm_password": "input[data-test-id='confirm-password']",
+        "agreed_to_privacy_policy": "input[data-test-id='consent-1']",
+        "agreed_to_credit_pull": "input[data-test-id='consent-2']",
+    }
+
     def __init__(self) -> None:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
@@ -254,6 +280,102 @@ class BrowserManager:
         except Exception:
             logger.exception("Failed during address selection for '%s'.", address)
             raise
+
+    # ------------------------------------------------------------------
+    # Generic Form Interaction
+    # ------------------------------------------------------------------
+
+    async def fill_form_fields(self, data: dict) -> None:
+        """Fill form fields dynamically based on the provided data dictionary.
+
+        Iterates through the data dictionary, looks up each key in FIELD_MAP,
+        determines the element type (input, select, or checkbox), and interacts
+        with the page accordingly.
+        """
+        page = self.page  # raises if not running
+
+        for key, value in data.items():
+            selector = self.FIELD_MAP.get(key)
+            if not selector or value is None:
+                continue
+
+            try:
+                # -------------------------------------------------------------
+                # Special Handlers for Custom UI Components
+                # -------------------------------------------------------------
+                if key == "date_of_birth" and value:
+                    val_str = str(value)
+                    if len(val_str) == 8 and "/" not in val_str:
+                        val_str = f"{val_str[:2]}/{val_str[2:4]}/{val_str[4:]}"
+                        
+                    parts = val_str.split("/")
+                    if len(parts) == 3:
+                        month, day, year = parts
+                        
+                        for part_val, test_id in [(month, 'dateOfBirth_month'), (day, 'dateOfBirth_day'), (year, 'dateOfBirth_year')]:
+                            loc = page.locator(f"div[data-test-id='{test_id}']").first
+                            await loc.focus()
+                            await page.keyboard.type(part_val, delay=100)
+                            
+                        logger.info("Filled bespoke spinbutton complex for date_of_birth")
+                    continue
+                if key in ["occupancy_type"]:
+                    # Custom clickable cards: "Primary property", etc.
+                    card_locator = page.locator(f"text='{value}'").last
+                    await card_locator.wait_for(state="visible", timeout=3_000)
+                    await card_locator.click()
+                    logger.info("Clicked card option: '%s' for '%s'", value, key)
+                    continue
+
+                if key == "is_currently_for_sale":
+                    val_str = "YES" if value else "NO"
+                    radio_loc = page.locator(f"input[name='isListedForSale'][value='{val_str}']").first
+                    await radio_loc.check(timeout=3_000, force=True)
+                    logger.info("Checked native radio button: '%s' for is_currently_for_sale", val_str)
+                    continue
+
+
+                # -------------------------------------------------------------
+                # Standard HTML Elements
+                # -------------------------------------------------------------
+                locator = page.locator(selector).first
+                # Wait briefly for exactly this field
+                await locator.wait_for(state="attached", timeout=2_000)
+
+                tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
+                type_attr = await locator.evaluate("el => el.type ? el.type.toLowerCase() : ''")
+
+                if tag_name == "select":
+                    # Use label=str(value) to match the visible option text exactly
+                    # rather than the internal value attribute! Added strict timeout 
+                    # to prevent 30-second silent hangs if the option label slightly mismatches.
+                    await locator.select_option(label=str(value), timeout=3000)
+                elif tag_name == "input" and type_attr in ["checkbox", "radio"]:
+                    # Coerce truthy values for checkboxes
+                    if str(value).lower() in ["true", "yes", "1", "on"]:
+                        await locator.check(force=True)
+                    else:
+                        await locator.uncheck(force=True)
+                else:
+                    await locator.fill(str(value))
+
+                logger.info("Filled '%s' with '%s'", key, value)
+
+            except Exception as e:
+                logger.warning("Failed to fill field '%s' (selector: %s): %s", key, selector, str(e))
+
+    async def click_continue(self) -> None:
+        """Locate the 'Continue' or 'Check my rate' button, click it, and wait for networkidle."""
+        page = self.page
+
+        logger.info("Clicking continue button...")
+        try:
+            button_locator = page.locator("button:has-text('Continue'), input[type='submit'][value='Continue'], button:has-text('Check my rate')").first
+            await button_locator.click(timeout=5_000)
+            await page.wait_for_load_state("networkidle")
+            logger.info("Successfully clicked continue and waited for networkidle.")
+        except Exception as e:
+            logger.warning("Failed to click continue: %s", str(e))
 
     async def shutdown(self) -> None:
         """Gracefully close the browser, context, and Playwright process.
