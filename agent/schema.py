@@ -55,7 +55,12 @@ class HelocApplicationState(BaseModel):
 
     # 7. Legal & Consents
     agreed_to_privacy_policy: Optional[bool] = Field(None, description="Must be True. User verbally agrees to Privacy Policy and Terms of Service.")
+    agreed_to_commerce_communication: Optional[bool] = Field(None, description="Optional. User agrees to marketing/commerce communications.")
     agreed_to_credit_pull: Optional[bool] = Field(None, description="Must be True. User verbally consents to the Electronic Communications Policy and soft credit pull.")
+    
+    # 8. Account Security (Auto-generated)
+    password: Optional[str] = Field(None, description="Auto-generated account password.")
+    confirm_password: Optional[str] = Field(None, description="Confirmation of the auto-generated password.")
 
     # =========================================================================
     # Field Validators — catch bad data before it enters the state.
@@ -146,29 +151,3 @@ class HelocApplicationState(BaseModel):
             )
         return v
 
-    def generate_password(self, pincode: str) -> str:
-        """
-        Dynamically generates a secure password meeting the 12-character requirement
-        (Uppercase, lowercase, number, and symbol). 
-        Format: firstname#pincode. If length < 12, uses firstname_lastname#pincode.
-        """
-        if not self.first_name:
-            return "" # Cannot generate without a name
-            
-        first = self.first_name.capitalize()
-        last = self.last_name.capitalize() if self.last_name else ""
-        
-        # Base attempt: Firstname#Pincode
-        attempt_1 = f"{first}#{pincode}"
-        
-        if len(attempt_1) >= 12:
-            return attempt_1
-            
-        # Fallback: Firstname_Lastname#Pincode
-        attempt_2 = f"{first}_{last}#{pincode}"
-        
-        # If it's STILL under 12 chars (e.g., user is "Ed Wu"), pad it with an extra symbol and year
-        if len(attempt_2) < 12:
-             return f"{first}_{last}#{pincode}!2026"
-             
-        return attempt_2

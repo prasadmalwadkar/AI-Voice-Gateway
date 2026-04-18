@@ -35,20 +35,34 @@ from pydantic import ValidationError
 from line.llm_agent import loopback_tool
 
 from agent.schema import HelocApplicationState, OccupancyType, OwnershipType, IncomeSource
+from agent.browser_manager import BrowserManager
 
 logger = logging.getLogger("voip.state")
 
 # =============================================================================
-# Global application state — one instance per call.
+# Global instances — one state and one browser per call.
 # Reset via reset_state() at the start of each new call in get_agent().
 # =============================================================================
 application_state = HelocApplicationState()
+browser_manager = BrowserManager()
 
 
-def reset_state() -> None:
-    """Reset the application state for a new call. Called from get_agent()."""
+async def ensure_browser_ready() -> None:
+    """Ensure the browser is running and on the correct page."""
+    if not browser_manager.is_running:
+        logger.info("Initializing browser for real-time sync...")
+        await browser_manager.start(is_demo=True)
+        await browser_manager.navigate_to_start()
+
+
+async def reset_state() -> None:
+    """Reset the application state and browser for a new call."""
     global application_state
     application_state = HelocApplicationState()
+    # If a previous browser was left running, shut it down so we start fresh
+    if browser_manager.is_running:
+        logger.info("Closing stale browser session...")
+        await browser_manager.shutdown()
     logger.info("Application state reset for new call.")
 
 
@@ -63,53 +77,96 @@ def get_missing_fields() -> list[str]:
     missing = []
     state = application_state
 
-    # -- Property Details --
-    if not state.address_line_1:
-        missing.append("street address")
-    if not state.city:
-        missing.append("city")
-    if not state.state:
-        missing.append("state")
-    if not state.zipcode:
-        missing.append("zipcode")
-    if not state.ownership_type:
-        missing.append("ownership type (sole or joint owner)")
-    if not state.occupancy_type:
-        missing.append("occupancy type (primary, secondary, or investment)")
-    
-    # -- For Sale Status --
-    if state.is_currently_for_sale is None:
-        missing.append("whether property is currently for sale")
-    
-    # -- Income --
-    if state.annual_pre_tax_income is None:
-        missing.append("annual pre-tax income")
-    if not state.primary_source_of_income:
-        missing.append("primary source of income")
-    
-    # -- Legal Name --
-    if not state.first_name:
-        missing.append("first name")
-    if not state.last_name:
-        missing.append("last name")
-    
-    # -- Birthday --
-    if not state.date_of_birth:
-        missing.append("date of birth")
-    
-    # -- Contact --
-    if not state.mobile_phone_number:
-        missing.append("mobile phone number")
-    if not state.email_address:
-        missing.append("email address")
-    
-    # -- Consents --
-    if not state.agreed_to_privacy_policy:
-        missing.append("privacy policy agreement")
-    if not state.agreed_to_credit_pull:
-        missing.append("credit pull consent")
+    FIELD_STAGES = {
+        "address_line_1": 1, "city": 1, "state": 1, "zipcode": 1,
+        "ownership_type": 1, "occupancy_type": 1,
+        "is_currently_for_sale": 2,
+        "annual_pre_tax_income": 3, "other_income": 3, "primary_source_of_income": 3,
+        "first_name": 4, "last_name": 4, "middle_name": 4, "suffix": 4,
+        "date_of_birth": 5,
+        "mobile_phone_number": 6, "email_address": 6,
+        "agreed_to_privacy_policy": 7, "agreed_to_commerce_communication": 7, "agreed_to_credit_pull": 7,
+        "password": 7, "confirm_password": 7
+    }
 
-    return missing
+    # Stage name to number mapping derived from browser_manager.get_current_stage()
+    STAGE_NUMS = {
+        "property": 1, "for-sale": 2, "income": 3, "name": 4, "birthday": 5, "contact": 6, "consent": 7, "unknown": 0
+    }
+
+    current_stage_name = browser_manager.get_current_stage()
+    current_stage_num = STAGE_NUMS.get(current_stage_name, 0)
+
+    # FILTERING LOGIC: If we are at a later stage, ignore MISSING fields from past stages
+    # unless they are 'required' (unfilled required fields usually block the browser anyway).
+    # For simplicity, we just filter out optional fields from past stages.
+    
+    final_missing = []
+    # These internal keys match the HelocApplicationState model fields
+    model_field_to_display = {
+        "address_line_1": "property address (street)",
+        "city": "city",
+        "state": "state",
+        "zipcode": "zipcode",
+        "ownership_type": "ownership type (sole or joint owner)",
+        "occupancy_type": "occupancy type (primary, secondary, or investment)",
+        "is_currently_for_sale": "whether property is currently for sale",
+        "annual_pre_tax_income": "annual pre-tax income",
+        "other_income": "any additional income (optional)",
+        "primary_source_of_income": "primary source of income",
+        "first_name": "first name",
+        "middle_name": "middle name or initial (optional)",
+        "last_name": "last name",
+        "suffix": "suffix (optional)",
+        "date_of_birth": "date of birth",
+        "mobile_phone_number": "mobile phone number",
+        "email_address": "email address",
+        "agreed_to_privacy_policy": "privacy policy agreement",
+        "agreed_to_commerce_communication": "marketing communications consent",
+        "agreed_to_credit_pull": "consent for electronic communications and soft credit pull",
+        "password": "account password",
+        "confirm_password": "password confirmation"
+    }
+    
+    # STAGE-LOCKING LOGIC:
+    # We only report fields for the CURRENT stage. 
+    # If the current stage is complete, we report fields for the NEXT stage only.
+    # This keeps the agent and browser in perfect lockstep.
+    
+    current_stage_fields = [f for f, s in FIELD_STAGES.items() if s == current_stage_num]
+    next_stage_fields = [f for f, s in FIELD_STAGES.items() if s == current_stage_num + 1]
+    
+    # Get optional fields list for classifications
+    optional_fields = BrowserManager.OPTIONAL_FIELDS
+
+    # Check if current stage is "complete" (no required missing fields)
+    current_stage_is_done = True
+    for f in current_stage_fields:
+        if not hasattr(state, f): continue
+        val = getattr(state, f)
+        if (val is None or val == "") and f not in optional_fields:
+            current_stage_is_done = False
+            break
+
+    target_fields = current_stage_fields if not current_stage_is_done else next_stage_fields
+    
+    final_missing = []
+    
+    for field_name in target_fields:
+        if not hasattr(state, field_name): continue
+            
+        current_val = getattr(state, field_name)
+        if current_val is None or current_val == "":
+            display_name = model_field_to_display.get(field_name)
+            if display_name:
+                final_missing.append(display_name)
+
+    # Prepend stage context for the LLM
+    stage_header = f"[BROWSER STAGE: {current_stage_name.upper()}]"
+    if not final_missing:
+        return f"{stage_header} All current fields filled. Waiting for navigation..."
+        
+    return f"{stage_header} Still needed: " + ", ".join(final_missing)
 
 
 # =============================================================================
@@ -333,6 +390,75 @@ async def update_application_state(
                 )
                 logger.warning("Validation failed for %s='%s': %s", field_name, value, error_msg)
     
+    # =========================================================================
+    # BROWSER SYNCHRONIZATION — Mirror valid updates to the live browser
+    # =========================================================================
+    if updates:
+        try:
+            await ensure_browser_ready()
+            
+            # -- RECURSIVE FILLING LOOP --
+            # We loop to handle cases where the agent provides data for multiple pages at once.
+            max_nav_attempts = 3
+            current_nav = 0
+            
+            while current_nav < max_nav_attempts:
+                # 1. Special case: Address Selection (triggers autocomplete)
+                if "address_line_1" in updates:
+                    full_address = updates["address_line_1"]
+                    if application_state.city: full_address += f" {application_state.city}"
+                    if application_state.state: full_address += f" {application_state.state}"
+                    if application_state.zipcode: full_address += f" {application_state.zipcode}"
+                    await browser_manager.select_address(full_address)
+                
+                # 2. Special case: Consent stage password generation
+                # If we are on the consent page and password is missing, auto-generate it.
+                if browser_manager.get_current_stage() == "consent":
+                    if not application_state.password:
+                        # Generate a simple but secure-looking password for the user
+                        auto_pass = "WCL!2024!Agent"
+                        application_state.password = auto_pass
+                        application_state.confirm_password = auto_pass
+                        updates["password"] = auto_pass
+                        updates["confirm_password"] = auto_pass
+                        logger.info("Auto-generated secure password for the final stage.")
+
+                # 3. Bulk fill fields visible on current page
+                await browser_manager.fill_form_fields(updates)
+
+                # 4. DOM Verification
+                mismatches = await browser_manager.verify_fields(updates)
+                if mismatches:
+                    mismatch_list = ", ".join(mismatches)
+                    logger.warning("DOM Verification failed for fields: %s", mismatch_list)
+                    validation_errors.append(f"BROWSER VERIFICATION WARNING: Fields not updated: {mismatch_list}.")
+
+                # 5. Check Complete and Navigate (SPEED GOVERNOR)
+                # We only allow ONE navigation jump per tool call. This ensures the browser 
+                # doesn't skip pages (like DOB) before the caller has spoken.
+                if await browser_manager.is_page_complete():
+                    logger.info("Page complete. Auto-navigating (1 jump max)...")
+                    nav_success = await browser_manager.click_continue()
+                    if nav_success:
+                        current_nav += 1
+                        logger.info("Successfully navigated. Stopping auto-advance to stay in sync with caller.")
+                        # After 1 jump, we stop and let the LLM react to the new page content
+                        break
+                    else:
+                        # SECOND OPINION: If click reported failure, check if the page is STILL complete.
+                        if not await browser_manager.is_page_complete():
+                            logger.info("Navigation confirmed via second-opinion.")
+                            current_nav += 1
+                            break
+                            
+                        validation_errors.append("BROWSER NAVIGATION WARNING: 'Continue' button clicked but page did not move.")
+                        break
+                else:
+                    break
+                
+        except Exception as e:
+            logger.error("Browser sync failed: %s", str(e), exc_info=True)
+
     if not updates and not validation_errors:
         return "No fields were updated. Please extract information from the user's speech before calling this tool."
     
@@ -366,6 +492,7 @@ async def update_application_state(
             "Please confirm the information with the caller and proceed to submit."
         )
     else:
-        parts.append(f"Still needed from the caller: {', '.join(missing)}")
+        # 'missing' is now a pre-formatted string from get_missing_fields()
+        parts.append(missing)
     
     return ". ".join(parts) + "."

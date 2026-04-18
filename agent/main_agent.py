@@ -23,10 +23,16 @@ Usage:
 """
 
 import os
+import sys
 import logging
+import signal
+import asyncio
+from typing import AsyncIterable
 
-from line.llm_agent import LlmAgent, LlmConfig, end_call
+from line.llm_agent import LlmAgent, LlmConfig, end_call, loopback_tool, passthrough_tool
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
+from line.agent import TurnEnv
+from line.events import InputEvent, OutputEvent, CallEnded
 
 from agent.state_manager import update_application_state, reset_state
 
@@ -68,6 +74,13 @@ update_application_state tool.
   apologize for the confusion and ask for a clear confirmation. Example: \
   "I want to make sure I get this right — is your address 325 West Adams \
   Boulevard?" Wait for a clear 'Yes', 'No', or corrected value.
+- If the tool reports a "BROWSER NAVIGATION WARNING" or a "UI error", \
+  FIRST check the list of missing fields. If the field you just provided is \
+  NO LONGER in the missing list, ignore the warning and proceed to the next \
+  topic (the browser is just being slow). ONLY ask for a correction if the \
+  field is still missing or the tool explicitly states the value was invalid. \
+  Example: "It looks like the system needs a full last name. Could you please \
+  provide the complete spelling?"
 - For consent fields (privacy policy, credit pull), the caller must \
   explicitly say "I agree." Vague responses like "sure" or "I guess" are \
   not sufficient — ask them to say "I agree" clearly.
@@ -87,25 +100,42 @@ update_application_state tool.
   except when saying goodbye.
 - Speak naturally — no bullet points, numbered lists, or special characters.
 - Spell out numbers and dates verbally: "January fifteenth" not "1/15".
+- **Optional Fields**: When asking for Apt/Suite, Other Income, Middle Name, or Suffix, \
+  clearly state that these are optional. Example: "And finally, any other \
+  income you'd like us to consider? This is totally optional."
 
 # Conversation Flow (follow the tool's guidance on what to ask next)
-1. Property address (street, city, state, zipcode).
+- **STRICT Context Priority**: You are a stage-locked intake specialist. ONLY \
+  ask for the fields listed in the tool result's "Still needed" section. \
+  If a field disappears from that list (meaning the browser has moved), \
+  STOP asking about it immediately, even if it was optional and unfilled. \
+  Do NOT jump ahead to future pages until the tool result provides the \
+  fields for the new stage.
+1. Property address (street, city, state, zipcode). Ask for apartment or \
+suite \
+   number too, but mention it's optional.
 2. Ownership type (sole or joint) and occupancy (primary, secondary, investment).
 3. Whether the property is currently for sale.
-4. Annual pre-tax income and primary source of income.
-5. Legal name (first, middle, last, suffix).
+4. Annual pre-tax income and primary source of income. Ask if they have any \
+   other income they'd like to include (optional).
+5. Legal name (first, middle, last, suffix). Mention that middle name and \
+   suffix are optional.
 6. Date of birth.
 7. Mobile phone number and email address.
 8. Verbal consent to Privacy Policy / Terms of Service.
-9. Verbal consent to Electronic Communications Policy and soft credit pull.
-10. Once ALL fields are collected, confirm the details back to the caller.
+9. Verbal consent to Electronic Communications Policy and soft credit pull. \
+   CRITICAL: You must use the phrase "soft credit pull" and explain that it \
+   will NOT affect their credit score.
+10. Once ALL fields are collected, confirm the details back to the caller \
+    and inform them that a secure, auto-generated password has been created \
+    for their new account.
 
 # Rules
 - If the caller asks about rates or terms, say: "Our loan officers can \
   discuss specific rates and terms during your follow-up call."
 - If the caller goes off-topic, gently redirect back to the application.
 - NEVER provide specific interest rates, APR, or financial advice.
-- When the caller says goodbye, respond warmly and then call end_call.
+- When the caller says goodbye, respond warmly and then call terminate_session.
 
 CRITICAL: NEVER call end_call without speaking a goodbye message first.
 """
@@ -126,6 +156,12 @@ TEMPERATURE = 0.6
 # for a phone interaction.
 MAX_TOKENS = 200
 
+
+@passthrough_tool
+async def terminate_session(ctx, reason: str = "Session ended. Saying goodbye.") -> None:
+    """End the call and close the browser session immediately."""
+    from line.events import AgentEndCall
+    yield AgentEndCall()
 
 async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
     """
@@ -152,9 +188,9 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
 
     # Reset application state for this new call — prevents cross-call
     # data leakage (e.g., caller B seeing caller A's address).
-    reset_state()
+    await reset_state()
 
-    agent = LlmAgent(
+    agent_instance = LlmAgent(
         # LiteLLM model string: "provider/model-name"
         # gemini/gemini-2.5-flash is cost-effective with fast inference,
         # ideal for real-time voice where latency = bad UX.
@@ -164,8 +200,8 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
             # Loopback tool: extracts caller data → updates state → returns
             # missing fields back to the LLM so it knows what to ask next.
             update_application_state,
-            # End call: agent calls this after saying goodbye.
-            end_call,
+            # End session: agent calls this after saying goodbye to close UI & call.
+            terminate_session,
         ],
         config=LlmConfig(
             system_prompt=SYSTEM_PROMPT,
@@ -175,7 +211,17 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
         ),
     )
 
-    return agent
+    async def agent_wrapper(ctx: TurnEnv, event: InputEvent) -> AsyncIterable[OutputEvent]:
+        """Wrapper to catch lifecycle events and delegate to LlmAgent."""
+        if isinstance(event, CallEnded):
+            logger.info("Call ended. Cleaning up browser session...")
+            await reset_state()
+            return
+
+        async for output in agent_instance.process(ctx, event):
+            yield output
+
+    return agent_wrapper
 
 
 def create_voice_app() -> VoiceAgentApp:
@@ -210,4 +256,17 @@ def create_voice_app() -> VoiceAgentApp:
 # =============================================================================
 if __name__ == "__main__":
     voice_app = create_voice_app()
+
+    # Manual signal handling for Ctrl+C on the agent process itself
+    def shutdown_handler(sig, frame):
+        logger.info(f"Received signal {sig}. Shutting down...")
+        # We use a task here because this is called in a synchronous context
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(reset_state())
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
     voice_app.run()
