@@ -94,7 +94,8 @@ update_application_state tool.
 - Use 2-letter uppercase state abbreviations (e.g., CA, NY, IL).
 
 # Communication Guidelines
-- Keep responses under 35 words. Phone callers lose patience with long answers.
+- Keep responses concise. Under normal conditions, keep responses under 35 words. 
+- **CRITICAL (VOICE MODE)**: If you detect the "[VOICE]" tag in the conversation context or user input, you MUST keep your response under 10 words to minimize character usage.
 - Be polite, concise, and efficient. Never ramble.
 - Always end your response with a question to keep the conversation moving, \
   except when saying goodbye.
@@ -213,6 +214,8 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
 
     async def agent_wrapper(ctx: TurnEnv, event: InputEvent) -> AsyncIterable[OutputEvent]:
         """Wrapper to catch lifecycle events and delegate to LlmAgent."""
+        from line.events import CallEnded
+
         if isinstance(event, CallEnded):
             logger.info("Call ended. Cleaning up browser session...")
             await reset_state()

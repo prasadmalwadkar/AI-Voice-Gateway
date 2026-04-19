@@ -10,10 +10,11 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.0.0
 
-# -- Cartesia Line SDK (Voice Agent Orchestration) --
-# Provides: LlmAgent, LlmConfig, VoiceAgentApp, tool decorators
-# Internally uses LiteLLM for 100+ LLM provider support
+# -- Cartesia SDKs --
+# cartesia-line: Higher level agent orchestration
+# cartesia: Base SDK for direct Sonic streaming (Low-latency TTS)
 cartesia-line>=0.2.8
+cartesia>=1.0.0
 
 # -- WebSocket Client --
 # For connecting to Cartesia's agent streaming endpoint from our bridge

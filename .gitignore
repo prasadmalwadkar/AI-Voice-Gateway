@@ -26,3 +26,6 @@ __pycache__/
 
 # Log files
 *.log
+
+# Local handoff / scratch notes (not for repo)
+HANDOFF.md

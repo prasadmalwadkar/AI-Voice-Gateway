@@ -161,21 +161,16 @@ async def media_stream_handler(websocket: WebSocket):
     call_logger = CallLogger(call_sid=preliminary_call_id)
     call_logger.info("WebSocket accepted — awaiting Twilio stream", event="ws.accepted")
 
-    # -- Build the Cartesia agent streaming URL --
-    # This URL connects our bridge to Cartesia's cloud infrastructure
-    # (or a local VoiceAgentApp instance for development).
-    cartesia_api_key = os.getenv("CARTESIA_API_KEY", "")
+    # -- Build the Cartesia Calls API URL --
+    # Uses the Calls API: wss://api.cartesia.ai/agents/stream/{agent_id}
+    # Override with CARTESIA_AGENT_WS_URL for custom deployments.
     cartesia_agent_url = os.getenv("CARTESIA_AGENT_WS_URL", "")
 
     if cartesia_agent_url:
-        # Custom URL: typically ws://localhost:8000 for local VoiceAgentApp
         cartesia_ws_url = cartesia_agent_url
     else:
-        # Default: Cartesia's cloud agent streaming endpoint
         cartesia_ws_url = (
-            f"wss://api.cartesia.ai/agents/stream/"
-            f"?api_key={cartesia_api_key}"
-            f"&cartesia_version=2024-11-13"
+            "wss://api.cartesia.ai/agents/stream/agent_6F5z1Fb3qRAAh6WVxj68bH"
         )
 
     # -- Create and run the bridge --
@@ -206,6 +201,7 @@ async def media_stream_handler(websocket: WebSocket):
         call_logger.warning(
             f"Cartesia connection failed: {e}",
             event="cartesia.connection_failed",
+            error=str(e),
         )
 
     except Exception as e:
