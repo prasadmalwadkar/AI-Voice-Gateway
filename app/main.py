@@ -27,6 +27,7 @@ Implementation:
     definition is shared either way.
 """
 
+import atexit
 import logging
 import os
 import uuid
@@ -37,9 +38,17 @@ from fastapi.responses import Response
 from agent.main_agent import create_voice_app
 from app.logging_config import CallLogger, setup_logging
 from app.twilio_bridge import TwilioBridge
+from app.twilio_line_bridge import TwilioLineBridge
+from app.path2_transcript_debug import (
+    keepalive_loop,
+    path2_transcript_debug_enabled,
+    register_client,
+    unregister_client,
+)
 
 # -- Initialize structured logging at module load --
 setup_logging()
+atexit.register(logging.shutdown)
 module_logger = logging.getLogger("voip.main")
 
 
@@ -161,24 +170,30 @@ async def media_stream_handler(websocket: WebSocket):
     call_logger = CallLogger(call_sid=preliminary_call_id)
     call_logger.info("WebSocket accepted — awaiting Twilio stream", event="ws.accepted")
 
-    # -- Build the Cartesia Calls API URL --
-    # Uses the Calls API: wss://api.cartesia.ai/agents/stream/{agent_id}
-    # Override with CARTESIA_AGENT_WS_URL for custom deployments.
-    cartesia_agent_url = os.getenv("CARTESIA_AGENT_WS_URL", "")
+    voice_mode = os.getenv("TWILIO_VOICE_MODE", "path2").strip().lower()
 
-    if cartesia_agent_url:
-        cartesia_ws_url = cartesia_agent_url
-    else:
-        cartesia_ws_url = (
-            "wss://api.cartesia.ai/agents/stream/agent_6F5z1Fb3qRAAh6WVxj68bH"
+    # -- Path2: Twilio → Ink STT → Line /ws (LlmAgent) → Sonic TTS → Twilio --
+    if voice_mode in ("path2", "line", "local"):
+        bridge = TwilioLineBridge(
+            twilio_ws=websocket,
+            call_logger=call_logger,
         )
+    else:
+        # -- Cartesia Calls API (cloud agent) --
+        cartesia_agent_url = os.getenv("CARTESIA_AGENT_WS_URL", "")
 
-    # -- Create and run the bridge --
-    bridge = TwilioBridge(
-        twilio_ws=websocket,
-        cartesia_ws_url=cartesia_ws_url,
-        call_logger=call_logger,
-    )
+        if cartesia_agent_url:
+            cartesia_ws_url = cartesia_agent_url
+        else:
+            cartesia_ws_url = (
+                "wss://api.cartesia.ai/agents/stream/agent_6F5z1Fb3qRAAh6WVxj68bH"
+            )
+
+        bridge = TwilioBridge(
+            twilio_ws=websocket,
+            cartesia_ws_url=cartesia_ws_url,
+            call_logger=call_logger,
+        )
 
     try:
         await bridge.run()
@@ -228,6 +243,25 @@ async def media_stream_handler(websocket: WebSocket):
             f"Handler complete | final_ttfa={call_logger.ttfa_ms}ms",
             event="ws.handler.done",
         )
+
+
+# =============================================================================
+# Route: WS /debug/path2-transcripts — Path2 STT transcript fan-out (orchestrator CLI)
+# =============================================================================
+
+
+@app.websocket("/debug/path2-transcripts")
+async def path2_transcript_debug_ws(websocket: WebSocket):
+    """Live STT events for local debugging (no Twilio protocol — safe for mimic)."""
+    await websocket.accept()
+    if not path2_transcript_debug_enabled():
+        await websocket.close(code=1008)
+        return
+    await register_client(websocket)
+    try:
+        await keepalive_loop(websocket)
+    finally:
+        await unregister_client(websocket)
 
 
 # =============================================================================

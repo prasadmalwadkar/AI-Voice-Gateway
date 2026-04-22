@@ -33,3 +33,7 @@ audioop-lts>=0.0.1; python_version >= "3.13"
 # Playwright powers the headless/headed Chromium automation for form-filling.
 # After pip install, run: playwright install chromium
 playwright>=1.44.0
+
+# -- Dev / tests (optional) --
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
