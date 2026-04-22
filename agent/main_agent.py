@@ -29,10 +29,19 @@ import signal
 import asyncio
 from typing import AsyncIterable
 
-from line.llm_agent import LlmAgent, LlmConfig, end_call, loopback_tool, passthrough_tool
+from line.llm_agent import LlmAgent, LlmConfig, passthrough_tool
+from line.llm_agent.provider import LlmProvider
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 from line.agent import TurnEnv
 from line.events import InputEvent, OutputEvent, CallEnded
+from litellm.exceptions import (
+    APIConnectionError,
+    BadGatewayError,
+    InternalServerError,
+    NotFoundError,
+    RateLimitError,
+    ServiceUnavailableError,
+)
 
 from agent.state_manager import update_application_state, reset_state
 
@@ -61,19 +70,57 @@ update_application_state tool.
 - Always include a confidence_score (0.0 to 1.0) when calling the tool. \
   Set it lower if the caller was unclear, mumbled, or you had to infer.
 - Always pass raw_user_input with the EXACT transcript of what the user \
-  just said. This is mandatory — the system uses it to detect uncertainty.
+  just said **in this turn only** — this line only, no past lines. Never merge \
+  multiple user utterances into one string; doing so breaks uncertainty/stability checks.
 - Wait for the tool's response to see which fields are still missing.
 - Do NOT ask for information that has already been captured.
 - Ask for ONE or TWO related fields at a time — never overwhelm the caller.
+- On the property (register) page, the **only** on-page typing for the address is the \
+  street (search) line and choosing a **dropdown** row; then WCL **fills** city, state, \
+  and zip in the form. Do not ask the caller to spell city, state, or zip. If the caller \
+  *does* mention city and/or state with the address, still include `city` and `state` in \
+  `update_application_state` so the browser can type a **longer search** and disambiguate \
+  the list—you are not using those to manually type the form fields; the site sets them after \
+  a good pick. Either street-only or street+what they said: same end state once the right \
+  suggestion is selected.
+- If the tool already has `address_line_1` (and the system syncs the rest from the \
+  address pick), do NOT say \"Address?\" or ask for street, city, state, or zip again. \
+  Follow the tool's \"Still needed\" list; it will not list city, state, or zip.
+- If the caller's utterance answers anything in the current "Still needed" list, \
+  you MUST call update_application_state in that same turn before your next spoken \
+  line. Never repeat the same question without a tool call that records their answer.
+- If tool output includes `Ask next: "..."`, your next spoken line MUST be exactly \
+  that question (or the same words with tiny punctuation change). Do not repeat the \
+  prior question.
+- **Tool before the next question (critical):** In a turn where the user answered you \
+  (including a bare "Yes" / "No" / "Nope" to your last question), the **first** \
+  model action must be `update_application_state` — never speak a **new** question \
+  (e.g. "listed for sale?") until the tool has run and returned. That tool call must \
+  record what their words actually answered (re-confirm at 1.0, `is_currently_for_sale`, \
+  `ownership_type`, etc.). If you speak before the tool, the user will have to repeat \
+  "Yes" and you will **double-ask**.
+- **Exception — presence / no data:** If the user only checks you are still on the line \
+  ("hello?", "you there?", "can you hear me?") or says thanks with **no** application \
+  content, **do not** call `update_application_state` (nothing to save). You **must** \
+  still speak: brief acknowledgment ("Still here." / "Yes — go ahead.") then the **next** \
+  question from the latest tool "Still needed" list. **Never** finish a turn with zero \
+  spoken words — empty replies sound like a dropped call.
 
 # Verification Rules
-- If the tool says a field "NEEDS VERBAL RE-CONFIRMATION", do NOT move to \
-  the next topic. Confirm the current value first by asking: "I heard \
-  [value], is that correct?"
+- If the tool output contains "RE-CONFIRM" (low confidence on the last save), ask \
+  **one** short check: e.g. "I heard [value] — correct?" **Do not** ask a second time. \
+  When the user then says yes, right, correct, yep, or any clear affirmation, you **must** \
+  call update_application_state in that same turn with the **same** field value(s), \
+  `confidence_score: 1.0`, and `raw_user_input` = their exact words — then read the new \
+  tool result and go to the next "Still needed" (e.g. sole/joint). Repeating the same \
+  confirm question after they already said yes is wrong.
+- **No duplicate question (paraphrase counts as repeat):** If the user just answered your \
+  last ask (e.g. "Yes" / "No" / "I agree") do **not** re-ask the same fact with different \
+  wording (e.g. "Listed for sale?" then "Is it currently for sale?" is forbidden). The next \
+  line after the tool returns must be the **next** item from "Still needed", not a rephrase.
 - If the tool indicates an update is "PENDING" due to uncertainty, \
-  apologize for the confusion and ask for a clear confirmation. Example: \
-  "I want to make sure I get this right — is your address 325 West Adams \
-  Boulevard?" Wait for a clear 'Yes', 'No', or corrected value.
+  do not apologize and do not repeat the captured value. Ask only: \
+  "Is that correct?" (exactly 3 words). Wait for clear "Yes", "No", or correction.
 - If the tool reports a "BROWSER NAVIGATION WARNING" or a "UI error", \
   FIRST check the list of missing fields. If the field you just provided is \
   NO LONGER in the missing list, ignore the warning and proceed to the next \
@@ -81,9 +128,15 @@ update_application_state tool.
   field is still missing or the tool explicitly states the value was invalid. \
   Example: "It looks like the system needs a full last name. Could you please \
   provide the complete spelling?"
-- For consent fields (privacy policy, credit pull), the caller must \
-  explicitly say "I agree." Vague responses like "sure" or "I guess" are \
-  not sufficient — ask them to say "I agree" clearly.
+- If the tool says "Waiting for navigation" or the browser is clicking Continue, \
+  do NOT ask for-sale, income, or any next-page field until a later tool result's \
+  "Still needed" shows that stage. At most 3 words of hold (e.g. "One sec") or silence.
+- For consent fields (privacy policy, credit pull), the caller must be explicit. \
+  **Accept as sufficient:** "I agree", "I agree.", "Yes" or "Yes." when you **just** \
+  asked for that specific consent. **Not** sufficient: "sure", "uh-huh", "I guess" — then \
+  ask for "I agree" once. If they already said "I agree" or a clear "Yes" to *that* \
+  question, you **must** call the tool in that same turn; never ask the same consent \
+  line again the same way.
 
 # Normalization Rules
 - Expand all address abbreviations before calling the tool: \
@@ -93,17 +146,36 @@ update_application_state tool.
 - Format dates of birth as MM/DD/YYYY.
 - Use 2-letter uppercase state abbreviations (e.g., CA, NY, IL).
 
-# Communication Guidelines
-- Keep responses concise. Under normal conditions, keep responses under 35 words. 
-- **CRITICAL (VOICE MODE)**: If you detect the "[VOICE]" tag in the conversation context or user input, you MUST keep your response under 10 words to minimize character usage.
-- Be polite, concise, and efficient. Never ramble.
-- Always end your response with a question to keep the conversation moving, \
-  except when saying goodbye.
+# Communication Guidelines (TTS billed per character — be extremely brief)
+- **Default: 6 words or fewer** per reply. Never exceed 12 words unless a rule below forces it (e.g. consent).
+- One short question per turn. Examples: "Address?" \
+  "Sole or joint owner?" "Primary, secondary, or investment?" "Listed for sale?" \
+  "Annual income?" "Income source?" "First and last name?" "Date of birth?" \
+  "Phone and email?"
+- **Never** repeat the street address in the same line as a follow-up question; it wastes \
+  time and confuses STT. For ownership after an address is set, ask only: \
+  "Sole or joint owner?" — not "What is the ownership type for this property?" \
+  and not long re-reads of the address.
+- **CRITICAL — no address in spoken follow-ups:** Once `address_line_1` exists in state, \
+  you must **never** speak the street number, street name, city, or state aloud — not even \
+  to "confirm" or pad a question. Forbidden patterns: "I have the property address as...", \
+  "the property at [street]...", repeating the city name. **Only** the short scripted \
+  questions (e.g. "Sole or joint owner?" then "Primary, secondary, or investment?").
+- **CRITICAL — Still needed order:** The comma-separated list after "Still needed:" is \
+  **ordered**. Ask the **first** item in that list before the second. Example: ask \
+  **ownership type (sole or joint)** before **occupancy type** when both appear. Never \
+  skip to occupancy or "primary, secondary, or investment" while ownership is still missing.
+- **Optional fields**: tag "Optional" in one word if needed, e.g. "Apt or suite? Optional."
+- **CRITICAL (VOICE)**: If you see "[VOICE]" in context, **4 words or fewer** when possible.
+- Be polite but terse. No filler, no preamble ("Hi", "thanks for calling") unless goodbye \
+  or a **one-breath** presence ack ("Still here.") when they ask if you are there.
+- **Question rule:** Your reply should usually end with a question. **Exception:** the \
+  turn is **for the tool** first. After the user clearly answered the last ask, the \
+  *first* model action is `update_application_state`; only after it returns, ask the \
+  *next* "Still needed" question. Never repeat the *same* field's ask (even rephrased) to \
+  satisfy a question — that causes double-asks. Goodbye ends without a new question.
 - Speak naturally — no bullet points, numbered lists, or special characters.
-- Spell out numbers and dates verbally: "January fifteenth" not "1/15".
-- **Optional Fields**: When asking for Apt/Suite, Other Income, Middle Name, or Suffix, \
-  clearly state that these are optional. Example: "And finally, any other \
-  income you'd like us to consider? This is totally optional."
+- Spell out numbers and dates verbally when you must include them.
 
 # Conversation Flow (follow the tool's guidance on what to ask next)
 - **STRICT Context Priority**: You are a stage-locked intake specialist. ONLY \
@@ -112,50 +184,73 @@ update_application_state tool.
   STOP asking about it immediately, even if it was optional and unfilled. \
   Do NOT jump ahead to future pages until the tool result provides the \
   fields for the new stage.
-1. Property address (street, city, state, zipcode). Ask for apartment or \
-suite \
-   number too, but mention it's optional.
-2. Ownership type (sole or joint) and occupancy (primary, secondary, investment).
-3. Whether the property is currently for sale.
-4. Annual pre-tax income and primary source of income. Ask if they have any \
-   other income they'd like to include (optional).
-5. Legal name (first, middle, last, suffix). Mention that middle name and \
-   suffix are optional.
-6. Date of birth.
-7. Mobile phone number and email address.
-8. Verbal consent to Privacy Policy / Terms of Service.
-9. Verbal consent to Electronic Communications Policy and soft credit pull. \
-   CRITICAL: You must use the phrase "soft credit pull" and explain that it \
-   will NOT affect their credit score.
-10. Once ALL fields are collected, confirm the details back to the caller \
-    and inform them that a secure, auto-generated password has been created \
-    for their new account.
+1. Address → ownership + occupancy (short prompts; tool lists "Still needed").
+2. For sale?
+3. Income + source; other income optional.
+4. Name; middle and suffix optional.
+5. DOB; phone + email.
+6. Privacy/terms — caller must say "I agree."
+7. Say "soft credit pull" and that it won't hurt their score; caller must say "I agree."
+8. All set — system handles goodbye automatically.
 
 # Rules
-- If the caller asks about rates or terms, say: "Our loan officers can \
-  discuss specific rates and terms during your follow-up call."
-- If the caller goes off-topic, gently redirect back to the application.
+- Rates or terms question: "Rates on the follow-up call."
+- If the caller goes off-topic, gently redirect in one short sentence plus the next \
+  "Still needed" question — never go silent.
 - NEVER provide specific interest rates, APR, or financial advice.
 - When the caller says goodbye, respond warmly and then call terminate_session.
 
 CRITICAL: NEVER call end_call without speaking a goodbye message first.
 """
 
-INTRODUCTION = (
-    "Hi, I'm your West Capital assistant. "
-    "I can help you start your HELOC application today. "
-    "To get started, what is the address of the property "
-    "you are looking to finance?"
-)
+# Minimal TTS: first spoken line only (Cartesia Sonic charges per character).
+INTRODUCTION = "Address?"
 
 # LLM temperature: 0.6 balances coherence with natural-sounding variation.
 # Lower (0.3) sounds robotic on the phone; higher (0.9) risks hallucination.
 TEMPERATURE = 0.6
 
-# Max tokens per response: 200 keeps responses short for voice delivery.
-# A 200-token response is roughly 15-20 seconds of speech — already long
-# for a phone interaction.
-MAX_TOKENS = 200
+# Cap completion length so the model stays short (saves TTS characters),
+# but avoid empty turns observed at very low caps on noisy STT.
+MAX_TOKENS = 72
+
+# flash-lite: lowest latency/cost, good enough for single-field extraction.
+# If double-ask or tool-ordering issues persist, try:
+#   GEMINI_MODEL=gemini/gemini-2.5-flash  (better instruction following, ~200ms more TTFT)
+# Auto-fallback on transient error switches primary → fallback mid-call (history preserved).
+_DEFAULT_PRIMARY_MODEL = "gemini/gemini-2.5-flash-lite"
+_DEFAULT_FALLBACK_MODEL = "gemini/gemini-2.5-flash"
+
+# Transient or primary-model issues — retry / fallback instead of tearing down Line /ws.
+# NotFoundError: wrong model id on primary → switch to GEMINI_FALLBACK_MODEL.
+_LLM_RETRYABLE = (
+    ServiceUnavailableError,  # includes MidStreamFallbackError (subclass)
+    NotFoundError,
+    RateLimitError,
+    BadGatewayError,
+    APIConnectionError,
+    InternalServerError,
+)
+_LLM_MAX_RETRIES = int(os.getenv("GEMINI_LLM_MAX_RETRIES", "4"))
+_LLM_RETRY_BASE_SEC = float(os.getenv("GEMINI_LLM_RETRY_BASE_SEC", "0.4"))
+
+
+def _switch_llm_model(agent: LlmAgent, new_model: str) -> None:
+    """Swap LiteLLM backend on existing agent (history preserved). Line SDK has no public API."""
+    from line.llm_agent.provider import _get_model_config
+
+    mcfg = _get_model_config(new_model)
+    if agent._config.reasoning_effort is not None and not mcfg.supports_reasoning_effort:
+        raise ValueError(
+            f"Model {new_model} does not support reasoning_effort; clear LlmConfig.reasoning_effort first."
+        )
+    agent._model = new_model
+    agent._llm = LlmProvider(
+        model=new_model,
+        api_key=agent._api_key,
+        config=agent._config,
+        tools=agent._tools,
+    )
 
 
 @passthrough_tool
@@ -191,11 +286,15 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
     # data leakage (e.g., caller B seeing caller A's address).
     await reset_state()
 
+    primary_model = os.getenv("GEMINI_MODEL", _DEFAULT_PRIMARY_MODEL).strip() or _DEFAULT_PRIMARY_MODEL
+    fallback_model = (
+        os.getenv("GEMINI_FALLBACK_MODEL", _DEFAULT_FALLBACK_MODEL).strip()
+        or _DEFAULT_FALLBACK_MODEL
+    )
+
     agent_instance = LlmAgent(
         # LiteLLM model string: "provider/model-name"
-        # gemini/gemini-2.5-flash is cost-effective with fast inference,
-        # ideal for real-time voice where latency = bad UX.
-        model="gemini/gemini-2.5-flash",
+        model=primary_model,
         api_key=os.getenv("GEMINI_API_KEY"),
         tools=[
             # Loopback tool: extracts caller data → updates state → returns
@@ -221,8 +320,51 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
             await reset_state()
             return
 
-        async for output in agent_instance.process(ctx, event):
-            yield output
+        on_primary = primary_model != fallback_model
+        attempt = 0
+        while True:
+            yielded_any = False
+            try:
+                async for output in agent_instance.process(ctx, event):
+                    yielded_any = True
+                    yield output
+                return
+            except _LLM_RETRYABLE as e:
+                if yielded_any:
+                    logger.error(
+                        "LLM failed mid-stream after partial output; not retrying: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    raise
+                if on_primary:
+                    logger.warning(
+                        "LLM primary failed (%s), switching to fallback %s: %s",
+                        primary_model,
+                        fallback_model,
+                        e,
+                    )
+                    _switch_llm_model(agent_instance, fallback_model)
+                    on_primary = False
+                    continue
+                attempt += 1
+                if attempt >= _LLM_MAX_RETRIES:
+                    logger.error(
+                        "LLM failed after %s retries: %s",
+                        _LLM_MAX_RETRIES,
+                        e,
+                        exc_info=True,
+                    )
+                    raise
+                delay = _LLM_RETRY_BASE_SEC * (2 ** (attempt - 1))
+                logger.warning(
+                    "LLM transient error (%s/%s), retry in %.2fs: %s",
+                    attempt,
+                    _LLM_MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
 
     return agent_wrapper
 

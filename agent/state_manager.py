@@ -28,13 +28,25 @@ Design decisions:
   "or", "I think") blocks the save and forces re-confirmation.
 """
 
+import asyncio
 import logging
-from typing import Annotated, Optional
+import os
+import re
+import time
+from typing import Annotated, List, Optional
 
 from pydantic import ValidationError
 from line.llm_agent import loopback_tool
 
-from agent.schema import HelocApplicationState, OccupancyType, OwnershipType, IncomeSource
+from app.path2_transcript_debug import path2_debug_log
+from agent.schema import (
+    HelocApplicationState,
+    HeuristicResult,
+    OccupancyType,
+    OwnershipType,
+    IncomeSource,
+    STRICT_EMAIL_REGEX,
+)
 from agent.browser_manager import BrowserManager
 
 logger = logging.getLogger("voip.state")
@@ -45,6 +57,210 @@ logger = logging.getLogger("voip.state")
 # =============================================================================
 application_state = HelocApplicationState()
 browser_manager = BrowserManager()
+
+# Background Playwright work so the model can return before ~10s of address autocomplete;
+# the next `update_application_state` / heuristics await the prior task. Set
+# ``SYNC_BROWSER_INLINE=1`` in env to use blocking sync (e.g. debugging).
+_browser_sync_inflight: Optional[asyncio.Task[None]] = None
+_SENSITIVE_FIELDS = frozenset({"password", "confirm_password"})
+
+
+async def _await_inflight_browser_sync() -> None:
+    global _browser_sync_inflight
+    t0 = time.perf_counter()
+    t = _browser_sync_inflight
+    waited = bool(t is not None and not t.done())
+    if t is not None and not t.done():
+        try:
+            await t
+        except Exception as e:
+            logger.debug("Background browser task ended with: %s", e)
+    _browser_sync_inflight = None
+    await path2_debug_log(
+        "path2.drain_inflight",
+        waited=waited,
+        await_ms=round((time.perf_counter() - t0) * 1000, 2),
+    )
+
+
+def _use_inline_browser_sync() -> bool:
+    return os.getenv("SYNC_BROWSER_INLINE", "").lower() in ("1", "true", "yes")
+
+
+def _should_force_inline_browser_sync(sync_updates: dict) -> bool:
+    """
+    Force inline sync on stage-boundary answers so tool response can include
+    next-page "Still needed" immediately (prevents dead-air after navigation).
+    """
+    stage = browser_manager.get_current_stage()
+    if stage == "property":
+        # Only occupancy completion should block inline here. Address selection
+        # and ownership fill are expensive/non-boundary and can run async.
+        return "occupancy_type" in sync_updates
+    if stage == "for-sale":
+        # This answer completes for-sale page and can trigger next navigation.
+        return "is_currently_for_sale" in sync_updates
+    return False
+
+
+def _redact_sensitive_map(data: dict) -> dict:
+    out = dict(data)
+    for key in _SENSITIVE_FIELDS:
+        if key in out and out[key] is not None:
+            out[key] = "***REDACTED***"
+    return out
+
+
+def _redact_if_sensitive(field_name: str, value: object) -> object:
+    if field_name in _SENSITIVE_FIELDS and value is not None:
+        return "***REDACTED***"
+    return value
+
+
+async def _run_browser_sync(
+    sync_updates: dict,
+    out_errors: Optional[List[str]] = None,
+) -> None:
+    def _ve(msg: str) -> None:
+        if out_errors is not None:
+            out_errors.append(msg)
+        else:
+            logger.warning("Browser sync (background): %s", msg)
+
+    run_t0 = time.perf_counter()
+    phases: dict[str, float] = {}
+    try:
+        t0 = time.perf_counter()
+        await ensure_browser_ready()
+        phases["ensure_browser_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+        u = sync_updates
+        # application_state (hydration) must win over the tool copy u: after
+        # select_address + pull, state has the USPS line but u can still have the
+        # short STT street — re-filling the combobox with the short value breaks autocomplete.
+        hydration = browser_manager.build_hydration_payload(application_state)
+        merged: dict = {**u, **hydration}
+        if hydration:
+            logger.info("Browser hydration for current URL — fields: %s", list(hydration.keys()))
+        await path2_debug_log(
+            "path2.browser_sync_start",
+            sync_keys_preview=list(merged.keys())[:24],
+            inline=bool(_use_inline_browser_sync()),
+        )
+
+        max_nav_attempts = 3
+        current_nav = 0
+
+        while current_nav < max_nav_attempts:
+            if application_state.address_line_1:
+                t0 = time.perf_counter()
+                await browser_manager.sync_property_address_from_state(
+                    application_state,
+                    user_updated_address=any(
+                        k in u for k in ("address_line_1", "city", "state")
+                    ),
+                )
+                phases["address_autocomplete_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
+                merged = {**u, **browser_manager.build_hydration_payload(application_state)}
+
+            if browser_manager.get_current_stage() == "consent":
+                if not application_state.password:
+                    auto_pass = "WCL!2026!Agent"
+                    application_state.password = auto_pass
+                    application_state.confirm_password = auto_pass
+                    u["password"] = auto_pass
+                    u["confirm_password"] = auto_pass
+                    merged["password"] = auto_pass
+                    merged["confirm_password"] = auto_pass
+                    logger.info("Auto-generated secure password for the final stage.")
+
+            t0 = time.perf_counter()
+            await browser_manager.fill_form_fields(merged)
+            phases["fill_form_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            t0 = time.perf_counter()
+            if browser_manager.get_current_stage() == "property":
+                await browser_manager.pull_property_fields_from_dom_into_state(
+                    application_state
+                )
+            phases["pull_property_dom_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            t0 = time.perf_counter()
+            try:
+                _settle = float(os.getenv("WCL_FORM_SETTLE_SEC", "0.2").strip() or "0.2")
+            except ValueError:
+                _settle = 0.2
+            _settle = max(0.0, min(_settle, 2.0))
+            await asyncio.sleep(_settle)
+            phases["settle_sleep_ms"] = round(_settle * 1000.0, 2)
+            t0 = time.perf_counter()
+            mismatches = await browser_manager.verify_fields(merged)
+            phases["verify_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            if mismatches:
+                mismatch_list = ", ".join(mismatches)
+                logger.warning("DOM Verification failed for fields: %s", mismatch_list)
+                _ve(
+                    f"BROWSER VERIFICATION WARNING: Fields not updated: {mismatch_list}."
+                )
+            t0 = time.perf_counter()
+            complete = await browser_manager.is_page_complete()
+            if (
+                complete
+                and browser_manager.get_current_stage() == "property"
+            ):
+                # Do not follow DOM alone to Continue. Caller must have committed both
+                # WCL property questions in state so we never advance while still asking
+                # sole/joint and primary/secondary in voice.
+                o = application_state.ownership_type
+                occ = application_state.occupancy_type
+                if o is None or occ is None:
+                    complete = False
+            phases["is_page_complete_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            if complete:
+                logger.info("Page complete. Auto-navigating (1 jump max)...")
+                t0 = time.perf_counter()
+                nav_success = await browser_manager.click_continue()
+                phases["click_continue_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
+                await path2_debug_log(
+                    "path2.page_complete",
+                    **phases,
+                    nav_ok=bool(nav_success),
+                    total_ms=round((time.perf_counter() - run_t0) * 1000, 2),
+                )
+                if nav_success:
+                    current_nav += 1
+                    logger.info(
+                        "Successfully navigated. Stopping auto-advance to stay in sync with caller."
+                    )
+                    break
+                t0 = time.perf_counter()
+                second = await browser_manager.is_page_complete()
+                phases["second_is_complete_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
+                if not second:
+                    logger.info("Navigation confirmed via second-opinion.")
+                    current_nav += 1
+                    break
+                _ve(
+                    "BROWSER NAVIGATION WARNING: 'Continue' button clicked but page did not move."
+                )
+                await path2_debug_log("path2.nav_stuck", **phases, second_opinion=second)
+                break
+            t0 = time.perf_counter()
+            snap = await browser_manager.path2_debug_register_snapshot()
+            phases["snapshot_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            await path2_debug_log(
+                "path2.page_incomplete",
+                **phases,
+                snapshot=snap,
+                total_ms=round((time.perf_counter() - run_t0) * 1000, 2),
+            )
+            break
+    except Exception as e:
+        logger.error("Browser sync failed: %s", str(e), exc_info=True)
+        await path2_debug_log("path2.browser_sync_error", err=str(e)[:300])
 
 
 async def ensure_browser_ready() -> None:
@@ -57,6 +273,7 @@ async def ensure_browser_ready() -> None:
 
 async def reset_state() -> None:
     """Reset the application state and browser for a new call."""
+    await _await_inflight_browser_sync()
     global application_state
     application_state = HelocApplicationState()
     # If a previous browser was left running, shut it down so we start fresh
@@ -66,20 +283,22 @@ async def reset_state() -> None:
     logger.info("Application state reset for new call.")
 
 
-def get_missing_fields() -> list[str]:
+def get_missing_fields() -> str:
     """
-    Return a human-readable list of fields that are still None.
-    
-    Groups fields by section so the agent can ask about related fields
-    together (e.g., "Can I get your city and state?" rather than asking
-    each individually).
+    Return a short line for the LLM: browser stage + still-needed labels.
+
+    Stage defaults to property (1) when URL is unknown so the list is never
+    empty at call start.
     """
     missing = []
     state = application_state
 
+    # WCL /register: picking one row from the address dropdown fills street, city, state, zip
+    # in the browser. User is never asked for city/state/zip in voice—only the street line for
+    # the search, then ownership and occupancy. (Browser still hydrates/validates those fields
+    # separately in BrowserManager.)
     FIELD_STAGES = {
-        "address_line_1": 1, "city": 1, "state": 1, "zipcode": 1,
-        "ownership_type": 1, "occupancy_type": 1,
+        "address_line_1": 1, "ownership_type": 1, "occupancy_type": 1,
         "is_currently_for_sale": 2,
         "annual_pre_tax_income": 3, "other_income": 3, "primary_source_of_income": 3,
         "first_name": 4, "last_name": 4, "middle_name": 4, "suffix": 4,
@@ -95,7 +314,9 @@ def get_missing_fields() -> list[str]:
     }
 
     current_stage_name = browser_manager.get_current_stage()
-    current_stage_num = STAGE_NUMS.get(current_stage_name, 0)
+    current_stage_num = STAGE_NUMS.get(current_stage_name)
+    if current_stage_num is None or current_stage_num == 0:
+        current_stage_num = 1  # property intake until URL resolves
 
     # FILTERING LOGIC: If we are at a later stage, ignore MISSING fields from past stages
     # unless they are 'required' (unfilled required fields usually block the browser anyway).
@@ -121,11 +342,37 @@ def get_missing_fields() -> list[str]:
         "date_of_birth": "date of birth",
         "mobile_phone_number": "mobile phone number",
         "email_address": "email address",
-        "agreed_to_privacy_policy": "privacy policy agreement",
+        "agreed_to_privacy_policy": (
+            "privacy policy, terms of service, and soft credit pull (one consent)"
+        ),
         "agreed_to_commerce_communication": "marketing communications consent",
         "agreed_to_credit_pull": "consent for electronic communications and soft credit pull",
         "password": "account password",
         "confirm_password": "password confirmation"
+    }
+    # Short scripted asks per field. Keep deterministic to avoid drift.
+    field_to_question = {
+        "address_line_1": "Property address?",
+        "ownership_type": "Sole or joint owner?",
+        "occupancy_type": "Primary, secondary, or investment?",
+        "is_currently_for_sale": "Currently for sale?",
+        "annual_pre_tax_income": "Annual pre-tax income?",
+        "other_income": "Any other income?",
+        "primary_source_of_income": "Primary income source?",
+        "first_name": "First name?",
+        "middle_name": "Middle name? Optional.",
+        "last_name": "Last name?",
+        "suffix": "Any suffix like Jr or Sr? Optional.",
+        "date_of_birth": "Date of birth?",
+        "mobile_phone_number": "Mobile phone?",
+        "email_address": "Email?",
+        "agreed_to_privacy_policy": (
+            "Privacy policy, terms of service, and soft credit pull — all okay?"
+        ),
+        "agreed_to_commerce_communication": "Agree to marketing texts?",
+        "agreed_to_credit_pull": "Agree to soft credit pull?",
+        "password": "Create password.",
+        "confirm_password": "Confirm password.",
     }
     
     # STAGE-LOCKING LOGIC:
@@ -139,10 +386,19 @@ def get_missing_fields() -> list[str]:
     # Get optional fields list for classifications
     optional_fields = BrowserManager.OPTIONAL_FIELDS
 
+    # WCL /register: combobox + DOM fill city/state/zip — not voice-collected; must not
+    # block "stage 1 done" or appear in Still needed (also avoids async pull race).
+    # Use stage number 1, not URL name "property": at call start get_current_stage() is often
+    # "unknown" while FIELD_STAGES still maps to register intake.
+    dom_filled_at_property = frozenset({"city", "state", "zipcode"})
+
     # Check if current stage is "complete" (no required missing fields)
     current_stage_is_done = True
     for f in current_stage_fields:
-        if not hasattr(state, f): continue
+        if current_stage_num == 1 and f in dom_filled_at_property:
+            continue
+        if not hasattr(state, f):
+            continue
         val = getattr(state, f)
         if (val is None or val == "") and f not in optional_fields:
             current_stage_is_done = False
@@ -153,20 +409,73 @@ def get_missing_fields() -> list[str]:
     final_missing = []
     
     for field_name in target_fields:
-        if not hasattr(state, field_name): continue
-            
+        if current_stage_num == 1 and field_name in dom_filled_at_property:
+            continue
+        if not hasattr(state, field_name):
+            continue
         current_val = getattr(state, field_name)
         if current_val is None or current_val == "":
+            # One verbal consent covers privacy + soft credit pull (same page step).
+            if (
+                field_name == "agreed_to_credit_pull"
+                and getattr(state, "agreed_to_privacy_policy", None) is None
+            ):
+                continue
             display_name = model_field_to_display.get(field_name)
             if display_name:
                 final_missing.append(display_name)
 
+    # Do not ask for stage-2 fields while the browser is still on the property URL —
+    # those inputs are not in the DOM yet (avoids failed radio fill + duplicate questions).
+    sale_label = model_field_to_display.get("is_currently_for_sale")
+    if (
+        sale_label
+        and sale_label in final_missing
+        and browser_manager._page is not None
+    ):
+        try:
+            page_url = browser_manager._page.url or ""
+        except Exception:
+            page_url = ""
+        if "for-sale" not in page_url:
+            final_missing = [x for x in final_missing if x != sale_label]
+
     # Prepend stage context for the LLM
     stage_header = f"[BROWSER STAGE: {current_stage_name.upper()}]"
     if not final_missing:
-        return f"{stage_header} All current fields filled. Waiting for navigation..."
-        
-    return f"{stage_header} Still needed: " + ", ".join(final_missing)
+        if current_stage_is_done and current_stage_num >= 7:
+            return ""
+        return (
+            f"{stage_header} All current fields filled. Waiting for navigation. "
+            "Do NOT ask for-sale, income, or any next-page field until a later tool "
+            "result shows the new stage in \"Still needed\" (browser may be clicking Continue). "
+            "At most 3 words of hold (e.g. \"One sec\") or stay silent — no new questions."
+        )
+
+    first_missing_field: Optional[str] = None
+    for field_name in target_fields:
+        if current_stage_num == 1 and field_name in dom_filled_at_property:
+            continue
+        if not hasattr(state, field_name):
+            continue
+        current_val = getattr(state, field_name)
+        if current_val is None or current_val == "":
+            if (
+                field_name == "agreed_to_credit_pull"
+                and getattr(state, "agreed_to_privacy_policy", None) is None
+            ):
+                continue
+            if model_field_to_display.get(field_name) in final_missing:
+                first_missing_field = field_name
+                break
+
+    question_hint = ""
+    if first_missing_field:
+        preset = field_to_question.get(first_missing_field)
+        if preset:
+            question_hint = f' Ask next: "{preset}"'
+
+    return f"{stage_header} Still needed: " + ", ".join(final_missing) + question_hint
 
 
 # =============================================================================
@@ -175,6 +484,15 @@ def get_missing_fields() -> list[str]:
 # moving to the next question.
 # =============================================================================
 CONFIDENCE_THRESHOLD = 0.85
+# Address is recovered via autocomplete + DOM sync; allow slightly lower score
+# so callers don't get stuck in repeat loops on noisy 8 kHz STT.
+ADDRESS_CONFIDENCE_THRESHOLD = 0.75
+ADDRESS_CONFIDENCE_FIELDS = {
+    "address_line_1",
+    "city",
+    "state",
+    "zipcode",
+}
 
 # Fields that require explicit high-confidence consent (legal compliance).
 # Vague responses like "sure" or "I guess" are not sufficient.
@@ -210,6 +528,515 @@ UNCERTAINTY_MARKERS = [
 ]
 
 
+def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
+    """Map common STT garbles of 'sole/joint owner' to enum when LLM omits ownership_type."""
+    if not text or not str(text).strip():
+        return None
+    # ink-whisper / phone: "Sole" → "Stole" as a short final; check each clause
+    for part in re.split(r"[.!?\n]+", text):
+        seg = part.strip().lower()
+        if not seg:
+            continue
+        if re.search(r"\bjoint\b", seg):
+            return "Joint owner"
+        if re.fullmatch(r"stole\.?", seg):
+            return "Sole owner"
+        if re.fullmatch(r"soul\.?", seg):
+            return "Sole owner"
+        if re.fullmatch(r"sool.*", seg):
+            return "Sole owner"
+        if re.fullmatch(r"so,?\s*loner\.?", seg):
+            return "Sole owner"
+        if re.fullmatch(r"soul\s+or\s+not\.?", seg):
+            return "Sole owner"
+        # 8 kHz + ink-whisper: "sole" often transcribes as "phone" / "foam"
+        if re.fullmatch(r"(phone|foam)\.?", seg):
+            return "Sole owner"
+        if re.fullmatch(r"toll\.?", seg):
+            return "Sole owner"
+        # ink-whisper: "sole owner" → "Soul bonus." / similar
+        if re.search(r"\bsoul\s+bonus\b", seg):
+            return "Sole owner"
+    low = text.lower()
+    if re.search(r"\bjoint\b", low):
+        return "Joint owner"
+    if re.search(
+        r"\b(sole|soul|soil|solo)\s*owners?\b"
+        r"|so,?\s*loner"
+        r"|stole\s*,?\s*stole"
+        r"|\bstole\s+owners?\b"
+        r"|\bso\s+owners?\b"
+        r"|\btool\s*owners?\b"
+        r"|sotool"
+        r"|\btoll\s+owners?\b"
+        r"|\bfoam\s+owners?\b"
+        r"|\bsold\s+owners?\b"
+        r"|\bsool\b"
+        r"|\bsoul\s+or\s+not\b",
+        low,
+    ):
+        return "Sole owner"
+    return None
+
+
+def infer_occupancy_from_transcript(text: str) -> Optional[OccupancyType]:
+    """Map common STT phrasing to occupancy when LLM omits occupancy_type."""
+    if not text or not str(text).strip():
+        return None
+    low = text.lower()
+    if re.search(r"\b(investment|investor|rental\s+property)\b", low):
+        return "Investment property"
+    if re.search(r"\bsecondary\b|\bsecond\s+home\b|\bvacation\s+home\b", low):
+        return "Secondary property"
+    if re.search(
+        r"\bprimary\s+property\b"
+        r"|\bprimary\b"
+        r"|\bmain\s+home\b"
+        r"|\bowner\s*[- ]?\s*occupied\b",
+        low,
+    ):
+        return "Primary property"
+    return None
+
+
+def infer_for_sale_from_transcript(text: str) -> Optional[bool]:
+    """Map short yes/no STT to is_currently_for_sale when the model omits the tool field."""
+    if not text or not str(text).strip():
+        return None
+    t = text.strip().lower().rstrip(".,!?")
+    if not t:
+        return None
+    if re.fullmatch(
+        r"(yes|yeah|yep|yup|correct|true|indeed|absolutely|certainly|definitely|sure|of course|it is|uh\s*-?\s*huh)",
+        t,
+    ):
+        return True
+    if re.fullmatch(r"(no|nope|nah|negative|false|naw|it'?s not|not really)", t):
+        return False
+    if len(t) <= 28 and re.match(r"^(yes|yeah|yep|yup|it is)\b", t):
+        return True
+    if len(t) <= 32 and re.match(r"^(no|nope|nah|it'?s not)\b", t):
+        return False
+    return None
+
+
+def infer_income_source_from_transcript(text: str) -> Optional[IncomeSource]:
+    """Map common spoken variants (without punctuation/dashes) to IncomeSource enum."""
+    if not text or not str(text).strip():
+        return None
+    low = text.lower()
+
+    if "full time" in low or "full-time" in low:
+        return "Employed full-time"
+    if "part time" in low or "part-time" in low:
+        return "Employed part-time"
+    if "self employed" in low or "self-employed" in low:
+        return "Self-employed"
+    if "retired" in low:
+        return "Retired"
+    if "unemployed" in low or "furlough" in low:
+        return "Unemployed / furloughed"
+    if "alimony" in low:
+        return "Alimony"
+    if "child support" in low:
+        return "Child support"
+    if "public assistance" in low:
+        return "Public assistance program"
+    if "separate maintenance" in low:
+        return "Separate maintenance payments"
+    # Bare "employed" without qualifier — default to full-time (most common).
+    if re.search(r"\bemployed\b", low):
+        return "Employed full-time"
+    return None
+
+
+_WORD_NUMS: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
+    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90,
+    "a": 1,
+}
+
+
+def _spoken_number_to_int(text: str) -> Optional[int]:
+    """Convert English spoken number phrase to int.
+
+    Handles: "two hundred fifty thousand", "eighty thousand",
+    "one point five million", "a hundred thousand", etc.
+    Returns None on failure.
+    """
+    tokens = re.split(r"[\s,]+", text.strip().lower())
+    # Strip punctuation per-token so inputs like "million." still parse.
+    tokens = [re.sub(r"[^a-z0-9]", "", t) for t in tokens if t]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return None
+
+    # Handle "point" for decimals before multiplier: "one point five million"
+    point_idx = None
+    for i, t in enumerate(tokens):
+        if t == "point":
+            point_idx = i
+            break
+
+    if point_idx is not None and point_idx > 0:
+        whole_part = _spoken_number_to_int(" ".join(tokens[:point_idx]))
+        frac_tokens = tokens[point_idx + 1:]
+        if not frac_tokens or whole_part is None:
+            return None
+        # fraction digit(s) before multiplier
+        mult_idx = None
+        for i, t in enumerate(frac_tokens):
+            if t in ("thousand", "million", "billion"):
+                mult_idx = i
+                break
+        if mult_idx is not None:
+            frac_word_part = frac_tokens[:mult_idx]
+            mult_word = frac_tokens[mult_idx]
+            multiplier = {"thousand": 1_000, "million": 1_000_000}.get(mult_word, 1)
+            frac_val = _spoken_number_to_int(" ".join(frac_word_part))
+            if frac_val is None:
+                return None
+            frac_digits = len(str(frac_val))
+            result = (whole_part + frac_val / (10 ** frac_digits)) * multiplier
+            return int(result)
+        return None
+
+    total = 0
+    current = 0
+    has_value = False
+    _TENS = frozenset({20, 30, 40, 50, 60, 70, 80, 90})
+
+    for t in tokens:
+        if t in _WORD_NUMS:
+            v = _WORD_NUMS[t]
+            # Shorthand: "one fifty" = 150, "two thirty" = 230.
+            # When current is 1-9 and next word is a tens (20-90), treat as X*100+Y.
+            if v in _TENS and 1 <= current <= 9:
+                current = current * 100 + v
+            else:
+                current += v
+            has_value = True
+        elif t == "hundred":
+            current = max(current, 1) * 100
+            has_value = True
+        elif t == "thousand":
+            current = max(current, 1) * 1_000
+            total += current
+            current = 0
+            has_value = True
+        elif t == "million":
+            current = max(current, 1) * 1_000_000
+            total += current
+            current = 0
+            has_value = True
+        elif t in ("and", "dollars", "dollar", "bucks", "per", "year", "annually"):
+            continue
+        else:
+            return None  # unknown token — bail
+
+    if not has_value:
+        return None
+    total += current
+    return total if total > 0 else None
+
+
+def infer_annual_income_from_transcript(text: str) -> Optional[int]:
+    """Map spoken annual income to integer dollars.
+
+    Handles: raw digits ("100000"), suffix shorthand ("80K", "1.5M"),
+    spoken words ("eighty thousand", "two hundred fifty thousand"),
+    and contextual bare numbers ("eighty" -> 80000 in HELOC context).
+    """
+    if not text or not str(text).strip():
+        return None
+    low = text.lower().strip()
+    # Keep decimal dot in numeric forms (1.5m), but remove sentence punctuation.
+    low = low.replace(",", " ")
+    low = re.sub(r"(?<!\d)\.(?!\d)", " ", low)
+    low = re.sub(r"[?!]", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+
+    # --- suffix shorthand: "1M", "1.5m", "80K", "80 k" ---
+    m = re.search(r"(\d+(?:\.\d+)?)\s*m\b", low)
+    if m:
+        val = int(float(m.group(1)) * 1_000_000)
+        if 0 < val <= 100_000_000:
+            return val
+    m = re.search(r"(\d+(?:\.\d+)?)\s*k\b", low)
+    if m:
+        val = int(float(m.group(1)) * 1_000)
+        if 0 < val <= 100_000_000:
+            return val
+
+    # --- raw digit string: "1-0-0-0-0-0" / "1000000" / "100000" ---
+    digits_only = re.sub(r"\D", "", low)
+    if digits_only:
+        try:
+            val = int(digits_only)
+            if 0 < val <= 100_000_000:
+                return val
+        except ValueError:
+            pass
+
+    # --- spoken digit-sequence: "one zero zero zero zero zero" ---
+    digit_word_map = {
+        "zero": "0",
+        "oh": "0",
+        "o": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+    }
+    wtokens = [re.sub(r"[^a-z0-9]", "", t) for t in low.split()]
+    if wtokens and all(t in digit_word_map for t in wtokens):
+        seq = "".join(digit_word_map[t] for t in wtokens).lstrip("0") or "0"
+        try:
+            val = int(seq)
+            if 0 < val <= 100_000_000:
+                return val
+        except ValueError:
+            pass
+
+    # --- spoken words: "eighty thousand", "one point five million" ---
+    spoken = _spoken_number_to_int(low)
+    if spoken is not None and spoken >= 1_000 and spoken <= 100_000_000:
+        return spoken
+
+    # --- contextual bare number: "eighty" -> 80_000 in HELOC income context ---
+    # Small bare numbers (1-999) likely mean thousands.
+    if spoken is not None and 1 <= spoken <= 999:
+        return spoken * 1_000
+
+    return None
+
+
+def infer_other_income_from_transcript(text: str) -> Optional[int]:
+    """Infer optional other income; map clear negatives to 0."""
+    if not text or not str(text).strip():
+        return None
+    low = text.lower().strip()
+    normalized = re.sub(r"[^\w\s]", " ", low)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    # Repeated negatives from 8kHz STT like "no, no" should still map to zero.
+    if re.fullmatch(r"(no|nope|none|nothing|zero|0)(\s+(no|nope|none|nothing|zero|0))*", normalized):
+        return 0
+    if normalized in {
+        "no other income",
+        "no any other income",
+        "none",
+        "nope",
+        "no",
+        "zero",
+        "0",
+        "nothing",
+    }:
+        return 0
+    return infer_annual_income_from_transcript(text)
+
+
+_MONTH_NAMES: dict[str, int] = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6,
+    "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_PAT = "|".join(_MONTH_NAMES.keys())
+
+
+def infer_dob_from_transcript(text: str) -> Optional[str]:
+    """Parse DOB from numeric (MM/DD/YYYY) or spoken ('January 5th 1990') forms."""
+    if not text or not str(text).strip():
+        return None
+
+    # Numeric: 01/05/1990 or 01-05-1990
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", text)
+    if m:
+        mm, dd, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
+            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
+
+    low = text.lower().strip()
+
+    # Spoken: "January 5th 1990", "march 15 1985"
+    m = re.search(
+        rf"\b({_MONTH_PAT})\s+(\d{{1,2}})\s*(?:st|nd|rd|th)?\s*,?\s*(\d{{4}})\b",
+        low,
+    )
+    if m:
+        mm = _MONTH_NAMES[m.group(1)]
+        dd, yyyy = int(m.group(2)), int(m.group(3))
+        if 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
+            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
+
+    # Reversed: "5th January 1990"
+    m = re.search(
+        rf"\b(\d{{1,2}})\s*(?:st|nd|rd|th)?\s+({_MONTH_PAT})\s+(\d{{4}})\b",
+        low,
+    )
+    if m:
+        dd = int(m.group(1))
+        mm = _MONTH_NAMES[m.group(2)]
+        yyyy = int(m.group(3))
+        if 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
+            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
+
+    return None
+
+
+def infer_phone_from_transcript(text: str) -> Optional[str]:
+    """Parse US phone from spoken digits."""
+    if not text or not str(text).strip():
+        return None
+    d = re.sub(r"\D", "", text)
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) == 10:
+        return d
+    return None
+
+
+def infer_email_from_transcript(text: str) -> Optional[str]:
+    """Parse email from typed form or spoken 'at'/'dot' variants."""
+    if not text or not str(text).strip():
+        return None
+    raw = text.strip().lower()
+    normalized = (
+        raw.replace(" at ", "@")
+        .replace(" dot ", ".")
+        .replace(" period ", ".")
+        .replace(" underscore ", "_")
+        .replace(" dash ", "-")
+        .replace(" hyphen ", "-")
+        .replace(" ", "")
+    )
+    normalized = normalized.rstrip(".,;:!?")
+    if STRICT_EMAIL_REGEX.match(normalized):
+        return normalized
+    return None
+
+
+def infer_property_address_from_transcript(text: str) -> Optional[str]:
+    """
+    Parse likely street line from noisy STT.
+    Requires leading street number to avoid accidental captures.
+    """
+    if not text or not str(text).strip():
+        return None
+    low = text.lower().strip()
+    m = re.match(r"^\s*(\d{1,6})\s+([a-z0-9\s.-]{3,})", low)
+    if not m:
+        return None
+    num = m.group(1)
+    rest = m.group(2)
+    # Stop at clear separators before city/state tail.
+    rest = re.split(r",|\bin\s+[a-z]+\b|\bcalifornia\b|\bca\b", rest, maxsplit=1)[0].strip()
+    if not rest:
+        return None
+    # Common STT fixes.
+    rest = re.sub(r"\band\s+lewart\b", "boulevard", rest)
+    rest = re.sub(r"\blewart\b", "boulevard", rest)
+    rest = re.sub(r"\s+", " ", rest).strip(" .,-")
+    if len(rest) < 3:
+        return None
+    return f"{num} {rest.title()}"
+
+
+def infer_name_fields_from_transcript(
+    text: str,
+    *,
+    need_first: bool,
+    need_last: bool,
+) -> dict[str, str]:
+    """
+    Parse simple spoken legal name replies for NAME stage safety net.
+
+    Conservative by design:
+    - Accept one clean token for first or last name.
+    - Accept two clean tokens as first+last when both missing.
+    - Reject obvious non-name utterances ("but it's sad", "yes", "primary", etc.).
+    """
+    if not text or not str(text).strip():
+        return {}
+
+    s = text.strip().lower()
+    s = re.sub(r"^(my name is|name is|i am|im|it's|it is|this is)\s+", "", s)
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z'-]{0,30}", s)
+    if not tokens:
+        return {}
+    if len(tokens) > 2:
+        return {}
+    if re.search(r"\d", s):
+        return {}
+
+    stop = {
+        "yes",
+        "no",
+        "primary",
+        "secondary",
+        "investment",
+        "owner",
+        "sole",
+        "joint",
+        "million",
+        "thousand",
+        "income",
+        "address",
+        "hello",
+        "hi",
+        "sad",
+        "but",
+    }
+    if any(t.lower() in stop for t in tokens):
+        return {}
+
+    out: dict[str, str] = {}
+    if len(tokens) == 1:
+        t = tokens[0].title()
+        if need_first:
+            out["first_name"] = t
+        elif need_last:
+            out["last_name"] = t
+        return out
+
+    # len == 2
+    t1, t2 = tokens[0].title(), tokens[1].title()
+    if need_first and need_last:
+        out["first_name"] = t1
+        out["last_name"] = t2
+    elif need_first:
+        out["first_name"] = t1
+    elif need_last:
+        out["last_name"] = t2
+    return out
+
+
+def infer_yes_no_from_transcript(text: str) -> Optional[bool]:
+    """Map short affirmation/negation utterances to bool."""
+    if not text or not str(text).strip():
+        return None
+    t = text.strip().lower().rstrip(".,!?")
+    if t in {
+        "yes", "yeah", "yep", "yup", "correct", "right",
+        "i agree", "agree", "sure", "of course", "absolutely",
+        "definitely", "certainly",
+    }:
+        return True
+    if t in {"no", "nope", "nah", "not really", "i don't think so", "negative"}:
+        return False
+    return None
+
+
 def detect_uncertainty(raw_input: str) -> list[str]:
     """
     Scan raw user speech for hedging / uncertainty language.
@@ -233,7 +1060,7 @@ def detect_uncertainty(raw_input: str) -> list[str]:
 #    state="IL", confidence_score=0.95
 # 3. LLM calls this tool with those 3 fields (other params stay None)
 # 4. Tool updates state, returns: "Updated: street address, city, state.
-#    Still needed: zipcode, ownership type, ..."
+#    Still needed: ownership type, ..." (zip comes from site autocomplete when possible)
 # 5. LLM reads the return value and asks the caller for the next missing item.
 #
 # Confidence scoring:
@@ -262,9 +1089,11 @@ async def update_application_state(
     mobile_phone_number: Annotated[Optional[str], "10-digit mobile phone number"] = None,
     email_address: Annotated[Optional[str], "Email address"] = None,
     agreed_to_privacy_policy: Annotated[Optional[bool], "User explicitly says 'I agree' to Privacy Policy and Terms of Service"] = None,
+    agreed_to_commerce_communication: Annotated[Optional[bool], "User agrees to marketing/commerce communications"] = None,
     agreed_to_credit_pull: Annotated[Optional[bool], "User explicitly says 'I agree' to Electronic Communications Policy and soft credit pull"] = None,
     confidence_score: Annotated[Optional[float], "Your confidence (0.0-1.0) in the accuracy of the extracted data. Set lower if the caller was unclear, mumbled, or you had to guess."] = None,
     raw_user_input: Annotated[Optional[str], "The exact transcript of what the user just said. Always pass this so the system can detect uncertainty."] = None,
+    deterministic_call: Annotated[Optional[bool], "Internal use only: deterministic parser call path."] = None,
 ) -> str:
     """
     Save extracted application data from the user's speech. Call this tool
@@ -279,11 +1108,11 @@ async def update_application_state(
       can detect uncertainty markers like 'maybe', 'I think', 'or', etc.
     """
     global application_state
+    await _await_inflight_browser_sync()
     
     # Collect which fields were actually provided in this call
     updates = {}
     validation_errors = []
-    needs_confirmation = []  # Fields saved but below confidence threshold
     local_vars = {
         "address_line_1": address_line_1,
         "apt_suite": apt_suite,
@@ -304,9 +1133,47 @@ async def update_application_state(
         "mobile_phone_number": mobile_phone_number,
         "email_address": email_address,
         "agreed_to_privacy_policy": agreed_to_privacy_policy,
+        "agreed_to_commerce_communication": agreed_to_commerce_communication,
         "agreed_to_credit_pull": agreed_to_credit_pull,
     }
-    
+
+    # Stage-gate accepted fields so off-page hallucinated saves do not derail flow.
+    stage_to_allowed_fields = {
+        "property": {
+            "address_line_1",
+            "apt_suite",
+            "city",
+            "state",
+            "zipcode",
+            "ownership_type",
+            "occupancy_type",
+        },
+        "for-sale": {"is_currently_for_sale"},
+        "income": {"annual_pre_tax_income", "other_income", "primary_source_of_income"},
+        "name": {"first_name", "middle_name", "last_name", "suffix"},
+        "birthday": {"date_of_birth"},
+        "contact": {"mobile_phone_number", "email_address"},
+        "consent": {"agreed_to_privacy_policy", "agreed_to_commerce_communication", "agreed_to_credit_pull"},
+    }
+    current_stage = browser_manager.get_current_stage()
+    allowed_now = stage_to_allowed_fields.get(current_stage)
+
+    # STT often garbles "sole owner" / "primary property"; infer if LLM omitted fields.
+    if raw_user_input and browser_manager.get_current_stage() == "property":
+        if local_vars.get("ownership_type") is None:
+            inferred_o = infer_ownership_from_transcript(raw_user_input)
+            if inferred_o:
+                local_vars["ownership_type"] = inferred_o
+        if local_vars.get("occupancy_type") is None:
+            inferred_occ = infer_occupancy_from_transcript(raw_user_input)
+            if inferred_occ:
+                local_vars["occupancy_type"] = inferred_occ
+    if raw_user_input and browser_manager.get_current_stage() == "for-sale":
+        if local_vars.get("is_currently_for_sale") is None:
+            inferred_fs = infer_for_sale_from_transcript(raw_user_input)
+            if inferred_fs is not None:
+                local_vars["is_currently_for_sale"] = inferred_fs
+
     # Determine effective confidence (default to 1.0 if not provided)
     score = confidence_score if confidence_score is not None else 1.0
     is_low_confidence = score < CONFIDENCE_THRESHOLD
@@ -331,7 +1198,7 @@ async def update_application_state(
             )
             
             missing = get_missing_fields()
-            missing_str = f" Still needed: {', '.join(missing)}." if missing else ""
+            missing_str = f" {missing}" if missing and missing.strip() else ""
             
             return (
                 f"Update PENDING. Uncertainty detected in user speech: "
@@ -342,8 +1209,17 @@ async def update_application_state(
                 f"{missing_str}"
             )
     
+    low_conf_pending = []
+    pending_conf_requirements: dict[str, float] = {}
     for field_name, value in local_vars.items():
         if value is not None:
+            if allowed_now is not None and field_name not in allowed_now:
+                logger.info(
+                    "Ignoring off-stage field '%s' while stage=%s",
+                    field_name,
+                    current_stage,
+                )
+                continue
             # -- Special handling: legal consent fields require explicit agreement --
             if field_name in HIGH_CONFIDENCE_FIELDS:
                 if is_low_confidence or not value:
@@ -360,6 +1236,16 @@ async def update_application_state(
                         field_name, score, value,
                     )
                     continue  # Do NOT save vague consent
+            field_threshold = (
+                ADDRESS_CONFIDENCE_THRESHOLD
+                if field_name in ADDRESS_CONFIDENCE_FIELDS
+                else CONFIDENCE_THRESHOLD
+            )
+            field_low_confidence = score < field_threshold
+            if field_low_confidence:
+                low_conf_pending.append(f"{field_name}='{value}'")
+                pending_conf_requirements[field_name] = field_threshold
+                continue  # Save only after explicit reconfirmation
             
             # -- Special handling: income must be positive --
             if field_name == "annual_pre_tax_income" and value is not None and value <= 0:
@@ -374,12 +1260,6 @@ async def update_application_state(
                 setattr(application_state, field_name, value)
                 updates[field_name] = value
                 
-                # -- Low confidence: saved but needs verbal re-confirmation --
-                if is_low_confidence and field_name not in HIGH_CONFIDENCE_FIELDS:
-                    needs_confirmation.append(
-                        f"'{field_name}' was captured as '{value}'"
-                    )
-                    
             except (ValidationError, ValueError) as e:
                 # Validator rejected this value — tell the LLM what went wrong
                 # so it can ask the caller to correct it.
@@ -388,79 +1268,83 @@ async def update_application_state(
                     f"Invalid data for {field_name}. {error_msg} "
                     "Please explain the requirement to the user and ask again."
                 )
-                logger.warning("Validation failed for %s='%s': %s", field_name, value, error_msg)
+                logger.warning(
+                    "Validation failed for %s='%s': %s",
+                    field_name,
+                    _redact_if_sensitive(field_name, value),
+                    error_msg,
+                )
+
+    # WCL register: one checkbox flow for voice — agreeing to privacy/terms
+    # implies the same answer for soft credit pull (no separate spoken question).
+    if (
+        "agreed_to_privacy_policy" in updates
+        and "agreed_to_credit_pull" not in updates
+    ):
+        pv = updates["agreed_to_privacy_policy"]
+        if pv is True:
+            updates["agreed_to_credit_pull"] = True
+            setattr(application_state, "agreed_to_credit_pull", True)
+        elif pv is False:
+            updates["agreed_to_credit_pull"] = False
+            setattr(application_state, "agreed_to_credit_pull", False)
     
     # =========================================================================
     # BROWSER SYNCHRONIZATION — Mirror valid updates to the live browser
+    # Default: run async in background so the LLM is not blocked ~10s on address
+    # autocomplete. Set SYNC_BROWSER_INLINE=1 to block in-process (stricter
+    # validation errors in the same turn).
     # =========================================================================
+    if low_conf_pending:
+        missing = get_missing_fields()
+        pending = "; ".join(low_conf_pending)
+        required_conf = (
+            max(pending_conf_requirements.values())
+            if pending_conf_requirements
+            else CONFIDENCE_THRESHOLD
+        )
+        return (
+            f"Update PENDING (low confidence {score:.0%}). "
+            f"Did not save: {pending}. "
+            "Ask user again for same field(s), then call update_application_state with "
+            f"confidence_score >= {required_conf:.2f}. Ask next: \"Is that correct?\"."
+            + (f" {missing}" if missing and missing.strip() else "")
+        )
+
     if updates:
-        try:
-            await ensure_browser_ready()
-            
-            # -- RECURSIVE FILLING LOOP --
-            # We loop to handle cases where the agent provides data for multiple pages at once.
-            max_nav_attempts = 3
-            current_nav = 0
-            
-            while current_nav < max_nav_attempts:
-                # 1. Special case: Address Selection (triggers autocomplete)
-                if "address_line_1" in updates:
-                    full_address = updates["address_line_1"]
-                    if application_state.city: full_address += f" {application_state.city}"
-                    if application_state.state: full_address += f" {application_state.state}"
-                    if application_state.zipcode: full_address += f" {application_state.zipcode}"
-                    await browser_manager.select_address(full_address)
-                
-                # 2. Special case: Consent stage password generation
-                # If we are on the consent page and password is missing, auto-generate it.
-                if browser_manager.get_current_stage() == "consent":
-                    if not application_state.password:
-                        # Generate a simple but secure-looking password for the user
-                        auto_pass = "WCL!2024!Agent"
-                        application_state.password = auto_pass
-                        application_state.confirm_password = auto_pass
-                        updates["password"] = auto_pass
-                        updates["confirm_password"] = auto_pass
-                        logger.info("Auto-generated secure password for the final stage.")
+        ucopy = dict(updates)
+        inline_sync = (
+            not bool(deterministic_call)
+            and (_use_inline_browser_sync() or _should_force_inline_browser_sync(ucopy))
+        )
+        if inline_sync:
+            try:
+                await _run_browser_sync(ucopy, validation_errors)
+            except Exception as e:
+                logger.error("Browser sync failed: %s", str(e), exc_info=True)
+        else:
+            global _browser_sync_inflight
+            task = asyncio.create_task(_run_browser_sync(ucopy, None))
 
-                # 3. Bulk fill fields visible on current page
-                await browser_manager.fill_form_fields(updates)
+            def _on_done(t: asyncio.Task) -> None:
+                global _browser_sync_inflight
+                if _browser_sync_inflight is t:
+                    _browser_sync_inflight = None
+                ex = t.exception()
+                if ex is not None and not isinstance(ex, asyncio.CancelledError):
+                    logger.error("Background browser task failed: %s", ex, exc_info=ex)
 
-                # 4. DOM Verification
-                mismatches = await browser_manager.verify_fields(updates)
-                if mismatches:
-                    mismatch_list = ", ".join(mismatches)
-                    logger.warning("DOM Verification failed for fields: %s", mismatch_list)
-                    validation_errors.append(f"BROWSER VERIFICATION WARNING: Fields not updated: {mismatch_list}.")
-
-                # 5. Check Complete and Navigate (SPEED GOVERNOR)
-                # We only allow ONE navigation jump per tool call. This ensures the browser 
-                # doesn't skip pages (like DOB) before the caller has spoken.
-                if await browser_manager.is_page_complete():
-                    logger.info("Page complete. Auto-navigating (1 jump max)...")
-                    nav_success = await browser_manager.click_continue()
-                    if nav_success:
-                        current_nav += 1
-                        logger.info("Successfully navigated. Stopping auto-advance to stay in sync with caller.")
-                        # After 1 jump, we stop and let the LLM react to the new page content
-                        break
-                    else:
-                        # SECOND OPINION: If click reported failure, check if the page is STILL complete.
-                        if not await browser_manager.is_page_complete():
-                            logger.info("Navigation confirmed via second-opinion.")
-                            current_nav += 1
-                            break
-                            
-                        validation_errors.append("BROWSER NAVIGATION WARNING: 'Continue' button clicked but page did not move.")
-                        break
-                else:
-                    break
-                
-        except Exception as e:
-            logger.error("Browser sync failed: %s", str(e), exc_info=True)
+            task.add_done_callback(_on_done)
+            _browser_sync_inflight = task
 
     if not updates and not validation_errors:
-        return "No fields were updated. Please extract information from the user's speech before calling this tool."
+        missing = get_missing_fields()
+        return (
+            "No fields were updated. Do not call this tool when the user gave no extractable "
+            "data (e.g. only 'you there?'). You must still speak to the caller — acknowledge "
+            "briefly, then ask the next question from Still needed. "
+            + (missing if missing.strip() else "")
+        )
     
     # Build response parts
     parts = []
@@ -472,27 +1356,339 @@ async def update_application_state(
     if updates:
         updated_names = ", ".join(updates.keys())
         logger.info("State updated — fields: %s (confidence: %.2f)", updated_names, score)
-        logger.debug("Current state: %s", application_state.model_dump(exclude_none=True))
-        parts.append(f"Updated: {updated_names}")
-    
-    # Flag low-confidence fields for verbal re-confirmation
-    if needs_confirmation:
-        confirm_list = "; ".join(needs_confirmation)
-        parts.append(
-            f"NEEDS VERBAL RE-CONFIRMATION (confidence {score:.0%}): {confirm_list}. "
-            "Please ask: 'I heard [value], is that correct?' before moving on."
+        logger.debug(
+            "Current state: %s",
+            _redact_sensitive_map(application_state.model_dump(exclude_none=True)),
         )
+        parts.append(f"Updated: {updated_names}")
     
     # Build the feedback message for the LLM
     missing = get_missing_fields()
     
     if not missing:
         parts.append(
-            "ALL required fields are now collected! "
-            "Please confirm the information with the caller and proceed to submit."
+            "All required fields collected."
         )
     else:
         # 'missing' is now a pre-formatted string from get_missing_fields()
         parts.append(missing)
     
     return ". ".join(parts) + "."
+
+
+async def apply_voice_intake_heuristics_before_line(transcript: str) -> HeuristicResult:
+    """
+    Pre-Line heuristic hook (deterministic-only safety net).
+
+    Returns HeuristicResult with handled=True when parser confidently
+    mapped input to a field update, or handled=False to delegate to LLM.
+
+    Scope intentionally deterministic:
+      - property ownership (sole/joint)
+      - property occupancy (primary/secondary/investment)
+      - for-sale yes/no
+      - annual/other income numeric inference
+      - primary income source enum mapping
+      - DOB date parsing
+      - phone digit parsing
+      - email normalization parser
+      - consent yes/no
+
+    Free-text address fields remain LLM-first to avoid premature autocomplete.
+    """
+    _NOT_HANDLED = HeuristicResult(handled=False)
+
+    if os.getenv("PATH2_ENABLE_PRELINE_HEURISTICS", "1").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return _NOT_HANDLED
+
+    def _extract_ask_next(tool_result: str) -> Optional[str]:
+        m = re.search(r'Ask next:\s*"([^"]+)"', tool_result or "")
+        if not m:
+            return None
+        q = (m.group(1) or "").strip()
+        return q or None
+
+    def _ok(ask: Optional[str], field: str, stage: str) -> HeuristicResult:
+        logger.info(
+            "deterministic_handled field=%s stage=%s",
+            field,
+            stage,
+            extra={"event": "state.deterministic_handled", "field": field, "stage": stage},
+        )
+        return HeuristicResult(handled=True, ask_next=ask, handled_field=field, stage=stage)
+
+    def _fail(stage: str) -> HeuristicResult:
+        return HeuristicResult(handled=False, stage=stage)
+
+    text = (transcript or "").strip()
+    if not text:
+        return _NOT_HANDLED
+    stage = browser_manager.get_current_stage()
+
+    if stage == "property":
+        if application_state.ownership_type is None:
+            own = infer_ownership_from_transcript(text)
+            if own is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        ownership_type=own,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "ownership_type", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line property ownership failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+
+        if application_state.occupancy_type is None:
+            occ = infer_occupancy_from_transcript(text)
+            if occ is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        occupancy_type=occ,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "occupancy_type", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line property occupancy failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+        return _fail(stage)
+
+    if stage == "consent":
+        yn = infer_yes_no_from_transcript(text)
+        if yn is None:
+            return _fail(stage)
+        try:
+            if (
+                application_state.agreed_to_privacy_policy is None
+                or application_state.agreed_to_credit_pull is None
+            ):
+                tool_result = await update_application_state.func(
+                    None,
+                    agreed_to_privacy_policy=yn,
+                    agreed_to_credit_pull=yn,
+                    confidence_score=0.95 if yn else 1.0,
+                    raw_user_input=text,
+                    deterministic_call=True,
+                )
+                return _ok(_extract_ask_next(tool_result), "agreed_to_privacy_policy", stage)
+            if application_state.agreed_to_commerce_communication is None:
+                tool_result = await update_application_state.func(
+                    None,
+                    agreed_to_commerce_communication=yn,
+                    confidence_score=0.95 if yn else 1.0,
+                    raw_user_input=text,
+                    deterministic_call=True,
+                )
+                return _ok(_extract_ask_next(tool_result), "agreed_to_commerce_communication", stage)
+        except Exception as e:
+            logger.warning(
+                "apply_voice_intake_heuristics_before_line consent failed: %s",
+                e,
+                exc_info=True,
+            )
+        return _fail(stage)
+
+    if stage == "name":
+        need_first = application_state.first_name is None
+        need_last = application_state.last_name is None
+        if not need_first and not need_last:
+            return _fail(stage)
+        parsed = infer_name_fields_from_transcript(
+            text,
+            need_first=need_first,
+            need_last=need_last,
+        )
+        if not parsed:
+            return _fail(stage)
+        handled_field = "first_name" if parsed.get("first_name") else "last_name"
+        try:
+            tool_result = await update_application_state.func(
+                None,
+                first_name=parsed.get("first_name"),
+                last_name=parsed.get("last_name"),
+                confidence_score=0.95,
+                raw_user_input=text,
+                deterministic_call=True,
+            )
+            return _ok(_extract_ask_next(tool_result), handled_field, stage)
+        except Exception as e:
+            logger.warning(
+                "apply_voice_intake_heuristics_before_line name failed: %s",
+                e,
+                exc_info=True,
+            )
+        return _fail(stage)
+
+    if stage == "income":
+        if application_state.annual_pre_tax_income is None:
+            inc = infer_annual_income_from_transcript(text)
+            if inc is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        annual_pre_tax_income=inc,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "annual_pre_tax_income", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line income amount failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+
+        if application_state.other_income is None:
+            oi = infer_other_income_from_transcript(text)
+            if oi is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        other_income=oi,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "other_income", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line other income failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+
+        if application_state.primary_source_of_income is None:
+            src = infer_income_source_from_transcript(text)
+            if src is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        primary_source_of_income=src,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "primary_source_of_income", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line income source failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+        return _fail(stage)
+
+    if stage == "birthday":
+        if application_state.date_of_birth is not None:
+            return _fail(stage)
+        dob = infer_dob_from_transcript(text)
+        if dob is None:
+            return _fail(stage)
+        try:
+            tool_result = await update_application_state.func(
+                None,
+                date_of_birth=dob,
+                confidence_score=0.95,
+                raw_user_input=text,
+                deterministic_call=True,
+            )
+            return _ok(_extract_ask_next(tool_result), "date_of_birth", stage)
+        except Exception as e:
+            logger.warning(
+                "apply_voice_intake_heuristics_before_line dob failed: %s",
+                e,
+                exc_info=True,
+            )
+        return _fail(stage)
+
+    if stage == "contact":
+        if application_state.mobile_phone_number is None:
+            ph = infer_phone_from_transcript(text)
+            if ph is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        mobile_phone_number=ph,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "mobile_phone_number", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line phone failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+        if application_state.email_address is None:
+            em = infer_email_from_transcript(text)
+            if em is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        email_address=em,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "email_address", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line email failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+        return _fail(stage)
+
+    if stage != "for-sale":
+        return _NOT_HANDLED
+    if application_state.is_currently_for_sale is not None:
+        return _fail(stage)
+    fs = infer_for_sale_from_transcript(text)
+    if fs is None:
+        return _fail(stage)
+    try:
+        tool_result = await update_application_state.func(
+            None,
+            is_currently_for_sale=fs,
+            confidence_score=0.95,
+            raw_user_input=text,
+            deterministic_call=True,
+        )
+        return _ok(_extract_ask_next(tool_result), "is_currently_for_sale", stage)
+    except Exception as e:
+        logger.warning("apply_voice_intake_heuristics_before_line failed: %s", e, exc_info=True)
+    return _fail(stage)
+
+
+async def apply_voice_intake_heuristics(transcript: str) -> None:
+    """
+    No-op for property stage by design.
+    Property inference lives inside update_application_state so agent and tool
+    stay in sync and avoid duplicate asks.
+    """
+    _ = transcript

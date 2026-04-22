@@ -1,7 +1,22 @@
 import re
+from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Optional, Literal
+
+STRICT_EMAIL_REGEX = re.compile(
+    r"^[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HeuristicResult:
+    """Structured outcome from deterministic pre-LLM heuristic parsing."""
+    handled: bool
+    ask_next: Optional[str] = None
+    handled_field: Optional[str] = None
+    stage: Optional[str] = None
+    normalization_source: str = "deterministic"
 
 # Enum types based on the specific dropdowns in the West Capital UI
 OccupancyType = Literal["Primary property", "Secondary property", "Investment property"]
@@ -54,9 +69,15 @@ class HelocApplicationState(BaseModel):
     email_address: Optional[str] = Field(None, description="User's email address.")
 
     # 7. Legal & Consents
-    agreed_to_privacy_policy: Optional[bool] = Field(None, description="Must be True. User verbally agrees to Privacy Policy and Terms of Service.")
+    agreed_to_privacy_policy: Optional[bool] = Field(
+        None,
+        description="Must be True. User verbally agrees to Privacy Policy, Terms of Service, and soft credit pull (one consent on the form).",
+    )
     agreed_to_commerce_communication: Optional[bool] = Field(None, description="Optional. User agrees to marketing/commerce communications.")
-    agreed_to_credit_pull: Optional[bool] = Field(None, description="Must be True. User verbally consents to the Electronic Communications Policy and soft credit pull.")
+    agreed_to_credit_pull: Optional[bool] = Field(
+        None,
+        description="Must be True. Same checkbox step as privacy/terms for WCL; set together with agreed_to_privacy_policy when user consents once.",
+    )
     
     # 8. Account Security (Auto-generated)
     password: Optional[str] = Field(None, description="Auto-generated account password.")
@@ -124,7 +145,7 @@ class HelocApplicationState(BaseModel):
         if v is None:
             return v
         v = v.strip().lower()
-        if not re.match(r"^[\w.+-]+@[\w-]+\.[\w.-]+$", v):
+        if not STRICT_EMAIL_REGEX.match(v):
             raise ValueError(
                 f"Invalid email format: '{v}'. Expected format: user@example.com."
             )
@@ -150,4 +171,20 @@ class HelocApplicationState(BaseModel):
                 f"'{v}' is not a valid US state abbreviation."
             )
         return v
+
+    def generate_password(self, zipcode: str) -> str:
+        """Build a 12+ character password from name + zip for the consent step."""
+        z = re.sub(r"[^\d]", "", zipcode or "")
+        if len(z) != 5:
+            z = "00000"
+        fn = (self.first_name or "User").strip().replace(" ", "")
+        ln = (self.last_name or "Name").strip().replace(" ", "")
+        base = f"{fn}_{ln}#{z}"
+        if len(base) < 12:
+            base = f"{fn}#{z}"
+        if len(base) < 12:
+            base = f"{base}!2026"
+        while len(base) < 12:
+            base += "X"
+        return base[:64]
 
