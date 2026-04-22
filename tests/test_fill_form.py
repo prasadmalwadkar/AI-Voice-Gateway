@@ -1,6 +1,8 @@
 import asyncio
-import sys
 import os
+import sys
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agent.browser_manager import BrowserManager
@@ -36,6 +38,11 @@ PAGE_7_DATA = {
     "agreed_to_credit_pull": True,
 }
 
+@pytest.mark.browser
+@pytest.mark.skipif(
+    os.getenv("RUN_BROWSER_TESTS") != "1",
+    reason="Set RUN_BROWSER_TESTS=1 to run headed Playwright form test",
+)
 async def test_form_filling():
     import logging
     logging.basicConfig(level=logging.INFO)

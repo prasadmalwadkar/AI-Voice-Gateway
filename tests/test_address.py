@@ -8,8 +8,10 @@ Usage:
 """
 
 import asyncio
-import sys
 import os
+import sys
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agent.browser_manager import BrowserManager
@@ -19,6 +21,11 @@ from agent.browser_manager import BrowserManager
 TEST_ADDRESS = "325 W Adams Blvd Los Angeles CA 90007"
 
 
+@pytest.mark.browser
+@pytest.mark.skipif(
+    os.getenv("RUN_BROWSER_TESTS") != "1",
+    reason="Set RUN_BROWSER_TESTS=1 to run headed Playwright smoke test",
+)
 async def test_select_address():
     print("--- Address Autocomplete Test ---\n")
     manager = BrowserManager()

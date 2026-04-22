@@ -10,8 +10,8 @@ Design principles:
   any browser logic leaking into the voice layer.
 - **Single Context**: One BrowserContext per session preserves cookies and
   session state across the multi-page form.
-- **Demo Mode**: When ``is_demo=True``, the browser launches headed with
-  ``slow_mo=500`` so human observers can follow the automation in real time.
+- **Demo Mode**: When ``is_demo=True``, the browser launches headed (optional
+  ``BROWSER_SLOW_MO_MS`` for slowed replay).
 - **Async Everywhere**: Every public method is ``async``.
 - **Defensive**: Navigation and lifecycle methods are wrapped in try/except
   with structured logging — a failed page load never crashes the caller.
@@ -29,8 +29,9 @@ Usage::
 
 import logging
 import asyncio
+import os
 import re
-from typing import Optional
+from typing import Any, ClassVar, Optional
 
 from playwright.async_api import (
     async_playwright,
@@ -40,7 +41,10 @@ from playwright.async_api import (
     Playwright,
 )
 
+from agent.schema import HelocApplicationState
+
 logger = logging.getLogger("voip.browser")
+_SENSITIVE_FIELDS = frozenset({"password", "confirm_password"})
 
 # The entry-point URL for the HELOC registration form.
 HELOC_REGISTER_URL = "https://heloc.westcapitallending.com/account/heloc/register"
@@ -48,11 +52,70 @@ HELOC_REGISTER_URL = "https://heloc.westcapitallending.com/account/heloc/registe
 # ---------------------------------------------------------------------------
 # CSS Selectors — captured from the live West Capital Lending form.
 # Centralised here so a future UI change only requires one update.
+# Register step: street is the React combobox (type text, listbox, then pick) —
+# same control fills or shows selected line; city/state/zip populate after pick.
 # ---------------------------------------------------------------------------
-SEL_ADDRESS_INPUT = "input[placeholder='Search for your address']"
+SEL_PROPERTY_STREET1 = "input[data-test-id='property-address-street1']"
+# WCL may add placeholder; older builds used name= only — OR chain for one locator
+SEL_STREET_LINE = (
+    f"{SEL_PROPERTY_STREET1}, input[name='address_line_1']"
+)
+# Typing for autocomplete: same combobox, or placeholder-only (legacy)
+SEL_ADDRESS_INPUT = (
+    f"{SEL_PROPERTY_STREET1}, input[placeholder='Search for your address']"
+)
 SEL_AUTOCOMPLETE_LIST = "ul[role='listbox']"
 # Skips the "Address not listed" option at the top of the dropdown.
 SEL_FIRST_SUGGESTION = "li[role='option']:not([id*='not-listed'])"
+
+# WCL /register: occupancy is a radio group name=occupancyType; cards are <label
+# class="...card-select"> wrapping <input type="radio" name="occupancyType" value="HOME">…
+SEL_OCCUPANCY_RADIOS = 'input[type="radio"][name="occupancyType"]'
+# Confirmed: Primary = HOME; other values often SECONDARY + INVESTMENT (verify in prod if form changes)
+OCCUPANCY_ENUM_TO_WCL: dict[str, str] = {
+    "Primary property": "HOME",
+    "Secondary property": "SECONDARY",
+    "Investment property": "INVESTMENT",
+}
+
+
+def _format_full_address_for_autocomplete(state: HelocApplicationState) -> str:
+    parts: list[str] = []
+    if state.address_line_1:
+        parts.append(state.address_line_1.strip())
+    if state.city:
+        parts.append(state.city.strip())
+    if state.state:
+        parts.append(state.state.strip())
+    if state.zipcode:
+        parts.append(state.zipcode.strip())
+    return " ".join(parts)
+
+
+def _street_city_state_key(state: HelocApplicationState) -> str:
+    """Stable key for autocomplete dedupe — omits zip so adding zip does not re-run search."""
+    parts: list[str] = []
+    if state.address_line_1:
+        parts.append(state.address_line_1.strip().lower())
+    if state.city:
+        parts.append(state.city.strip().lower())
+    if state.state:
+        parts.append(state.state.strip().upper())
+    return "|".join(parts)
+
+
+def _zip_from_autocomplete_suggestion(text: str) -> Optional[str]:
+    """Extract 5-digit zip from WCL-style suggestion line (e.g. '..., LOS ANGELES, CA 90007')."""
+    if not text:
+        return None
+    normalized = re.sub(r"\s+", " ", text.upper().replace(",", " ")).strip()
+    m = re.search(r"\b([A-Z]{2})\s+(\d{5})\b", normalized)
+    if m:
+        return m.group(2)
+    m = re.search(r"\b(\d{5})\b(?=[^\d]|$)", normalized)
+    if m:
+        return m.group(1)
+    return None
 
 
 class BrowserManager:
@@ -68,13 +131,17 @@ class BrowserManager:
 
     # Selector map mapping Pydantic keys to West Capital CSS selectors
     FIELD_MAP = {
-        "address_line_1": "input[name='address_line_1']",
+        "address_line_1": (
+            f"{SEL_PROPERTY_STREET1}, input[name='address_line_1']"
+        ),
         "apt_suite": "input[data-test-id='property-address-street2']",
         "city": "input[name='city']",
         "state": "input[name='state']",
         "zipcode": "input[name='zipcode']",
         "ownership_type": "select[name='ownership']",
-        "occupancy_type": "select[name='occupancy_type']",
+        "occupancy_type": (
+            "input[name='occupancyType'], select[name='occupancy_type']"
+        ),
         "is_currently_for_sale": "input[name='isListedForSale']",
         "annual_pre_tax_income": "input[data-test-id='income-amount']",
         "other_income": "input[data-test-id='other-income-amount']",
@@ -96,12 +163,44 @@ class BrowserManager:
     # Fields that are visible but not required for navigation ("Continue")
     OPTIONAL_FIELDS = ["apt_suite", "other_income", "middle_name", "suffix", "agreed_to_commerce_communication"]
 
+    # Ordered URL substring → required fields for that step (first match wins).
+    # ``register`` must be last — it appears as a substring on several paths.
+    _URL_PATTERN_TO_FIELDS: ClassVar[list[tuple[str, list[str]]]] = [
+        ("for-sale", ["is_currently_for_sale"]),
+        ("annual-income", ["annual_pre_tax_income", "primary_source_of_income"]),
+        ("legal-name", ["first_name", "last_name"]),
+        ("birthdate", ["date_of_birth"]),
+        ("phone-and-email", ["mobile_phone_number", "email_address"]),
+        ("set-password", ["agreed_to_privacy_policy", "agreed_to_credit_pull", "password", "confirm_password"]),
+        ("consent", ["agreed_to_privacy_policy", "agreed_to_credit_pull", "password", "confirm_password"]),
+        # WCL /register: dropdown address pick fills these inputs in the live browser;
+        # we hydrate/verify so Continue enables—user never types them in voice.
+        # https://heloc.westcapitallending.com/account/heloc/register
+        ("register", [
+            "address_line_1", "city", "state", "zipcode",
+            "ownership_type", "occupancy_type",
+        ]),
+    ]
+
+    # Optional fields to hydrate when syncing DOM from state (stage from get_current_stage()).
+    _OPTIONAL_HYDRATION_BY_STAGE: ClassVar[dict[str, tuple[str, ...]]] = {
+        "property": ("apt_suite",),
+        "for-sale": (),
+        "income": ("other_income",),
+        "name": ("middle_name", "suffix"),
+        "birthday": (),
+        "contact": (),
+        "consent": ("agreed_to_commerce_communication",),
+    }
+
     def __init__(self) -> None:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._is_running: bool = False
+        # Dedupe autocomplete on street+city+state only (not zip — site fills zip from suggestion).
+        self._last_address_street_city_state_key: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Properties — safe accessors for the active page
@@ -129,10 +228,10 @@ class BrowserManager:
         """Launch a Chromium browser and create a single persistent context.
 
         Args:
-            is_demo: If ``True``, launches in **headed** mode with
-                ``slow_mo=500`` and a maximized viewport so a human can
-                observe the automation in real time. If ``False``, launches
-                headless for server / CI environments.
+            is_demo: If ``True``, launches in **headed** mode with a maximized
+                viewport. Playwright ``slow_mo`` is **off** by default; set
+                ``BROWSER_SLOW_MO_MS`` (e.g. 500) to slow steps for debugging.
+                If ``False``, launches headless for server / CI environments.
 
         Raises:
             RuntimeError: If the browser is already running.
@@ -148,8 +247,15 @@ class BrowserManager:
             launch_kwargs: dict = {
                 "headless": not is_demo,
             }
+            # Default 0: demo used to force slow_mo=500ms per action (~10s+ on address).
+            # Set BROWSER_SLOW_MO_MS=400–500 only when debugging visually.
+            try:
+                _smo = int(os.getenv("BROWSER_SLOW_MO_MS", "0").strip() or "0")
+            except ValueError:
+                _smo = 0
+            if _smo > 0:
+                launch_kwargs["slow_mo"] = _smo
             if is_demo:
-                launch_kwargs["slow_mo"] = 500
                 # --start-maximized opens the window at full screen size
                 launch_kwargs["args"] = ["--start-maximized"]
 
@@ -180,8 +286,8 @@ class BrowserManager:
     async def navigate_to_start(self) -> None:
         """Navigate the active page to the HELOC registration form.
 
-        Uses ``wait_until="networkidle"`` to ensure the page (including
-        the Address field) is fully loaded before returning.
+        Uses ``wait_until="load"`` then waits for the address field — ``networkidle``
+        is often very slow on SPAs.
 
         Raises:
             RuntimeError: If the browser is not running.
@@ -191,9 +297,17 @@ class BrowserManager:
         try:
             response = await page.goto(
                 HELOC_REGISTER_URL,
-                wait_until="networkidle",
+                wait_until="load",
                 timeout=30_000,
             )
+            try:
+                await page.wait_for_selector(
+                    SEL_STREET_LINE,
+                    state="visible",
+                    timeout=20_000,
+                )
+            except Exception as e:
+                logger.debug("Address field not visible after load: %s", e)
 
             status = response.status if response else "no response"
             title = await page.title()
@@ -212,41 +326,186 @@ class BrowserManager:
             )
             raise
 
+    def _field_keys_for_url(self, current_url: str) -> list[str]:
+        """Return required field names for the funnel step implied by ``current_url``."""
+        for pattern, fields in self._URL_PATTERN_TO_FIELDS:
+            if pattern in current_url:
+                return list(fields)
+        return list(self.FIELD_MAP.keys())
+
+    def build_hydration_payload(self, state: HelocApplicationState) -> dict[str, Any]:
+        """
+        Build a fill dict from application state for the **current** URL only.
+
+        Used to sync the live DOM when the browser lags behind conversation (e.g. user
+        fixes an earlier page while state already holds later-page values). This turn's
+        tool ``updates`` should be merged on top (caller merges; this has no updates).
+        """
+        if not self._is_running or self._page is None:
+            return {}
+
+        keys = self._field_keys_for_url(self._page.url)
+        dump = state.model_dump(exclude_none=True)
+        out: dict[str, Any] = {}
+        for k in keys:
+            if k in dump:
+                out[k] = dump[k]
+
+        stage = self.get_current_stage()
+        for ok in self._OPTIONAL_HYDRATION_BY_STAGE.get(stage, ()):
+            if ok in dump and ok not in out:
+                out[ok] = dump[ok]
+
+        return out
+
+    _ZIP_FIELD_SELECTORS: ClassVar[tuple[str, ...]] = (
+        "input[name='zipcode']",
+        "input[name='postalCode']",
+        "input[data-test-id*='zip' i]",
+        "input[id*='zipcode' i]",
+    )
+
+    async def _read_zip_from_dom(self, page: Page) -> str:
+        """Zip inputs are sometimes slow or React-controlled; try JS .value + fallbacks."""
+        for css in self._ZIP_FIELD_SELECTORS:
+            try:
+                loc = page.locator(css).first
+                if await loc.count() == 0:
+                    continue
+                raw = (await loc.input_value() or "").strip()
+                if not raw:
+                    raw = (
+                        await loc.evaluate("el => (el && 'value' in el ? String(el.value || '').trim() : '')")
+                        or ""
+                    ).strip()
+                digits = re.sub(r"\D", "", raw)
+                if len(digits) >= 5:
+                    return digits[:5]
+            except Exception as e:
+                logger.debug("read zip from %s: %s", css, e)
+        return ""
+
+    async def pull_property_fields_from_dom_into_state(self, state: HelocApplicationState) -> list[str]:
+        """Copy street/city/state/zip from the property page into state (e.g. after autocomplete)."""
+        if self.get_current_stage() != "property":
+            return []
+        page = self.page
+        # Give React a tick to commit zip after autocomplete.
+        await asyncio.sleep(0.25)
+        changed: list[str] = []
+        mapping = [
+            ("address_line_1", SEL_STREET_LINE),
+            ("city", "input[name='city']"),
+            ("state", "input[name='state']"),
+        ]
+        for field, css in mapping:
+            try:
+                loc = page.locator(css).first
+                if await loc.count() == 0:
+                    continue
+                raw = (await loc.input_value() or "").strip()
+                if not raw:
+                    continue
+                if field == "state" and len(raw) == 2:
+                    raw = raw.upper()
+                cur = getattr(state, field, None)
+                if cur is not None and str(cur).strip() == str(raw).strip():
+                    continue
+                setattr(state, field, raw)
+                changed.append(field)
+            except Exception as e:
+                logger.debug("pull_property_fields_from_dom_into_state: %s: %s", field, e)
+
+        z = await self._read_zip_from_dom(page)
+        if z:
+            cur_z = getattr(state, "zipcode", None)
+            if cur_z is None or str(cur_z).strip() != z:
+                state.zipcode = z
+                changed.append("zipcode")
+        if changed:
+            logger.info("Synced property fields from DOM into state: %s", changed)
+        return changed
+
+    async def sync_property_address_from_state(
+        self,
+        state: HelocApplicationState,
+        *,
+        user_updated_address: bool,
+    ) -> None:
+        """
+        Run address autocomplete when street/city/state change — not when only zip is added
+        (zip is usually filled by the site's autocomplete). Always try to pull DOM → state
+        so zip/city/state match what the page shows.
+        """
+        if self.get_current_stage() != "property":
+            return
+        if not state.address_line_1:
+            return
+
+        # Re-syncing ownership/occupancy/zip in a **later** tool call must not re-type the
+        # combobox. Pull is enough; select_address is only for the first save or a real
+        # user address change in this turn.
+        if not user_updated_address:
+            await self.pull_property_fields_from_dom_into_state(state)
+            return
+
+        full = _format_full_address_for_autocomplete(state)
+        if not full.strip():
+            return
+
+        dedupe_key = _street_city_state_key(state)
+        should_search = bool(dedupe_key) and (
+            user_updated_address or dedupe_key != self._last_address_street_city_state_key
+        )
+
+        if should_search:
+            suggestion = await self.select_address(full)
+            self._last_address_street_city_state_key = dedupe_key
+            z_from_line = _zip_from_autocomplete_suggestion(suggestion or "")
+            if z_from_line and not state.zipcode:
+                state.zipcode = z_from_line
+                logger.info("Set zipcode from autocomplete suggestion text: %s", z_from_line)
+
+        await self.pull_property_fields_from_dom_into_state(state)
+
+    async def _wait_for_city_populated(self, page: Page, timeout_ms: int = 4000) -> None:
+        """After picking a listbox row, city/state/zip fill async. Avoid ``networkidle`` (SPA)."""
+        steps = max(1, timeout_ms // 50)
+        loc = page.locator("input[name='city']").first
+        for _ in range(steps):
+            try:
+                if await loc.count() == 0:
+                    await asyncio.sleep(0.05)
+                    continue
+                c = await loc.input_value()
+                if c and str(c).strip():
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        logger.debug("City field still empty after suggestion pick (timeout=%sms).", timeout_ms)
+
     # ------------------------------------------------------------------
     # Form Interaction — address autocomplete
     # ------------------------------------------------------------------
 
-    async def select_address(self, address: str) -> None:
-        """Type an address into the search field and select the first autocomplete match.
-
-        Workflow:
-        1. Simulate human-speed typing (``delay=100``) into the address
-           input to trigger the site's autocomplete API.
-        2. Wait up to 3 seconds for the suggestion dropdown to appear.
-        3. Click the first real suggestion (skipping "Address not listed").
-        4. Wait for ``networkidle`` so City, State, and Zipcode fields are
-           auto-populated by the site.
-
-        If the dropdown never appears (API timeout, network issue, etc.),
-        the method falls back to ``page.fill()`` and logs a warning so
-        the caller can handle City/State/Zip manually.
-
-        Args:
-            address: The street address string to type (e.g. "325 W Adams Blvd").
-
-        Raises:
-            RuntimeError: If the browser is not running.
-        """
+    async def select_address(self, address: str) -> Optional[str]:
+        """Type address, pick first suggestion, wait for fields. Returns suggestion line text or None."""
         page = self.page  # will raise if not running
 
         logger.info("Selecting address — typing '%s' into autocomplete field.", address)
 
         try:
-            # 1. Clear any previous value and type slowly to trigger autocomplete
+            try:
+                _td = int(os.getenv("WCL_ADDRESS_TYPE_DELAY_MS", "35").strip() or "35")
+            except ValueError:
+                _td = 35
+            _td = max(0, min(_td, 150))
+            # 1. Clear any previous value and type to trigger autocomplete (lower delay = faster)
             await page.click(SEL_ADDRESS_INPUT)
             await page.fill(SEL_ADDRESS_INPUT, "")  # clear existing text
-            await page.type(SEL_ADDRESS_INPUT, address, delay=100)
-            logger.debug("Typed '%s' into address field.", address)
+            await page.type(SEL_ADDRESS_INPUT, address, delay=_td)
+            logger.debug("Typed '%s' into address field (delay_ms=%s).", address, _td)
 
             # 2. Wait for the autocomplete dropdown to appear (3s timeout)
             try:
@@ -259,19 +518,21 @@ class BrowserManager:
 
                 # 3. Click the first real suggestion
                 first_option = page.locator(SEL_FIRST_SUGGESTION).first
-                suggestion_text = await first_option.text_content()
+                suggestion_text = (await first_option.text_content() or "").strip()
                 await first_option.click()
                 logger.info(
                     "Selected autocomplete suggestion — '%s'",
-                    (suggestion_text or "").strip(),
+                    suggestion_text,
                 )
 
-                # 4. Wait for the site to auto-populate City / State / Zip
-                await page.wait_for_load_state("networkidle")
+                # 4. City/state/zip update after pick (do not use networkidle — can take 10s+ on SPAs)
+                await self._wait_for_city_populated(page, timeout_ms=4_000)
+                await asyncio.sleep(0.1)
                 logger.info(
                     "Address fields auto-populated after selecting '%s'.",
-                    (suggestion_text or "").strip(),
+                    suggestion_text,
                 )
+                return suggestion_text
 
             except Exception:
                 # ---------- SAFETY FALLBACK ----------
@@ -282,6 +543,7 @@ class BrowserManager:
                     address,
                 )
                 await page.fill(SEL_ADDRESS_INPUT, address)
+                return None
 
         except Exception:
             logger.exception("Failed during address selection for '%s'.", address)
@@ -290,6 +552,183 @@ class BrowserManager:
     # ------------------------------------------------------------------
     # Generic Form Interaction
     # ------------------------------------------------------------------
+
+    async def _click_occupancy_card(self, page: Page, value: str) -> bool:
+        """WCL: card <label> + input[name=occupancyType] value=HOME|…; else <select> or ARIA fallbacks."""
+        val = str(value).strip()
+        short = re.sub(r"\s+property\s*$", "", val, flags=re.IGNORECASE).strip()
+
+        if await page.locator(SEL_OCCUPANCY_RADIOS).count() > 0:
+            wclv = OCCUPANCY_ENUM_TO_WCL.get(val)
+            try:
+                card = page.locator("label:has(input[name='occupancyType'])").filter(
+                    has=page.get_by_text(val, exact=True)
+                )
+                if await card.count() > 0:
+                    c0 = card.first
+                    await c0.scroll_into_view_if_needed()
+                    await c0.click(timeout=4_000, force=True, no_wait_after=True)
+                    logger.info("WCL occupancy: clicked card label (exact) %r", val)
+            except Exception as e:
+                logger.debug("WCL card label %r: %s", val, e)
+            # React may not commit :checked on label only; re-filling other fields can unmount
+            # cards if occupancy ran first — fill flow must set occupancy last. Also force <input>.
+            await asyncio.sleep(0.2)
+            chk = page.locator('input[name="occupancyType"]:checked')
+            if wclv and await chk.count() > 0:
+                act = (await chk.first.get_attribute("value") or "").strip()
+                if act == wclv:
+                    return True
+            if wclv:
+                rloc = page.locator(
+                    f'input[type="radio"][name="occupancyType"][value="{wclv}"]'
+                )
+                if await rloc.count() > 0:
+                    try:
+                        await rloc.first.check(timeout=3_000, force=True)
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        logger.debug("WCL radio check %r: %s", wclv, e)
+                    try:
+                        if await page.locator('input[name="occupancyType"]:checked').count() > 0:
+                            act2 = (
+                                await page.locator('input[name="occupancyType"]:checked')
+                                .first.get_attribute("value")
+                                or ""
+                            ).strip()
+                            if wclv and act2 == wclv:
+                                logger.info("WCL occupancy: native radio selected value=%r", wclv)
+                                return True
+                    except Exception as e:
+                        logger.debug("WCL post-check: %s", e)
+                    try:
+                        lab2 = page.locator(
+                            f'label:has(input[name="occupancyType"][value="{wclv}"])'
+                        )
+                        if await lab2.count() > 0:
+                            await lab2.first.scroll_into_view_if_needed()
+                            await lab2.first.click(
+                                timeout=3_000, force=True, no_wait_after=True
+                            )
+                            await asyncio.sleep(0.15)
+                            if await page.locator('input[name="occupancyType"]:checked').count() > 0:
+                                logger.info("WCL occupancy: label click for value=%r", wclv)
+                                return True
+                    except Exception as e:
+                        logger.debug("WCL label for value: %s", e)
+
+        # Legacy or alternate: native <select name=occupancy_type>
+        vmap_select: dict[str, str] = {
+            "Primary property": "PRIMARY",
+            "Secondary property": "SECONDARY",
+            "Investment property": "INVESTMENT",
+        }
+        sel = page.locator("select[name='occupancy_type']").first
+        if await sel.count() > 0:
+            for label in (val, short):
+                if not label:
+                    continue
+                try:
+                    await sel.select_option(label=label, timeout=3_000)
+                    logger.info("Selected occupancy_type <select> label=%r", label)
+                    return True
+                except Exception:
+                    pass
+            code = vmap_select.get(val)
+            if code:
+                try:
+                    await sel.select_option(value=code, timeout=2_000)
+                    logger.info("Selected occupancy_type <select> value=%r", code)
+                    return True
+                except Exception:
+                    pass
+            try:
+                h = await sel.element_handle()
+                if h is not None:
+                    await h.evaluate(
+                        """(el) => {
+                        if (el && el.classList) el.classList.remove('sr-only');
+                        if (el) el.removeAttribute('hidden');
+                    }"""
+                    )
+            except Exception:
+                pass
+            for label in (val, short):
+                if not label:
+                    continue
+                try:
+                    await sel.select_option(label=label, timeout=2_000)
+                    logger.info(
+                        "Selected occupancy_type <select> after unhide: %r", label
+                    )
+                    return True
+                except Exception:
+                    pass
+
+        for label in (val, short):
+            if not label:
+                continue
+            for role in ("button", "radio"):
+                try:
+                    b = page.get_by_role(
+                        role,  # type: ignore[arg-type]
+                        name=label,
+                        exact=True,
+                    ).first
+                    await b.wait_for(state="visible", timeout=2_500)
+                    await b.scroll_into_view_if_needed()
+                    await b.click(timeout=3_000, force=True)
+                    logger.info("Clicked occupancy (role=%s) %r", role, label)
+                    return True
+                except Exception:
+                    pass
+
+        for label in (val,):
+            if not label:
+                continue
+            try:
+                loc = page.get_by_text(label, exact=True)
+                n = min(await loc.count(), 12)
+                for i in range(n):
+                    t = loc.nth(i)
+                    if not await t.is_visible():
+                        continue
+                    await t.scroll_into_view_if_needed()
+                    try:
+                        await t.click(timeout=1_500)
+                    except Exception:
+                        hop = t.locator(
+                            "xpath=ancestor::button[1] | ancestor::div[@role='button'][1] |"
+                            " ancestor::label[1] |"
+                            " ancestor::div[contains(concat(' ',@class,' '), ' cursor-pointer ')]"
+                        ).first
+                        if await hop.count() == 0:
+                            continue
+                        if not await hop.is_visible():
+                            continue
+                        await hop.click(timeout=1_500, force=True, no_wait_after=True)
+                    logger.info("Clicked occupancy get_by_text %r", label)
+                    return True
+            except Exception as e:
+                logger.debug("occupancy get_by_text %r: %s", label, e)
+        if short and short != val and len(short) > 6:
+            try:
+                loc = page.get_by_text(short, exact=True)
+                n = min(await loc.count(), 12)
+                for i in range(1, n):
+                    t = loc.nth(i)
+                    if not await t.is_visible():
+                        continue
+                    await t.scroll_into_view_if_needed()
+                    try:
+                        await t.click(timeout=1_500)
+                    except Exception:
+                        continue
+                    logger.info("Clicked occupancy get_by_text (short) %r", short)
+                    return True
+            except Exception as e:
+                logger.debug("occupancy get_by_text short %r: %s", short, e)
+        return False
 
     async def fill_form_fields(self, data: dict) -> None:
         """Fill form fields dynamically based on the provided data dictionary.
@@ -300,7 +739,16 @@ class BrowserManager:
         """
         page = self.page  # raises if not running
 
+        # WCL: filling address/ownership after occupancy clears the card radio in React.
+        on_property = self.get_current_stage() == "property"
+        occ_value = data.get("occupancy_type") if on_property else None
+
         for key, value in data.items():
+            if on_property and key == "occupancy_type":
+                continue
+            if on_property and key in ("city", "state", "zipcode"):
+                # Filled by WCL after address dropdown pick; never overwrite from hydration.
+                continue
             selector = self.FIELD_MAP.get(key)
             if not selector or value is None:
                 continue
@@ -327,14 +775,6 @@ class BrowserManager:
                             
                         logger.info("Filled bespoke spinbutton complex for date_of_birth")
                     continue
-                if key in ["occupancy_type"]:
-                    # Custom clickable cards: "Primary property", etc.
-                    card_locator = page.locator(f"text='{value}'").last
-                    await card_locator.wait_for(state="visible", timeout=3_000)
-                    await card_locator.click()
-                    logger.info("Clicked card option: '%s' for '%s'", value, key)
-                    continue
-
                 if key == "is_currently_for_sale":
                     val_str = "YES" if value else "NO"
                     radio_loc = page.locator(f"input[name='isListedForSale'][value='{val_str}']").first
@@ -347,9 +787,25 @@ class BrowserManager:
                 # Standard HTML Elements
                 # -------------------------------------------------------------
                 locator = page.locator(selector).first
-                
+                if key == "address_line_1" and self.get_current_stage() == "property":
+                    if await locator.count() > 0:
+                        try:
+                            cur = (await locator.input_value() or "").strip()
+                        except Exception:
+                            cur = ""
+                        if (
+                            len(cur) >= 28
+                            and re.search(r"\b\d{5}\b", cur)
+                            and ("," in cur)
+                        ):
+                            # Site already has the resolved autocomplete line; avoid clobber
+                            # with a shorter Pydantic street and DOM mismatch on verify.
+                            logger.info(
+                                "Skip fill for address_line_1 (combobox already has resolved line)."
+                            )
+                            continue
                 # FIRST: check if it's even on the page right now.
-                # We use 'attached' with a short timeout because these checkboxes 
+                # We use 'attached' with a short timeout because these checkboxes
                 # are often 'size-0' (not visible to Playwright) but still interactable.
                 try:
                     await locator.wait_for(state="attached", timeout=1000)
@@ -385,10 +841,19 @@ class BrowserManager:
                 else:
                     await locator.fill(str(value))
 
-                logger.info("Filled '%s' with '%s'", key, value)
+                safe_value = "***REDACTED***" if key in _SENSITIVE_FIELDS else value
+                logger.info("Filled '%s' with '%s'", key, safe_value)
 
             except Exception as e:
                 logger.warning("Failed to fill field '%s' (selector: %s): %s", key, selector, str(e))
+
+        if occ_value is not None:
+            try:
+                await asyncio.sleep(0.35)
+                if await self._click_occupancy_card(page, str(occ_value)):
+                    logger.info("Set occupancy_type: %r", occ_value)
+            except Exception as e:
+                logger.warning("Failed to set occupancy_type: %s", e)
 
     async def click_continue(self) -> bool:
         """Locate the 'Continue' or 'Check my rate' button, click it, and verify navigation.
@@ -403,7 +868,25 @@ class BrowserManager:
         try:
             # Re-locate to ensure freshness
             button_locator = page.locator("button:has-text('Continue'), input[type='submit'][value='Continue'], button:has-text('Check my rate'), button:has-text('Next')").first
-            await button_locator.click(timeout=5_000)
+            await button_locator.wait_for(state="visible", timeout=5_000)
+            # React often disables Continue until the last required field is valid; wait
+            # briefly for enablement to avoid a no-op click and silent stuck state.
+            for _ in range(30):
+                try:
+                    disabled = await button_locator.get_attribute("disabled")
+                    aria_dis = await button_locator.get_attribute("aria-disabled")
+                except Exception:
+                    disabled, aria_dis = None, None
+                if (
+                    disabled in (None, "false")
+                    and (aria_dis is None or str(aria_dis).lower() not in ("true", "1"))
+                ):
+                    break
+                await asyncio.sleep(0.15)
+            else:
+                logger.warning("Continue button still disabled after wait — clicking anyway (force)")
+
+            await button_locator.click(timeout=5_000, force=True)
             
             # 1. Short wait for immediate URL change
             try:
@@ -467,6 +950,28 @@ class BrowserManager:
         mismatches = []
 
         for key, expected_value in data.items():
+            if (
+                key == "occupancy_type"
+                and expected_value is not None
+                and self.get_current_stage() == "property"
+            ):
+                wexp = OCCUPANCY_ENUM_TO_WCL.get(str(expected_value))
+                chk = page.locator('input[name="occupancyType"]:checked')
+                if await chk.count() > 0:
+                    if wexp:
+                        wact = (await chk.first.get_attribute("value") or "").strip()
+                        if wact != wexp:
+                            logger.warning(
+                                "DOM Mismatch for 'occupancy_type': expected WCL value %r, actual %r",
+                                wexp,
+                                wact,
+                            )
+                            mismatches.append("occupancy_type")
+                    continue
+                if await self._occupancy_field_filled(page):
+                    continue
+                mismatches.append("occupancy_type")
+                continue
             selector = self.FIELD_MAP.get(key)
             if not selector or expected_value is None:
                 continue
@@ -502,9 +1007,27 @@ class BrowserManager:
 
                 # Determine if this is a numeric/phone field for better comparison
                 is_num = any(x in key for x in ["income", "phone", "zipcode", "amount", "monthly"])
-                
+
+                if (
+                    key == "address_line_1"
+                    and self.get_current_stage() == "property"
+                    and actual_value is not None
+                    and expected_value is not None
+                ):
+                    a = re.sub(r"\W+", "", str(actual_value).lower())[:200]
+                    e = re.sub(r"\W+", "", str(expected_value).lower())[:200]
+                    if e in a or a in e or (len(e) > 4 and e[:6] in a):
+                        continue
+
                 if normalize(actual_value, is_num) != normalize(expected_value, is_num):
-                    logger.warning("DOM Mismatch for '%s': expected='%s', actual='%s'", key, expected_value, actual_value)
+                    safe_expected = "***REDACTED***" if key in _SENSITIVE_FIELDS else expected_value
+                    safe_actual = "***REDACTED***" if key in _SENSITIVE_FIELDS else actual_value
+                    logger.warning(
+                        "DOM Mismatch for '%s': expected='%s', actual='%s'",
+                        key,
+                        safe_expected,
+                        safe_actual,
+                    )
                     mismatches.append(key)
 
             except Exception as e:
@@ -512,90 +1035,252 @@ class BrowserManager:
         
         return mismatches
 
-    async def is_page_complete(self) -> bool:
-        """Scan the current visible DOM to see if all required fields are filled."""
-        page = self.page
-        
-        # 1. Map URL fragments to fields we expect on those pages for speed
-        current_url = page.url
-        # Order matters! 'register' must be last because it's the prefix for all other pages.
-        url_targets = {
-            "for-sale": ["is_currently_for_sale"],
-            "annual-income": ["annual_pre_tax_income", "primary_source_of_income"],
-            "legal-name": ["first_name", "last_name"],
-            "birthdate": ["date_of_birth"],
-            "phone-and-email": ["mobile_phone_number", "email_address"],
-            # We only require the two main legal checkboxes to proceed
-            "consent": ["agreed_to_privacy_policy", "agreed_to_credit_pull", "password", "confirm_password"],
-            "register": ["address_line_1", "ownership_type", "occupancy_type"]
-        }
-        
-        target_fields = []
-        for pattern, fields in url_targets.items():
-            if pattern in current_url:
-                target_fields = fields
-                break
-        
-        if not target_fields:
-            # Fallback to all fields if URL is unknown
-            target_fields = list(self.FIELD_MAP.keys())
+    async def _field_selected_in_cards_or_select(
+        self, page: Page, select_name: str, card_labels: tuple[str, ...]
+    ) -> bool:
+        """WCL: native select can be hidden; also detect selection via same card text as fill."""
+        try:
+            sel = page.locator(f"select[name='{select_name}']").first
+            if await sel.count() > 0:
+                val = (await sel.input_value() or "").strip()
+                if val:
+                    return True
+            # Use role=button to avoid false positives from headings / footers that
+            # contain the same string as a card (e.g. "Primary property").
+            for label in card_labels:
+                loc = page.get_by_role("button", name=label, exact=True)
+                n = await loc.count()
+                for i in range(n):
+                    try:
+                        btn = loc.nth(i)
+                        if not await btn.is_visible():
+                            continue
+                    except Exception:
+                        continue
+                    picked = await btn.evaluate(
+                        """el => {
+                        if (el.getAttribute('aria-pressed') === 'true' ||
+                            el.getAttribute('aria-selected') === 'true') return true;
+                        const ds = el.getAttribute && el.getAttribute('data-state');
+                        if (ds === 'checked' || ds === 'active' || ds === 'on') return true;
+                        if (el.classList && [...el.classList].some(c => c.includes('ring-') || c.includes('border-primary')))
+                          return true;
+                        return false;
+                    }"""
+                    )
+                    if picked:
+                        return True
+            return False
+        except Exception as e:
+            logger.debug("card/select completeness check failed (%s): %s", select_name, e)
+            return False
 
-        visible_fields_found = 0
+    async def _occupancy_field_filled(self, page: Page) -> bool:
+        """WCL: radio name=occupancyType; or hidden select; or ARIA card buttons."""
+        r = page.locator('input[name="occupancyType"]:checked')
+        if await r.count() > 0 and (await r.first.get_attribute("value") or "").strip():
+            return True
+        return await self._field_selected_in_cards_or_select(
+            page, "occupancy_type", ("Primary property", "Secondary property", "Investment property")
+        )
+
+    async def _wcl_register_street_satisfied(self, page: Page) -> bool:
+        """WCL /register: street = combobox (data-test-id=property-address-street1) or
+        hidden named input; after pick, value may be in the combobox. Else infer from
+        city+state+zip5 filled by the same selection.
+        """
+        line = page.locator(SEL_STREET_LINE).first
+        if await line.count() > 0 and (await line.input_value() or "").strip():
+            return True
+        search = page.locator(SEL_ADDRESS_INPUT).first
+        if await search.count() > 0 and len(
+            (await search.input_value() or "").strip()
+        ) >= 4:
+            return True
+        c = page.locator("input[name='city']").first
+        st = page.locator("input[name='state']").first
+        if await c.count() == 0 or await st.count() == 0:
+            return False
+        cval = (await c.input_value() or "").strip()
+        stval = (await st.input_value() or "").strip()
+        zd = re.sub(r"\D", "", await self._read_zip_from_dom(page) or "")
+        return bool(cval and stval and len(zd) >= 5)
+
+    async def is_page_complete(self) -> bool:
+        """True only when every required field for this URL is filled (including card-based occupancy)."""
+        page = self.page
+
+        current_url = page.url
+        target_fields = self._field_keys_for_url(current_url)
+        if not target_fields:
+            return False
+
         try:
             if await page.locator(".loading-spinner, .progress-bar-animated").count() > 0:
                 return False
 
             for key in target_fields:
-                selector = self.FIELD_MAP.get(key)
-                if not selector: continue
-                # Skip the DOB composite fields which are handled specially
+                if key in self.OPTIONAL_FIELDS:
+                    continue
+
+                if key == "address_line_1":
+                    if self.get_current_stage() == "property":
+                        if not await self._wcl_register_street_satisfied(page):
+                            return False
+                    else:
+                        loc = page.locator(SEL_STREET_LINE).first
+                        if await loc.count() == 0:
+                            return False
+                        if not (await loc.input_value() or "").strip():
+                            return False
+                    continue
+
+                if key in ("city", "state"):
+                    # Same as address: WCL can keep values in inputs that are not
+                    # considered "visible" to Playwright's strict is_visible.
+                    loc = page.locator(f"input[name='{key}']").first
+                    if await loc.count() == 0:
+                        logger.debug("is_page_complete: no input for %s", key)
+                        return False
+                    val = (await loc.input_value() or "").strip()
+                    if not val:
+                        logger.debug("is_page_complete: empty value for %s", key)
+                        return False
+                    continue
+
+                if key == "zipcode":
+                    z = await self._read_zip_from_dom(page)
+                    digits = re.sub(r"\D", "", z or "")
+                    if len(digits) >= 5:
+                        continue
+                    logger.debug("is_page_complete: missing or short zip in DOM: %r", z)
+                    return False
+
                 if key == "date_of_birth":
-                    # Check the first spinbutton component for visibility
                     loc = page.locator("div[data-test-id='dateOfBirth_month']").first
-                    if await loc.is_visible():
-                        visible_fields_found += 1
-                        val = await loc.text_content()
-                        
-                        # CRITICAL: Ignore placeholders! If it says 'Month', 'MM', etc, it's NOT filled.
-                        # This prevents 'Double Advance' skipping from the Income page.
-                        placeholders = ["Month", "Day", "Year", "MM", "DD", "YYYY"]
-                        if not val or val.strip() == "" or any(p in val for p in placeholders):
-                             return False
+                    if not await loc.is_visible():
+                        return False
+                    val = await loc.text_content()
+                    placeholders = ["Month", "Day", "Year", "MM", "DD", "YYYY"]
+                    if not val or val.strip() == "" or any(p in val for p in placeholders):
+                        return False
+                    continue
+
+                if key == "ownership_type":
+                    if not await self._field_selected_in_cards_or_select(
+                        page, "ownership", ("Sole owner", "Joint owner")
+                    ):
+                        return False
+                    continue
+
+                if key == "occupancy_type":
+                    if not await self._occupancy_field_filled(page):
+                        return False
+                    continue
+
+                selector = self.FIELD_MAP.get(key)
+                if not selector:
                     continue
 
                 locator = page.locator(selector).first
-                if await locator.is_visible():
-                    visible_fields_found += 1
-                    
-                    # Optional fields never block navigation
-                    if key in self.OPTIONAL_FIELDS:
-                        continue
-                        
-                    tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
-                    type_attr = await locator.evaluate("el => el.type ? el.type.toLowerCase() : ''")
+                if await locator.count() == 0 or not await locator.is_visible():
+                    return False
 
-                    if tag_name == "select":
-                        val = await locator.input_value()
-                        if not val: return False
-                    elif tag_name == "input" and type_attr in ["checkbox", "radio"]:
-                        if type_attr == "radio":
-                            name = await locator.get_attribute("name")
-                            group = page.locator(f"input[name='{name}']")
-                            checked_count = await group.evaluate_all("els => els.filter(el => el.checked).length")
-                            if checked_count == 0: return False
-                        else:
-                            if not await locator.is_checked(): return False
+                tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
+                type_attr = await locator.evaluate("el => el.type ? el.type.toLowerCase() : ''")
+
+                if tag_name == "select":
+                    val = await locator.input_value()
+                    if not val or not str(val).strip():
+                        return False
+                elif tag_name == "input" and type_attr in ["checkbox", "radio"]:
+                    if type_attr == "radio":
+                        name = await locator.get_attribute("name")
+                        group = page.locator(f"input[name='{name}']")
+                        checked_count = await group.evaluate_all(
+                            "els => els.filter(el => el.checked).length"
+                        )
+                        if checked_count == 0:
+                            return False
                     else:
-                        val = await locator.input_value()
-                        if not val or val.strip() == "": return False
+                        if not await locator.is_checked():
+                            return False
+                else:
+                    val = await locator.input_value()
+                    if not val or str(val).strip() == "":
+                        return False
 
-            # If we found at least one visible field and all were filled, 
-            # the page is likely complete.
-            return visible_fields_found > 0
+            return True
 
         except Exception as e:
             logger.debug("Page completeness check failed: %s", str(e))
             return False
+
+    async def path2_debug_register_snapshot(self) -> dict[str, Any]:
+        """For PATH2_DEBUG_DETAILED: one dict of what the WCL register form looks like in Playwright (no PII in keys)."""
+        if not self._is_running or self._page is None:
+            return {"ok": False, "reason": "browser not running"}
+        page = self._page
+        out: dict[str, Any] = {
+            "url": page.url,
+            "stage": self.get_current_stage(),
+        }
+        if self.get_current_stage() != "property":
+            out["note"] = "not on /register"
+            return out
+        try:
+            out["loading_spinnerish"] = await page.locator(
+                ".loading-spinner, .progress-bar-animated"
+            ).count()
+            for name in ("address_line_1", "city", "state", "zipcode"):
+                if name == "zipcode":
+                    out["zip_raw"] = await self._read_zip_from_dom(page)
+                    z = re.sub(r"\D", "", out.get("zip_raw") or "")
+                    out["zip_digits"] = len(z)
+                    continue
+                if name == "address_line_1":
+                    loc = page.locator(SEL_STREET_LINE).first
+                else:
+                    loc = page.locator(f"input[name='{name}']").first
+                c = await loc.count()
+                if c:
+                    v = (await loc.input_value() or "").strip()
+                    out[name] = {"count": 1, "len": len(v), "set": bool(v)}
+                else:
+                    out[name] = {"count": 0, "set": False}
+            own = page.locator("select[name='ownership']").first
+            if await own.count():
+                ovv = (await own.input_value() or "").strip()
+                out["ownership"] = {"select_value_len": len(ovv), "set": bool(ovv)}
+            else:
+                out["ownership"] = {"select_present": False}
+            ocr = page.locator('input[name="occupancyType"]:checked').first
+            if await ocr.count() > 0:
+                w = (await ocr.get_attribute("value") or "").strip()
+                out["occupancy_radio"] = {
+                    "value": w,
+                    "set": bool(w),
+                }
+            else:
+                out["occupancy_radio"] = {"set": False}
+            occ = page.locator("select[name='occupancy_type']").first
+            if await occ.count():
+                ocv = (await occ.input_value() or "").strip()
+                out["occupancy_select"] = {
+                    "select_value_len": len(ocv),
+                    "set": bool(ocv),
+                }
+            else:
+                out["occupancy_select"] = {"select_present": False}
+            out["occupancy_cards_satisfied"] = await self._occupancy_field_filled(page)
+            out["ownership_cards_satisfied"] = await self._field_selected_in_cards_or_select(
+                page, "ownership", ("Sole owner", "Joint owner")
+            )
+            out["wcl_street_satisfied"] = await self._wcl_register_street_satisfied(page)
+            out["is_page_complete"] = await self.is_page_complete()
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return out
 
     def get_current_stage(self) -> str:
         """Return a logical stage name based on the current URL.
@@ -612,30 +1297,12 @@ class BrowserManager:
         if "birthdate" in url: return "birthday"
         if "phone-and-email" in url: return "contact"
         if "set-password" in url: return "consent"
-        # Check 'register' last as it is a parent path
-        if "register" in url and url.endswith("register"): return "property"
-        
-        return "start"
+        # Check 'register' last as it is a parent path (handles /register and /register/)
+        path = url.split("?")[0].rstrip("/")
+        if "register" in url and path.endswith("register"):
+            return "property"
 
-    async def wait_for_stage(self, stage: str, timeout_ms: int = 15000) -> bool:
-        """Wait until the browser reaches the specified logical stage.
-        
-        Uses a polling loop to verify the URL contains the expected stage identifier.
-        """
-        logger.info("Waiting for browser to reach stage: %s...", stage)
-        start_time = asyncio.get_event_loop().time()
-        
-        while (asyncio.get_event_loop().time() - start_time) < (timeout_ms / 1000):
-            current = self.get_current_stage()
-            if current == stage:
-                logger.info("Reached stage: %s", stage)
-                # Wait a tiny bit for animations to settle
-                await asyncio.sleep(0.5)
-                return True
-            await asyncio.sleep(0.5)
-            
-        logger.warning("Timed out waiting for stage: %s (current: %s)", stage, self.get_current_stage())
-        return False
+        return "start"
 
     async def shutdown(self) -> None:
         """Gracefully close the browser, context, and Playwright process.
@@ -698,15 +1365,4 @@ class BrowserManager:
                 self._playwright = None
 
         self._is_running = False
-
-    # ------------------------------------------------------------------
-    # Context manager support (optional convenience)
-    # ------------------------------------------------------------------
-
-    async def __aenter__(self) -> "BrowserManager":
-        """Allow ``async with BrowserManager() as mgr:`` usage."""
-        await self.start()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        await self.shutdown()
+        self._last_address_street_city_state_key = None
