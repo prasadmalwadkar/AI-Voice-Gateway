@@ -30,7 +30,9 @@ Usage:
 
 import json
 import logging
+import os
 import time
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 
@@ -157,6 +159,12 @@ class CallLogger:
             message, extra={"call_sid": self.call_sid, **extra}
         )
 
+    def debug(self, message: str, **extra) -> None:
+        """Log at DEBUG level with automatic call_sid injection."""
+        self.logger.debug(
+            message, extra={"call_sid": self.call_sid, **extra}
+        )
+
     def warning(self, message: str, **extra) -> None:
         """Log at WARNING level with automatic call_sid injection."""
         self.logger.warning(
@@ -184,16 +192,27 @@ def setup_logging(level: int = logging.INFO) -> None:
     Args:
         level: Minimum log level. Default INFO. Use DEBUG for local dev.
     """
-    handler = logging.StreamHandler()
-    handler.setFormatter(JSONFormatter())
-
     root_logger = logging.getLogger("voip")
-    # Prevent duplicate handlers if setup_logging is called multiple times
-    # (e.g., during testing or hot-reload)
-    if not root_logger.handlers:
-        root_logger.addHandler(handler)
+    if root_logger.handlers:
+        root_logger.setLevel(level)
+        return
+
+    fmt = JSONFormatter()
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    root_logger.addHandler(stream_handler)
+
+    if os.getenv("LOG_FILE_DISABLE", "").strip().lower() not in ("1", "true", "yes"):
+        log_path = os.getenv("LOG_FILE_PATH", "").strip() or os.path.join("logs", "voip.log")
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        root_logger.addHandler(file_handler)
+
     root_logger.setLevel(level)
 
-    # Suppress noisy third-party loggers that pollute voice call logs
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
