@@ -1,0 +1,72 @@
+{
+  "cases": [
+    {
+      "name": "address_noise_reconfirm_short",
+      "address_tokens": ["325", "West Adams", "Los Angeles", "90007"],
+      "turns": [
+        {
+          "user": "325-Pay start, MC Delivered, Los Angeles.",
+          "expect_any": ["is that correct?", "property address?"],
+          "forbid_contains": [],
+          "max_words": 12,
+          "disallow_address_leak": false
+        },
+        {
+          "user": "No. 325 West Adams Boulevard, Los Angeles.",
+          "expect_any": ["sole or joint owner?"],
+          "forbid_contains": ["primary, secondary, or investment?"],
+          "max_words": 12,
+          "disallow_address_leak": true
+        },
+        {
+          "user": "Sole owner.",
+          "expect_any": ["primary, secondary, or investment?"],
+          "forbid_contains": [],
+          "max_words": 12,
+          "disallow_address_leak": true
+        }
+      ]
+    },
+    {
+      "name": "property_to_income_short_prompts",
+      "address_tokens": ["4134", "11th Avenue", "Seattle"],
+      "turns": [
+        {
+          "user": "4134 11th Avenue Northeast Seattle.",
+          "expect_any": ["sole or joint owner?", "is that correct?"],
+          "forbid_contains": [],
+          "max_words": 12,
+          "disallow_address_leak": false
+        },
+        {
+          "user": "Joint owner.",
+          "expect_any": ["primary, secondary, or investment?"],
+          "forbid_contains": [],
+          "max_words": 12,
+          "disallow_address_leak": true
+        },
+        {
+          "user": "Primary.",
+          "expect_any": ["for sale?"],
+          "forbid_contains": ["primary, secondary, or investment?"],
+          "max_words": 12,
+          "disallow_address_leak": true
+        },
+        {
+          "user": "No.",
+          "expect_any": ["annual income?"],
+          "forbid_contains": ["for sale?"],
+          "max_words": 12,
+          "disallow_address_leak": true
+        },
+        {
+          "user": "1M.",
+          "expect_any": ["income source?"],
+          "forbid_contains": [],
+          "max_words": 12,
+          "disallow_address_leak": true
+        }
+      ]
+    }
+  ]
+}

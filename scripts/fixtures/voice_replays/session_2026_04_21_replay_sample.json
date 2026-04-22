@@ -1,0 +1,32 @@
+{
+  "cases": [
+    {
+      "name": "session_2026_04_21_replay_sample",
+      "address_tokens": ["325", "West Adams", "Los Angeles"],
+      "notes": "Synthetic replay fixture for voice E2E (no real PII).",
+      "turns": [
+        {"user": "325 West Adams Boulevard Los Angeles.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "and", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "So,", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Toll owner.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Soul Owner.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "primary primary primary", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Yes.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "One million.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Zero.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Nope.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "full-time employed.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "But a sad.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Alexar.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Kale, you there?", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "in.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "But...", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Jan 1992. 1st Jan 1992.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "2135550199", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "applicant@example.com.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Yes.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false},
+        {"user": "Yes.", "expect_any": [], "expect_all": [], "forbid_contains": [], "max_words": null, "disallow_address_leak": false}
+      ]
+    }
+  ]
+}

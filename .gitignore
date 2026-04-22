@@ -26,6 +26,7 @@ __pycache__/
 
 # Log files
 *.log
+logs/
 
-# Local handoff / scratch notes (not for repo)
-HANDOFF.md
+# Local orchestrator session dumps only (replay JSON stays tracked)
+scripts/fixtures/voice_replays/orchestrator_runs/
