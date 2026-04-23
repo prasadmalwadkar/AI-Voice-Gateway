@@ -33,7 +33,7 @@ from line.llm_agent import LlmAgent, LlmConfig, passthrough_tool
 from line.llm_agent.provider import LlmProvider
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 from line.agent import TurnEnv
-from line.events import InputEvent, OutputEvent, CallEnded
+from line.events import InputEvent, OutputEvent, CallEnded, UserTurnEnded
 from litellm.exceptions import (
     APIConnectionError,
     BadGatewayError,
@@ -43,7 +43,11 @@ from litellm.exceptions import (
     ServiceUnavailableError,
 )
 
-from agent.state_manager import update_application_state, reset_state
+from agent.state_manager import (
+    build_intake_llm_context_string,
+    reset_state,
+    update_application_state,
+)
 
 logger = logging.getLogger("voip.agent")
 
@@ -184,6 +188,11 @@ update_application_state tool.
   STOP asking about it immediately, even if it was optional and unfilled. \
   Do NOT jump ahead to future pages until the tool result provides the \
   fields for the new stage.
+- **Per-turn [CURRENT_INTAKE_STATE]:** Injected each user turn (system context). \
+  It mirrors browser stage, captured fields (JSON, no passwords), and the same \
+  ``Still needed`` / ``Ask next`` line as the tool. If chat history disagrees, \
+  **trust [CURRENT_INTAKE_STATE]** for what is already filled and which single \
+  question to ask next. Never re-ask a field that appears captured there.
 1. Address → ownership + occupancy (short prompts; tool lists "Still needed").
 2. For sale?
 3. Income + source; other income optional.
@@ -320,12 +329,21 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
             await reset_state()
             return
 
+        intake_ctx = None
+        if isinstance(event, UserTurnEnded) and os.getenv(
+            "PATH2_DISABLE_INTAKE_LLM_CONTEXT", ""
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            try:
+                intake_ctx = build_intake_llm_context_string()
+            except Exception as e:
+                logger.warning("build_intake_llm_context_string failed: %s", e)
+
         on_primary = primary_model != fallback_model
         attempt = 0
         while True:
             yielded_any = False
             try:
-                async for output in agent_instance.process(ctx, event):
+                async for output in agent_instance.process(ctx, event, context=intake_ctx):
                     yielded_any = True
                     yield output
                 return
