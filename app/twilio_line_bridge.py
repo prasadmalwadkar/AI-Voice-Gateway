@@ -30,6 +30,8 @@ from agent.state_manager import (
 from app.cartesia_stt_client import CartesiaInkSTTSession
 from app.cartesia_tts_mulaw import CartesiaSonicMulawTTS
 from app.line_session_client import LineSessionClient
+from app.conversation_transcript import append_transcript_turn
+from app.intake_audit import log_intake_event
 from app.logging_config import CallLogger
 from app.path2_stt_noise import path2_stt_final_is_drop_noise
 from app.path2_transcript_debug import (
@@ -51,10 +53,19 @@ ADDRESS_FINAL_BUFFER_MAX_FRAGMENTS = max(
     1, int(os.getenv("TWILIO_ADDRESS_FINAL_BUFFER_MAX_FRAGMENTS", "3"))
 )
 CONTACT_PHONE_BUFFER_SECS = max(
-    0.0, float(os.getenv("TWILIO_CONTACT_PHONE_BUFFER_SECS", "1.25"))
+    0.0, float(os.getenv("TWILIO_CONTACT_PHONE_BUFFER_SECS", "2.0"))
 )
 CONTACT_EMAIL_BUFFER_SECS = max(
-    0.0, float(os.getenv("TWILIO_CONTACT_EMAIL_BUFFER_SECS", "1.65"))
+    0.0, float(os.getenv("TWILIO_CONTACT_EMAIL_BUFFER_SECS", "2.25"))
+)
+# Extra patience while digits / email are incomplete (slow dictation).
+CONTACT_PHONE_BUFFER_PARTIAL_SECS = max(
+    CONTACT_PHONE_BUFFER_SECS,
+    float(os.getenv("TWILIO_CONTACT_PHONE_BUFFER_PARTIAL_SECS", "3.5")),
+)
+CONTACT_EMAIL_BUFFER_PARTIAL_SECS = max(
+    CONTACT_EMAIL_BUFFER_SECS,
+    float(os.getenv("TWILIO_CONTACT_EMAIL_BUFFER_PARTIAL_SECS", "4.0")),
 )
 CONTACT_BUFFER_MAX_FRAGMENTS = max(
     1, int(os.getenv("TWILIO_CONTACT_BUFFER_MAX_FRAGMENTS", "8"))
@@ -414,9 +425,23 @@ class TwilioLineBridge:
             t.cancel()
 
     def _contact_buffer_window_secs(self) -> float:
+        parts = [p.strip() for p in self._contact_final_buffer if (p or "").strip()]
+        merged = re.sub(r"\s+", " ", " ".join(parts)).strip()
         if self._contact_buffer_kind == "email":
-            return CONTACT_EMAIL_BUFFER_SECS
-        return CONTACT_PHONE_BUFFER_SECS
+            base = CONTACT_EMAIL_BUFFER_SECS
+            if (
+                merged
+                and "@" in merged
+                and not infer_email_from_transcript(merged)
+            ):
+                return CONTACT_EMAIL_BUFFER_PARTIAL_SECS
+            return base
+        base = CONTACT_PHONE_BUFFER_SECS
+        if merged:
+            digits = re.sub(r"\D", "", merged)
+            if 0 < len(digits) < 10:
+                return CONTACT_PHONE_BUFFER_PARTIAL_SECS
+        return base
 
     async def _flush_contact_buffer(self, *, reason: str) -> None:
         parts = [p.strip() for p in self._contact_final_buffer if (p or "").strip()]
@@ -709,6 +734,15 @@ class TwilioLineBridge:
         ctx = path2_set_debug_call(self.call_sid)
         t0 = time.perf_counter()
         try:
+            log_intake_event(
+                self.call_sid or "",
+                "stt_final",
+                payload={
+                    "user_text": (text or "")[:500],
+                    "missing_excerpt": (get_missing_fields() or "")[:1200],
+                },
+            )
+            append_transcript_turn(self.call_sid or "", "user", text)
             result = await apply_voice_intake_heuristics_before_line(text)
             if result.handled and self._line:
                 self._log_pipeline_debug(
@@ -717,6 +751,16 @@ class TwilioLineBridge:
                         f"field={result.handled_field} stage={result.stage}"
                     ),
                     event="path2.stt.final_deterministic",
+                )
+                log_intake_event(
+                    self.call_sid or "",
+                    "deterministic_preline",
+                    payload={
+                        "user_text": (text or "")[:500],
+                        "handled_field": result.handled_field,
+                        "stage": result.stage,
+                        "ask_next_excerpt": (result.ask_next or "")[:400],
+                    },
                 )
                 self._deterministic_answer_guard_until = (
                     time.monotonic() + ANSWER_GUARD_SECS
@@ -761,7 +805,7 @@ class TwilioLineBridge:
                         ),
                         event="path2.status_check.shortcircuit",
                     )
-                    await self._line.mark_deterministic_turn(ask_from_missing)
+                    await self._line.enqueue_brief_repeat_for_pending_ask()
                     return
                 if result.ask_next and self._line:
                     self._line.inject_ask_next_hint(result.ask_next)
@@ -868,6 +912,7 @@ class TwilioLineBridge:
             except asyncio.TimeoutError:
                 continue
 
+            append_transcript_turn(self.call_sid or "", "agent", text)
             await broadcast_stt(
                 kind="agent_tts",
                 text=text,
