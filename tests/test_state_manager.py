@@ -285,6 +285,8 @@ def test_infer_ownership_garbles():
     assert infer_ownership_from_transcript("1") == "Sole owner"
     assert infer_ownership_from_transcript("two") == "Joint owner"
     assert infer_ownership_from_transcript("2") == "Joint owner"
+    assert infer_ownership_from_transcript("When.") == "Sole owner"
+    assert infer_ownership_from_transcript("when") == "Sole owner"
     assert infer_ownership_from_transcript("hello world") is None
 
 
@@ -297,6 +299,12 @@ def test_infer_income_source_employed():
     assert infer_income_source_from_transcript("part-time") == "Employed part-time"
     assert infer_income_source_from_transcript("self employed") == "Self-employed"
     assert infer_income_source_from_transcript("retired") == "Retired"
+    assert infer_income_source_from_transcript("1") == "Employed full-time"
+    assert infer_income_source_from_transcript("when") == "Employed full-time"
+    assert infer_income_source_from_transcript("two") == "Employed part-time"
+    assert infer_income_source_from_transcript("3") == "Self-employed"
+    assert infer_income_source_from_transcript("for") == "Retired"
+    assert infer_income_source_from_transcript("5") == "Unemployed / furloughed"
 
 
 def test_infer_occupancy_and_for_sale():
@@ -305,11 +313,20 @@ def test_infer_occupancy_and_for_sale():
     assert infer_occupancy_from_transcript("primary") == "Primary property"
     assert infer_occupancy_from_transcript("secondary home") == "Secondary property"
     assert infer_occupancy_from_transcript("investment") == "Investment property"
+    assert infer_occupancy_from_transcript("1") == "Primary property"
+    assert infer_occupancy_from_transcript("two") == "Secondary property"
+    assert infer_occupancy_from_transcript("free") == "Investment property"
+    assert infer_occupancy_from_transcript("When?") == "Primary property"
 
     assert infer_for_sale_from_transcript("yes") is True
     assert infer_for_sale_from_transcript("nope") is False
     assert infer_for_sale_from_transcript("yeah") is True
     assert infer_for_sale_from_transcript("nah") is False
+    assert infer_for_sale_from_transcript("1") is True
+    assert infer_for_sale_from_transcript("2") is False
+    assert infer_for_sale_from_transcript("one") is True
+    assert infer_for_sale_from_transcript("two") is False
+    assert infer_for_sale_from_transcript("when") is True
 
 
 def test_infer_phone_email_yesno_and_address():
@@ -476,24 +493,48 @@ def _make_tool_result(ask_next: str) -> str:
     return f'Updated. Still needed: foo. Ask next: "{ask_next}"'
 
 
+_OCCUPANCY_ASK_NEXT = (
+    "Primary, secondary, or investment? "
+    "Say one for primary, two for secondary, three for investment."
+)
+_FOR_SALE_ASK_NEXT = (
+    "Is the property currently for sale? Say one for yes, two for no."
+)
+
+
 @pytest.mark.parametrize(
-    "stage,transcript,field,expected_ask",
+    "stage,transcript,field,expected_ask,state_kwargs",
     [
-        ("property", "sole owner", "ownership_type", "Primary, secondary, or investment?"),
-        ("property", "joint", "ownership_type", "Primary, secondary, or investment?"),
-        ("for-sale", "no", "is_currently_for_sale", "Annual pre-tax income?"),
-        ("consent", "yes", "agreed_to_privacy_policy", "Agree to marketing texts?"),
-        ("name", "Alex", "first_name", "Last name?"),
-        ("income", "80K", "annual_pre_tax_income", "Other income?"),
-        ("birthday", "01/05/1990", "date_of_birth", "Phone number?"),
-        ("contact", "2135550101", "mobile_phone_number", "Email address?"),
+        ("property", "sole owner", "ownership_type", _OCCUPANCY_ASK_NEXT, {}),
+        ("property", "joint", "ownership_type", _OCCUPANCY_ASK_NEXT, {}),
+        (
+            "property",
+            "3",
+            "occupancy_type",
+            _FOR_SALE_ASK_NEXT,
+            {"address_line_1": "123 Main St", "ownership_type": "Sole owner"},
+        ),
+        ("for-sale", "no", "is_currently_for_sale", "Annual pre-tax income?", {}),
+        ("for-sale", "1", "is_currently_for_sale", "Annual pre-tax income?", {}),
+        ("consent", "yes", "agreed_to_privacy_policy", "Agree to marketing texts?", {}),
+        ("name", "Alex", "first_name", "Last name?", {}),
+        ("income", "80K", "annual_pre_tax_income", "Other income?", {}),
+        (
+            "income",
+            "3",
+            "primary_source_of_income",
+            "First name?",
+            {"annual_pre_tax_income": 80000, "other_income": 0},
+        ),
+        ("birthday", "01/05/1990", "date_of_birth", "Phone number?", {}),
+        ("contact", "2135550101", "mobile_phone_number", "Email address?", {}),
     ],
 )
-async def test_preline_heuristic_handled(stage, transcript, field, expected_ask):
+async def test_preline_heuristic_handled(stage, transcript, field, expected_ask, state_kwargs):
     """Each deterministic field returns HeuristicResult(handled=True) with correct field."""
     from agent.schema import HeuristicResult, HelocApplicationState
 
-    mock_state = HelocApplicationState()
+    mock_state = HelocApplicationState(**state_kwargs)
     mock_browser = MagicMock()
     mock_browser.get_current_stage.return_value = stage
 
@@ -534,6 +575,51 @@ async def test_preline_heuristic_not_handled_ambiguous():
 
     assert isinstance(result, HeuristicResult)
     assert result.handled is False
+
+
+def test_transcript_requests_intake_default_phrases():
+    from agent.state_manager import transcript_requests_intake_default
+
+    assert transcript_requests_intake_default("I don't know.") is True
+    assert transcript_requests_intake_default("I have no idea.") is True
+    assert transcript_requests_intake_default("I can't remember.") is True
+    assert transcript_requests_intake_default("I'm not sure.") is True
+    assert transcript_requests_intake_default("I am not sure") is True
+    assert transcript_requests_intake_default("I'm not sure about that") is False
+    assert transcript_requests_intake_default("sole owner") is False
+
+
+async def test_preline_idk_falls_back_sole_ownership():
+    """Decline phrase on ownership step → Sole owner via tool, raw omitted."""
+    from agent.schema import HeuristicResult, HelocApplicationState
+    from agent.state_manager import (
+        DEFAULT_INTAKE_OWNERSHIP,
+        apply_voice_intake_heuristics_before_line,
+    )
+
+    mock_state = HelocApplicationState(
+        address_line_1="123 Main St",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+    tool_return = _make_tool_result(_OCCUPANCY_ASK_NEXT)
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(return_value=tool_return)
+        result = await apply_voice_intake_heuristics_before_line("I don't know.")
+
+    assert result.handled is True
+    assert result.handled_field == "ownership_type"
+    mock_tool.func.assert_called_once()
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["ownership_type"] == DEFAULT_INTAKE_OWNERSHIP
+    assert call_kw["raw_user_input"] is None
+    assert call_kw["confidence_score"] == 0.95
 
 
 async def test_preline_heuristic_env_killswitch():
@@ -733,7 +819,7 @@ async def test_send_user_transcript_status_ping_repeats_current_ask_without_llm(
     await client.send_user_transcript("Hello, you there?")
 
     client._enqueue_ask_if_needed.assert_awaited_once_with(
-        "Last name?",
+        LineSessionClient.BRIEF_REPEAT_PROMPT,
         event="line.session.status_check_repeat_ask",
     )
     client._ws.send.assert_not_called()
@@ -883,16 +969,19 @@ async def test_bridge_schedules_followup_ask_after_navigation():
     bridge.call_logger = MagicMock(spec=["debug", "info", "warning", "error"])
     bridge._deterministic_followup_task = None
 
+    _for_sale_ask = (
+        "Is the property currently for sale? Say one for yes, two for no."
+    )
     with patch(
         "app.twilio_line_bridge.get_missing_fields",
         side_effect=[
             "[BROWSER STAGE: PROPERTY] All current fields filled. Waiting for navigation.",
-            '[BROWSER STAGE: FOR-SALE] Still needed: whether property is currently for sale Ask next: "Currently for sale?"',
+            f'[BROWSER STAGE: FOR-SALE] Still needed: whether property is currently for sale Ask next: "{_for_sale_ask}"',
         ],
     ):
         await TwilioLineBridge._wait_and_queue_deterministic_followup_ask(bridge)
 
-    bridge._line.mark_deterministic_turn.assert_called_once_with("Currently for sale?")
+    bridge._line.mark_deterministic_turn.assert_called_once_with(_for_sale_ask)
 
 
 def test_status_check_utterance_short_circuit_match():
@@ -961,6 +1050,19 @@ def test_mismatched_question_detection():
     assert fn("Got it!", "Sole or joint owner?") is False
 
 
+def test_build_intake_llm_context_string_shape():
+    from agent.state_manager import application_state, build_intake_llm_context_string
+
+    application_state.first_name = "Pat"
+    s = build_intake_llm_context_string(max_total_chars=8000)
+    assert "[CURRENT_INTAKE_STATE" in s
+    assert "browser_stage=" in s
+    assert "captured_fields_json" in s
+    assert "still_needed_line" in s
+    assert "Pat" in s
+    application_state.first_name = None
+
+
 def test_looks_like_answer_to_ownership_numeric_shortcuts():
     from app.line_session_client import LineSessionClient
 
@@ -970,6 +1072,8 @@ def test_looks_like_answer_to_ownership_numeric_shortcuts():
     assert fn(ask, "2") is True
     assert fn(ask, "one") is True
     assert fn(ask, "two") is True
+    assert fn(ask, "sad") is False
+    assert fn(ask, "um") is False
 
 
 if __name__ == "__main__":

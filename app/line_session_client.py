@@ -21,6 +21,9 @@ from app.path2_transcript_debug import broadcast_stt
 class LineSessionClient:
     """Async client for the Line VoiceAgentApp websocket protocol."""
 
+    # Re-ask same pending question without replaying long scripted prompts (watchdogs / status).
+    BRIEF_REPEAT_PROMPT = "Can you repeat that?"
+
     def __init__(
         self,
         ws_url: str,
@@ -171,6 +174,15 @@ class LineSessionClient:
         "date of birth",
         "birth",
     )
+    # Asks with fixed options: broad "short reply" fallback must not apply (STT noise).
+    _CHOICE_ASK_MARKERS = (
+        "sole or joint",
+        "primary, secondary, or investment",
+        "for sale",
+        "primary income",
+        "income source",
+    )
+
     _OFF_STAGE_TOPIC_PATTERNS = (
         r"\bincome\b",
         r"\bannual\b",
@@ -444,14 +456,40 @@ class LineSessionClient:
 
         # Existing key asks.
         if "primary, secondary, or investment" in a:
-            return any(k in u for k in ("primary", "secondary", "investment"))
-        if "sole or joint owner" in a:
-            return any(k in u for k in ("sole", "soul", "joint", "one", "two")) or u in {
+            pu = u.strip().rstrip(".,!?").lower()
+            return any(k in u for k in ("primary", "secondary", "investment")) or pu in {
                 "1",
                 "2",
+                "3",
+                "one",
+                "two",
+                "three",
+                "won",
+                "when",
+                "too",
+                "to",
+                "tree",
+                "free",
             }
-        if "currently for sale" in a:
-            return any(k in u for k in ("yes", "no", "yep", "nope"))
+        if "sole or joint owner" in a:
+            pu = u.strip().rstrip(".,!?").lower()
+            return (
+                any(k in u for k in ("sole", "soul", "joint", "one", "two"))
+                or u in {"1", "2"}
+                or pu in {"when", "won", "one", "two", "to", "too"}
+            )
+        if "for sale" in a and "?" in a:
+            pu = u.strip().rstrip(".,!?").lower()
+            return any(k in u for k in ("yes", "no", "yep", "nope")) or pu in {
+                "1",
+                "2",
+                "one",
+                "two",
+                "won",
+                "when",
+                "too",
+                "to",
+            }
 
         # Later-page asks.
         if "annual pre-tax income" in a or "annual income" in a:
@@ -499,6 +537,46 @@ class LineSessionClient:
             return False
         if "other income" in a:
             return any(ch.isdigit() for ch in u) or u in {"none", "no", "nope"}
+        if "primary income" in a or (
+            "income source" in a and "other income" not in a and "annual" not in a
+        ):
+            pu = u.strip().rstrip(".,!?").lower()
+            if pu in {
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "one",
+                "two",
+                "three",
+                "four",
+                "five",
+                "won",
+                "when",
+                "too",
+                "to",
+                "tree",
+                "free",
+                "for",
+            }:
+                return True
+            return any(
+                k in u
+                for k in (
+                    "full",
+                    "part",
+                    "self",
+                    "retired",
+                    "unemploy",
+                    "employ",
+                    "alimony",
+                    "child support",
+                    "public assistance",
+                    "separate maintenance",
+                    "furlough",
+                )
+            )
         if "date of birth" in a:
             return any(ch.isdigit() for ch in u)
         if "phone" in a:
@@ -518,8 +596,12 @@ class LineSessionClient:
         ):
             return any(k in u for k in ("yes", "i agree", "agree", "no", "nope"))
 
-        # Broad fallback: short direct reply to a question is likely an answer.
+        # Broad fallback: short reply to an unknown question is often an answer — but
+        # never for enumerated choice asks: STT noise ("sad", "um") must not skip
+        # watchdog / look like a valid sole-vs-joint reply (see path2 logs).
         if "?" in a and len(u.split()) <= 4:
+            if any(m in a for m in LineSessionClient._CHOICE_ASK_MARKERS):
+                return False
             return True
         return False
 
@@ -531,14 +613,15 @@ class LineSessionClient:
             ask = (self._last_tool_ask or "").strip()
             if not ask:
                 return
+            to_speak = self.BRIEF_REPEAT_PROMPT
             emitted = await self._enqueue_ask_if_needed(
-                ask,
+                to_speak,
                 event="line.session.turn_watchdog",
             )
             if not emitted:
                 return
             self._call_logger.info(
-                f"Line watchdog ask emitted: {ask}",
+                f"Line watchdog brief repeat (pending ask was): {ask[:80]}",
                 event="line.session.turn_watchdog",
             )
         except asyncio.CancelledError:
@@ -551,21 +634,21 @@ class LineSessionClient:
         """
         try:
             await asyncio.sleep(self._no_response_watchdog_sec)
-            ask = (self._last_tool_ask or "").strip() or "Could you repeat that?"
-            ask = self._clarify_prompt_for_ask(ask)
+            pending = (self._last_tool_ask or "").strip()
+            to_speak = self.BRIEF_REPEAT_PROMPT
             emitted = await self._enqueue_ask_if_needed(
-                ask,
+                to_speak,
                 event="line.session.no_response_watchdog",
             )
             if not emitted:
                 return
             self._call_logger.warning(
-                f"Line no-response watchdog emitted: {ask}",
+                f"Line no-response watchdog brief repeat (pending ask was): {pending[:80]}",
                 event="line.session.no_response_watchdog",
             )
             await broadcast_stt(
                 kind="agent_watchdog_no_response",
-                text=ask,
+                text=to_speak,
                 call_sid=self._call_logger.call_sid,
             )
         except asyncio.CancelledError:
@@ -636,6 +719,13 @@ class LineSessionClient:
                 ask_next, event="line.session.deterministic_ask"
             )
 
+    async def enqueue_brief_repeat_for_pending_ask(self) -> bool:
+        """TTS only: short repeat line. Does not change ``_last_tool_ask``."""
+        return await self._enqueue_ask_if_needed(
+            self.BRIEF_REPEAT_PROMPT,
+            event="line.session.brief_repeat_pending_ask",
+        )
+
     async def send_user_transcript(self, transcript: str) -> None:
         """
         Send one user turn: user_state speaking → message → user_state idle.
@@ -653,7 +743,7 @@ class LineSessionClient:
         # locally and never reopen LLM context for stale/out-of-stage questions.
         if ask_l and self._is_status_check_utterance(lower_text):
             await self._enqueue_ask_if_needed(
-                ask_l,
+                self.BRIEF_REPEAT_PROMPT,
                 event="line.session.status_check_repeat_ask",
             )
             return

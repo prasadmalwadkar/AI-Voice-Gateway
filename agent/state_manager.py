@@ -29,6 +29,7 @@ Design decisions:
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -354,8 +355,13 @@ def get_missing_fields() -> str:
     field_to_question = {
         "address_line_1": "Property address?",
         "ownership_type": "Sole or joint owner? Say one for sole, two for joint.",
-        "occupancy_type": "Primary, secondary, or investment?",
-        "is_currently_for_sale": "Currently for sale?",
+        "occupancy_type": (
+            "Primary, secondary, or investment? "
+            "Say one for primary, two for secondary, three for investment."
+        ),
+        "is_currently_for_sale": (
+            "Is the property currently for sale? Say one for yes, two for no."
+        ),
         "annual_pre_tax_income": "Annual pre-tax income?",
         "other_income": "Any other income?",
         "primary_source_of_income": "Primary income source?",
@@ -478,6 +484,37 @@ def get_missing_fields() -> str:
     return f"{stage_header} Still needed: " + ", ".join(final_missing) + question_hint
 
 
+def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
+    """
+    Per-user-turn snapshot for LlmAgent ``process(..., context=...)``.
+
+    Rendered as a transient system CustomHistoryEntry (not the user's message),
+    so ``raw_user_input`` stays the true transcript.
+    """
+    stage = browser_manager.get_current_stage()
+    missing = get_missing_fields() or ""
+    data = application_state.model_dump(
+        mode="json",
+        exclude_none=True,
+        exclude=_SENSITIVE_FIELDS,
+    )
+    captured = json.dumps(data, default=str)
+    body = (
+        "[CURRENT_INTAKE_STATE — authoritative for this turn; trust over chat memory]\n"
+        f"browser_stage={stage}\n"
+        f"captured_fields_json={captured}\n"
+        "still_needed_line:\n"
+        f"{missing}\n"
+        "[/CURRENT_INTAKE_STATE]"
+    )
+    if len(body) > max_total_chars:
+        body = (
+            body[: max_total_chars - 60].rstrip()
+            + "\n... [truncated]\n[/CURRENT_INTAKE_STATE]"
+        )
+    return body
+
+
 # =============================================================================
 # Confidence threshold for field extraction. If the LLM's self-assessed
 # confidence is below this, the tool instructs re-confirmation before
@@ -527,6 +564,43 @@ UNCERTAINTY_MARKERS = [
     "let me check",
 ]
 
+# Path2 pre-line: only when transcript_requests_intake_default() matches — not when
+# infer merely fails. raw_user_input omitted on default saves so uncertainty scan
+# does not block.
+DEFAULT_INTAKE_OWNERSHIP: OwnershipType = "Sole owner"
+DEFAULT_INTAKE_OCCUPANCY: OccupancyType = "Primary property"
+DEFAULT_INTAKE_FOR_SALE = False
+DEFAULT_INTAKE_OTHER_INCOME = 0
+DEFAULT_INTAKE_ANNUAL_PRE_TAX = 100_000
+DEFAULT_INTAKE_PRIMARY_SOURCE: IncomeSource = "Employed full-time"
+
+_DECLINE_TO_SPECIFY_PATTERNS = (
+    r"\bi\s+don'?t\s+know\b",
+    r"\bdon'?t\s+know\b",
+    r"\bdo\s+not\s+know\b",
+    r"\bi\s+don'?t\s+remember\b",
+    r"\bcan'?t\s+remember\b",
+    r"\bdo\s+not\s+remember\b",
+    r"\bi\s+am\s+not\s+sure\b",
+    r"\bi'?m\s+not\s+sure\b",
+    r"\bi\s+can'?t\s+think\b",
+    r"\bcan'?t\s+think\b",
+    r"\bcannot\s+think\b",
+    r"\bi\s+don'?t\s+have\s+(?:any\s+)?idea\b",
+    r"\bno\s+idea\b",
+)
+
+
+def transcript_requests_intake_default(text: str) -> bool:
+    """True only for explicit decline / don't-know phrasing (then apply default)."""
+    if not text or not str(text).strip():
+        return False
+    low = text.lower()
+    # Hedging ("not sure about that address") — not the same as declining the question.
+    if "not sure about" in low:
+        return False
+    return any(re.search(p, low) for p in _DECLINE_TO_SPECIFY_PATTERNS)
+
 
 def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
     """Map common STT garbles of 'sole/joint owner' to enum when LLM omits ownership_type."""
@@ -537,10 +611,11 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         seg = part.strip().lower()
         if not seg:
             continue
+        seg_n = seg.rstrip(".,!?")
         # Numeric shortcut mode for noisy telephony turns.
-        if re.fullmatch(r"(1|one|won)", seg):
+        if re.fullmatch(r"(1|one|won|when)", seg_n):
             return "Sole owner"
-        if re.fullmatch(r"(2|two|too|to)", seg):
+        if re.fullmatch(r"(2|two|too|to)", seg_n):
             return "Joint owner"
         if re.search(r"\bjoint\b", seg):
             return "Joint owner"
@@ -563,7 +638,7 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         if re.search(r"\bsoul\s+bonus\b", seg):
             return "Sole owner"
     low = text.lower()
-    if re.fullmatch(r"\s*(1|one|won)\s*[.,!?]?\s*", low):
+    if re.fullmatch(r"\s*(1|one|won|when)\s*[.,!?]?\s*", low):
         return "Sole owner"
     if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
         return "Joint owner"
@@ -592,7 +667,24 @@ def infer_occupancy_from_transcript(text: str) -> Optional[OccupancyType]:
     """Map common STT phrasing to occupancy when LLM omits occupancy_type."""
     if not text or not str(text).strip():
         return None
+    for part in re.split(r"[.!?\n]+", text):
+        seg = part.strip().lower()
+        if not seg:
+            continue
+        seg_n = seg.rstrip(".,!?")
+        if re.fullmatch(r"(1|one|won|when)", seg_n):
+            return "Primary property"
+        if re.fullmatch(r"(2|two|too|to)", seg_n):
+            return "Secondary property"
+        if re.fullmatch(r"(3|three|tree|free)", seg_n):
+            return "Investment property"
     low = text.lower()
+    if re.fullmatch(r"\s*(1|one|won|when)\s*[.,!?]?\s*", low):
+        return "Primary property"
+    if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
+        return "Secondary property"
+    if re.fullmatch(r"\s*(3|three|tree|free)\s*[.,!?]?\s*", low):
+        return "Investment property"
     if re.search(r"\b(investment|investor|rental\s+property)\b", low):
         return "Investment property"
     if re.search(r"\bsecondary\b|\bsecond\s+home\b|\bvacation\s+home\b", low):
@@ -612,9 +704,22 @@ def infer_for_sale_from_transcript(text: str) -> Optional[bool]:
     """Map short yes/no STT to is_currently_for_sale when the model omits the tool field."""
     if not text or not str(text).strip():
         return None
+    for part in re.split(r"[.!?\n]+", text):
+        seg = part.strip().lower()
+        if not seg:
+            continue
+        seg_n = seg.rstrip(".,!?")
+        if re.fullmatch(r"(1|one|won|when)", seg_n):
+            return True
+        if re.fullmatch(r"(2|two|too|to)", seg_n):
+            return False
     t = text.strip().lower().rstrip(".,!?")
     if not t:
         return None
+    if re.fullmatch(r"(1|one|won|when)", t):
+        return True
+    if re.fullmatch(r"(2|two|too|to)", t):
+        return False
     if re.fullmatch(
         r"(yes|yeah|yep|yup|correct|true|indeed|absolutely|certainly|definitely|sure|of course|it is|uh\s*-?\s*huh)",
         t,
@@ -633,7 +738,32 @@ def infer_income_source_from_transcript(text: str) -> Optional[IncomeSource]:
     """Map common spoken variants (without punctuation/dashes) to IncomeSource enum."""
     if not text or not str(text).strip():
         return None
+    for part in re.split(r"[.!?\n]+", text):
+        seg = part.strip().lower()
+        if not seg:
+            continue
+        seg_n = seg.rstrip(".,!?")
+        if re.fullmatch(r"(1|one|won|when)", seg_n):
+            return "Employed full-time"
+        if re.fullmatch(r"(2|two|too|to)", seg_n):
+            return "Employed part-time"
+        if re.fullmatch(r"(3|three|tree|free)", seg_n):
+            return "Self-employed"
+        if re.fullmatch(r"(4|four|for)", seg_n):
+            return "Retired"
+        if re.fullmatch(r"(5|five)", seg_n):
+            return "Unemployed / furloughed"
     low = text.lower()
+    if re.fullmatch(r"\s*(1|one|won|when)\s*[.,!?]?\s*", low):
+        return "Employed full-time"
+    if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
+        return "Employed part-time"
+    if re.fullmatch(r"\s*(3|three|tree|free)\s*[.,!?]?\s*", low):
+        return "Self-employed"
+    if re.fullmatch(r"\s*(4|four|for)\s*[.,!?]?\s*", low):
+        return "Retired"
+    if re.fullmatch(r"\s*(5|five)\s*[.,!?]?\s*", low):
+        return "Unemployed / furloughed"
 
     if "full time" in low or "full-time" in low:
         return "Employed full-time"
@@ -1280,14 +1410,20 @@ async def update_application_state(
             inferred_addr = infer_property_address_from_transcript(raw_user_input)
             if inferred_addr:
                 local_vars["address_line_1"] = inferred_addr
-        if local_vars.get("ownership_type") is None:
+        # Same utterance must not fill both: "one"/"1" is sole owner, not primary occupancy.
+        # If this call already sets occupancy, do not infer ownership (e.g. "two" for
+        # secondary must not become joint owner).
+        if local_vars.get("ownership_type") is None and local_vars.get(
+            "occupancy_type"
+        ) is None:
             inferred_o = infer_ownership_from_transcript(raw_user_input)
             if inferred_o:
                 local_vars["ownership_type"] = inferred_o
         if local_vars.get("occupancy_type") is None:
-            inferred_occ = infer_occupancy_from_transcript(raw_user_input)
-            if inferred_occ:
-                local_vars["occupancy_type"] = inferred_occ
+            if local_vars.get("ownership_type") is None:
+                inferred_occ = infer_occupancy_from_transcript(raw_user_input)
+                if inferred_occ:
+                    local_vars["occupancy_type"] = inferred_occ
     if raw_user_input and browser_manager.get_current_stage() == "for-sale":
         if local_vars.get("is_currently_for_sale") is None:
             inferred_fs = infer_for_sale_from_transcript(raw_user_input)
@@ -1509,6 +1645,8 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
       - for-sale yes/no
       - annual/other income numeric inference
       - primary income source enum mapping
+      - explicit don't-know / decline phrases only → conservative defaults (not when
+        infer simply fails; see transcript_requests_intake_default)
       - DOB date parsing
       - phone digit parsing
       - email normalization parser
@@ -1571,6 +1709,28 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                     )
                 return _fail(stage)
         if application_state.ownership_type is None:
+            if transcript_requests_intake_default(text):
+                logger.info(
+                    "intake default: ownership_type=%s (caller declined to specify)",
+                    DEFAULT_INTAKE_OWNERSHIP,
+                    extra={"event": "state.intake_default", "field": "ownership_type"},
+                )
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        ownership_type=DEFAULT_INTAKE_OWNERSHIP,
+                        confidence_score=0.95,
+                        raw_user_input=None,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "ownership_type", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line ownership default failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
             own = infer_ownership_from_transcript(text)
             if own is not None:
                 try:
@@ -1589,8 +1749,31 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
+            return _fail(stage)
 
         if application_state.occupancy_type is None:
+            if transcript_requests_intake_default(text):
+                logger.info(
+                    "intake default: occupancy_type=%s (caller declined to specify)",
+                    DEFAULT_INTAKE_OCCUPANCY,
+                    extra={"event": "state.intake_default", "field": "occupancy_type"},
+                )
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        occupancy_type=DEFAULT_INTAKE_OCCUPANCY,
+                        confidence_score=0.95,
+                        raw_user_input=None,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "occupancy_type", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line occupancy default failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
             occ = infer_occupancy_from_transcript(text)
             if occ is not None:
                 try:
@@ -1609,6 +1792,7 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
+            return _fail(stage)
         return _fail(stage)
 
     if stage == "consent":
@@ -1681,6 +1865,28 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
 
     if stage == "income":
         if application_state.annual_pre_tax_income is None:
+            if transcript_requests_intake_default(text):
+                logger.info(
+                    "intake default: annual_pre_tax_income=%s (caller declined to specify)",
+                    DEFAULT_INTAKE_ANNUAL_PRE_TAX,
+                    extra={"event": "state.intake_default", "field": "annual_pre_tax_income"},
+                )
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        annual_pre_tax_income=DEFAULT_INTAKE_ANNUAL_PRE_TAX,
+                        confidence_score=0.95,
+                        raw_user_input=None,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "annual_pre_tax_income", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line annual income default failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
             inc = infer_annual_income_from_transcript(text)
             if inc is not None:
                 try:
@@ -1699,8 +1905,31 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
+            return _fail(stage)
 
         if application_state.other_income is None:
+            if transcript_requests_intake_default(text):
+                logger.info(
+                    "intake default: other_income=%s (caller declined to specify)",
+                    DEFAULT_INTAKE_OTHER_INCOME,
+                    extra={"event": "state.intake_default", "field": "other_income"},
+                )
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        other_income=DEFAULT_INTAKE_OTHER_INCOME,
+                        confidence_score=0.95,
+                        raw_user_input=None,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "other_income", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line other income default failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
             oi = infer_other_income_from_transcript(text)
             if oi is not None:
                 try:
@@ -1719,8 +1948,31 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
+            return _fail(stage)
 
         if application_state.primary_source_of_income is None:
+            if transcript_requests_intake_default(text):
+                logger.info(
+                    "intake default: primary_source_of_income=%s (caller declined to specify)",
+                    DEFAULT_INTAKE_PRIMARY_SOURCE,
+                    extra={"event": "state.intake_default", "field": "primary_source_of_income"},
+                )
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        primary_source_of_income=DEFAULT_INTAKE_PRIMARY_SOURCE,
+                        confidence_score=0.95,
+                        raw_user_input=None,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "primary_source_of_income", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line primary source default failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
             src = infer_income_source_from_transcript(text)
             if src is not None:
                 try:
@@ -1739,6 +1991,7 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
+            return _fail(stage)
         return _fail(stage)
 
     if stage == "birthday":
@@ -1816,7 +2069,17 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         return _NOT_HANDLED
     if application_state.is_currently_for_sale is not None:
         return _fail(stage)
-    fs = infer_for_sale_from_transcript(text)
+    if transcript_requests_intake_default(text):
+        fs = DEFAULT_INTAKE_FOR_SALE
+        used_for_sale_default = True
+        logger.info(
+            "intake default: is_currently_for_sale=%s (caller declined to specify)",
+            fs,
+            extra={"event": "state.intake_default", "field": "is_currently_for_sale"},
+        )
+    else:
+        fs = infer_for_sale_from_transcript(text)
+        used_for_sale_default = False
     if fs is None:
         return _fail(stage)
     try:
@@ -1824,7 +2087,7 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             None,
             is_currently_for_sale=fs,
             confidence_score=0.95,
-            raw_user_input=text,
+            raw_user_input=None if used_for_sale_default else text,
             deterministic_call=True,
         )
         return _ok(_extract_ask_next(tool_result), "is_currently_for_sale", stage)
