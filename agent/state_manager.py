@@ -33,7 +33,7 @@ import logging
 import os
 import re
 import time
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import ValidationError
 from line.llm_agent import loopback_tool
@@ -353,7 +353,7 @@ def get_missing_fields() -> str:
     # Short scripted asks per field. Keep deterministic to avoid drift.
     field_to_question = {
         "address_line_1": "Property address?",
-        "ownership_type": "Sole or joint owner?",
+        "ownership_type": "Sole or joint owner? Say one for sole, two for joint.",
         "occupancy_type": "Primary, secondary, or investment?",
         "is_currently_for_sale": "Currently for sale?",
         "annual_pre_tax_income": "Annual pre-tax income?",
@@ -537,6 +537,11 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         seg = part.strip().lower()
         if not seg:
             continue
+        # Numeric shortcut mode for noisy telephony turns.
+        if re.fullmatch(r"(1|one|won)", seg):
+            return "Sole owner"
+        if re.fullmatch(r"(2|two|too|to)", seg):
+            return "Joint owner"
         if re.search(r"\bjoint\b", seg):
             return "Joint owner"
         if re.fullmatch(r"stole\.?", seg):
@@ -558,6 +563,10 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         if re.search(r"\bsoul\s+bonus\b", seg):
             return "Sole owner"
     low = text.lower()
+    if re.fullmatch(r"\s*(1|one|won)\s*[.,!?]?\s*", low):
+        return "Sole owner"
+    if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
+        return "Joint owner"
     if re.search(r"\bjoint\b", low):
         return "Joint owner"
     if re.search(
@@ -894,6 +903,11 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
     return None
 
 
+PARTIAL_MOBILE_PHONE_REPROMPT = (
+    "Please say your full 10-digit mobile phone number."
+)
+
+
 def infer_phone_from_transcript(text: str) -> Optional[str]:
     """Parse US phone from spoken digits."""
     if not text or not str(text).strip():
@@ -903,6 +917,17 @@ def infer_phone_from_transcript(text: str) -> Optional[str]:
         d = d[1:]
     if len(d) == 10:
         return d
+    return None
+
+
+def get_contact_buffer_mode() -> Optional[Literal["phone", "email"]]:
+    """Contact stage: buffer STT finals while caller spells phone or email."""
+    if browser_manager.get_current_stage() != "contact":
+        return None
+    if application_state.mobile_phone_number is None:
+        return "phone"
+    if application_state.email_address is None:
+        return "email"
     return None
 
 
@@ -934,7 +959,13 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
     if not text or not str(text).strip():
         return None
     low = text.lower().strip()
-    m = re.match(r"^\s*(\d{1,6})\s+([a-z0-9\s.-]{3,})", low)
+    # Reject common STT garbage phrases before extracting any address fragment.
+    if re.search(r"\b(lost|list|students|items|below|best|where)\b", low):
+        return None
+    # Normalize punctuation/noise around the leading street number.
+    low = re.sub(r"[^\w\s,.-]", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+    m = re.match(r"^\s*(\d{1,6})[\s,.-]+([a-z0-9\s.-]{3,})", low)
     if not m:
         return None
     num = m.group(1)
@@ -946,10 +977,35 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
     # Common STT fixes.
     rest = re.sub(r"\band\s+lewart\b", "boulevard", rest)
     rest = re.sub(r"\blewart\b", "boulevard", rest)
+    rest = re.sub(r"\blewat\b", "boulevard", rest)
+    rest = re.sub(r"\bof\s+lewat\b", "boulevard", rest)
+    rest = re.sub(r"\bblvd\b", "boulevard", rest)
+    rest = re.sub(r"\bave\b", "avenue", rest)
+    rest = re.sub(r"\brd\b", "road", rest)
+    rest = re.sub(r"\bdr\b", "drive", rest)
+    rest = re.sub(r"\bln\b", "lane", rest)
+    rest = re.sub(r"\bct\b", "court", rest)
+    rest = re.sub(r"\bpkwy\b", "parkway", rest)
+    rest = re.sub(r"\bst\b", "street", rest)
     rest = re.sub(r"\s+", " ", rest).strip(" .,-")
+    if re.fullmatch(r"(los angeles|california|ca)", rest):
+        return None
     if len(rest) < 3:
         return None
     return f"{num} {rest.title()}"
+
+
+def _name_slot_focus_from_missing(missing_blob: str) -> Optional[str]:
+    """If get_missing_fields() includes Ask next, map to first- or last-name-only intake."""
+    m = re.search(r'Ask next:\s*"([^"]+)"', missing_blob or "")
+    if not m:
+        return None
+    q = (m.group(1) or "").strip().lower()
+    if q.startswith("first name"):
+        return "first"
+    if q.startswith("last name"):
+        return "last"
+    return None
 
 
 def infer_name_fields_from_transcript(
@@ -957,19 +1013,44 @@ def infer_name_fields_from_transcript(
     *,
     need_first: bool,
     need_last: bool,
+    slot_focus: Optional[str] = None,
 ) -> dict[str, str]:
     """
     Parse simple spoken legal name replies for NAME stage safety net.
 
     Conservative by design:
     - Accept one clean token for first or last name.
-    - Accept two clean tokens as first+last when both missing.
+    - Accept two clean tokens as first+last when both missing (unless slot_focus or dup rule).
     - Reject obvious non-name utterances ("but it's sad", "yes", "primary", etc.).
+
+    slot_focus:
+    - ``"first"``: only fill first name (e.g. Ask next is \"First name?\" even if user says
+      two words — second word is ignored for this save so we still ask last name).
+    - ``"last"``: only fill last name (e.g. \"Last name?\"); two tokens → use second token.
+    - ``None``: use need_first / need_last only.
+
+    Duplicate tokens (e.g. STT \"Prasad? Prasad?\"): never set first and last to the same
+    string in one shot — return first name only when both slots are still needed.
     """
     if not text or not str(text).strip():
         return {}
 
     s = text.strip().lower()
+    # Hard-reject common off-topic/garbled phrases seen on PSTN STT for name turns.
+    # This avoids writing junk like "Whatever" / "Brother" into legal name fields.
+    if re.search(
+        r"\b("
+        r"whatever|brother|sister|mother|father|"
+        r"thank(s| you)?|god|word"
+        r")\b",
+        s,
+    ):
+        return {}
+    if (
+        re.match(r"^\W*my\b", s)
+        and not re.match(r"^\W*(my name is|name is|i am|im)\b", s)
+    ):
+        return {}
     s = re.sub(r"^(my name is|name is|i am|im|it's|it is|this is)\s+", "", s)
     tokens = re.findall(r"[a-zA-Z][a-zA-Z'-]{0,30}", s)
     if not tokens:
@@ -996,8 +1077,43 @@ def infer_name_fields_from_transcript(
         "hi",
         "sad",
         "but",
+        "whatever",
+        "brother",
+        "sister",
+        "mother",
+        "father",
+        "god",
+        "word",
+        "thanks",
+        "thank",
     }
     if any(t.lower() in stop for t in tokens):
+        return {}
+
+    # STT echo / repetition: do not treat as first+last with identical strings.
+    if len(tokens) == 2 and tokens[0].lower() == tokens[1].lower():
+        t = tokens[0].title()
+        if need_first and need_last:
+            return {"first_name": t}
+        if need_first:
+            return {"first_name": t}
+        if need_last:
+            return {"last_name": t}
+        return {}
+
+    # Align with scripted Ask next so one question does not capture both names.
+    if slot_focus == "first" and need_first:
+        if len(tokens) == 1:
+            return {"first_name": tokens[0].title()}
+        if len(tokens) == 2:
+            return {"first_name": tokens[0].title()}
+        return {}
+
+    if slot_focus == "last" and need_last:
+        if len(tokens) == 1:
+            return {"last_name": tokens[0].title()}
+        if len(tokens) == 2:
+            return {"last_name": tokens[1].title()}
         return {}
 
     out: dict[str, str] = {}
@@ -1160,6 +1276,10 @@ async def update_application_state(
 
     # STT often garbles "sole owner" / "primary property"; infer if LLM omitted fields.
     if raw_user_input and browser_manager.get_current_stage() == "property":
+        if local_vars.get("address_line_1") is None and application_state.address_line_1 is None:
+            inferred_addr = infer_property_address_from_transcript(raw_user_input)
+            if inferred_addr:
+                local_vars["address_line_1"] = inferred_addr
         if local_vars.get("ownership_type") is None:
             inferred_o = infer_ownership_from_transcript(raw_user_input)
             if inferred_o:
@@ -1431,6 +1551,25 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
     stage = browser_manager.get_current_stage()
 
     if stage == "property":
+        if application_state.address_line_1 is None:
+            addr = infer_property_address_from_transcript(text)
+            if addr is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        address_line_1=addr,
+                        confidence_score=0.92,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(_extract_ask_next(tool_result), "address_line_1", stage)
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line property address failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
         if application_state.ownership_type is None:
             own = infer_ownership_from_transcript(text)
             if own is not None:
@@ -1512,10 +1651,12 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         need_last = application_state.last_name is None
         if not need_first and not need_last:
             return _fail(stage)
+        slot_focus = _name_slot_focus_from_missing(get_missing_fields() or "")
         parsed = infer_name_fields_from_transcript(
             text,
             need_first=need_first,
             need_last=need_last,
+            slot_focus=slot_focus,
         )
         if not parsed:
             return _fail(stage)
@@ -1625,6 +1766,13 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
 
     if stage == "contact":
         if application_state.mobile_phone_number is None:
+            digit_run = re.sub(r"\D", "", text)
+            if 5 <= len(digit_run) <= 9:
+                return _ok(
+                    PARTIAL_MOBILE_PHONE_REPROMPT,
+                    "mobile_phone_number",
+                    stage,
+                )
             ph = infer_phone_from_transcript(text)
             if ph is not None:
                 try:

@@ -204,7 +204,7 @@ CRITICAL: NEVER call end_call without speaking a goodbye message first.
 """
 
 # Minimal TTS: first spoken line only (Cartesia Sonic charges per character).
-INTRODUCTION = "Address?"
+INTRODUCTION = "What is the property address?"
 
 # LLM temperature: 0.6 balances coherence with natural-sounding variation.
 # Lower (0.3) sounds robotic on the phone; higher (0.9) risks hallucination.
