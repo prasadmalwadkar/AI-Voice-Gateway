@@ -34,6 +34,18 @@ def default_voice() -> Dict[str, str]:
     return {"mode": "id", "id": vid}
 
 
+def default_generation_config() -> Dict[str, float]:
+    """
+    Sonic-3 generation_config: speed + volume.
+
+    Speed: [0.6, 1.5] — 0.6 is slowest, 1.0 is Cartesia default.
+    Volume: [0.5, 2.0] — boost above 1.0 for PSTN audibility.
+    """
+    speed = max(0.6, min(1.5, float(os.getenv("CARTESIA_TTS_SPEED", "0.75"))))
+    volume = max(0.5, min(2.0, float(os.getenv("CARTESIA_TTS_VOLUME", "2.0"))))
+    return {"speed": speed, "volume": volume}
+
+
 class CartesiaSonicMulawTTS:
     """Manage a long-lived TTS WebSocket and synthesize text to 8 kHz µ-law chunks."""
 
@@ -52,7 +64,12 @@ class CartesiaSonicMulawTTS:
         self._client = AsyncCartesia(api_key=api_key)
         self._manager = self._client.tts.websocket_connect()
         self._conn = await self._manager.__aenter__()
-        self._call_logger.info("Cartesia TTS WebSocket connected", event="cartesia.tts.connected")
+
+        gen_cfg = default_generation_config()
+        self._call_logger.info(
+            f"Cartesia TTS WebSocket connected | generation_config={gen_cfg}",
+            event="cartesia.tts.connected",
+        )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -93,11 +110,13 @@ class CartesiaSonicMulawTTS:
         model_id = os.getenv("CARTESIA_TTS_MODEL_ID", "sonic-3")
         voice = default_voice()
         output_format = default_mulaw_output_format()
+        gen_cfg = default_generation_config()
 
         ctx = self._conn.context(
             model_id=model_id,
             voice=voice,
             output_format=output_format,
+            generation_config=gen_cfg,
         )
         self._current_ctx = ctx
 
@@ -111,6 +130,7 @@ class CartesiaSonicMulawTTS:
                 voice=voice,
                 output_format=output_format,
                 continue_=False,
+                generation_config=gen_cfg,
             )
             async for event in ctx.receive():
                 now = time.monotonic()

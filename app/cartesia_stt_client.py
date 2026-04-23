@@ -6,7 +6,8 @@ and is_final. See Cartesia STT streaming docs.
 
 Model default is ``ink-whisper`` (``CARTESIA_STT_MODEL``). On 8 kHz phone audio,
 short homophones are often wrong (e.g. "sole" → "stole" / "phone"). Tunables:
-``CARTESIA_STT_MAX_SILENCE_SECS`` (default 0.38 — lower = faster ``is_final``), ``CARTESIA_STT_LANGUAGE`` (en).
+``CARTESIA_STT_MAX_SILENCE_SECS`` (higher = wait longer before ``is_final``, better for full addresses; default 0.45 for PSTN),
+``CARTESIA_STT_LANGUAGE`` (en).
 The agent also maps common STT garbles in ``state_manager.infer_ownership_from_transcript``.
 """
 
@@ -26,8 +27,8 @@ from app.logging_config import CallLogger
 
 def _build_stt_websocket_url() -> str:
     # Lower = faster turn-end (snappier), higher = fewer mid-sentence cuts.
-    # Recommended: 0.25–0.30 for local mic, 0.35–0.45 for Twilio PSTN.
-    silence = max(0.20, float(os.getenv("CARTESIA_STT_MAX_SILENCE_SECS", "0.30")))
+    # Recommended: 0.25–0.30 for local mic, 0.40–0.55 for Twilio PSTN.
+    silence = max(0.20, float(os.getenv("CARTESIA_STT_MAX_SILENCE_SECS", "0.45")))
     q: dict[str, str] = {
         "model": os.getenv("CARTESIA_STT_MODEL", "ink-whisper"),
         "language": os.getenv("CARTESIA_STT_LANGUAGE", "en"),
@@ -64,7 +65,15 @@ class CartesiaInkSTTSession:
             ping_timeout=20,
             max_size=2**20,
         )
-        self._call_logger.info("Cartesia STT WebSocket connected", event="cartesia.stt.connected")
+        self._call_logger.info(
+            (
+                "Cartesia STT WebSocket connected | "
+                f"max_silence={os.getenv('CARTESIA_STT_MAX_SILENCE_SECS', '0.45')} "
+                f"min_volume={os.getenv('CARTESIA_STT_MIN_VOLUME', '0.0')} "
+                f"model={os.getenv('CARTESIA_STT_MODEL', 'ink-whisper')}"
+            ),
+            event="cartesia.stt.connected",
+        )
 
     async def send_mulaw_bytes(self, data: bytes) -> bool:
         """
