@@ -122,6 +122,10 @@ class LineSessionClient:
             )
             return
         self._fallback_spoken_text = ""
+        self._call_logger.info(
+            f"Queueing TTS text | chars={len(t)} text='{t[:160]}'",
+            event="line.session.tts_enqueue",
+        )
         await self.tts_queue.put(t)
 
     def _normalize_agent_text_for_tts(self, text: str) -> str:
@@ -142,9 +146,74 @@ class LineSessionClient:
         if m:
             return current_ask or (m.group(1) or "").strip()
 
+        # Guard against off-stage narration like "I have your income as $325"
+        # while current ask is still property address.
+        if (
+            current_ask
+            and "property address" in current_ask.lower()
+            and any(tok in low for tok in ("income", "annual", "$"))
+        ):
+            return current_ask
+
+        if current_ask and self._model_leaks_offstage_for_personal_ask(t, current_ask):
+            return current_ask
+
         if current_ask and self._text_contains_mismatched_question(t, current_ask):
             return current_ask
         return t
+
+    _PERSONAL_FIELD_ASK_MARKERS = (
+        "phone",
+        "mobile",
+        "email",
+        "first name",
+        "last name",
+        "date of birth",
+        "birth",
+    )
+    _OFF_STAGE_TOPIC_PATTERNS = (
+        r"\bincome\b",
+        r"\bannual\b",
+        r"\bproperty\b",
+        r"\baddress\b",
+        r"\bstreet\b",
+        r"\bavenue\b",
+        r"\bboulevard\b",
+        r"\bmortgage\b",
+        r"\bownership\b",
+        r"\boccupancy\b",
+        r"\binvestment property\b",
+        r"\bprimary property\b",
+        r"\bsecondary property\b",
+        r"\bequity\b",
+        r"\bfor sale\b",
+        r"\blisted\b",
+        r"\$\s*\d",
+    )
+
+    def _is_personal_field_ask(self, current_ask: str) -> bool:
+        ca = (current_ask or "").lower()
+        return any(m in ca for m in self._PERSONAL_FIELD_ASK_MARKERS)
+
+    def _model_leaks_offstage_for_personal_ask(self, text: str, current_ask: str) -> bool:
+        if not self._is_personal_field_ask(current_ask):
+            return False
+        low = (text or "").lower()
+        ca = (current_ask or "").lower()
+        patterns = list(self._OFF_STAGE_TOPIC_PATTERNS)
+        if "phone" in ca or "mobile" in ca:
+            patterns.extend((r"\bemail\b", r"@"))
+        if "email" in ca:
+            patterns.extend((r"\bphone\b", r"\bmobile\b"))
+        if "first name" in ca:
+            patterns.append(r"\blast name\b")
+        if "last name" in ca:
+            patterns.append(r"\bfirst name\b")
+        if "date of birth" in ca or (
+            "birth" in ca and "phone" not in ca and "email" not in ca
+        ):
+            patterns.extend((r"\bphone\b", r"\bmobile\b", r"\bemail\b", r"@"))
+        return any(re.search(p, low) for p in patterns)
 
     @staticmethod
     def _text_contains_mismatched_question(text: str, current_ask: str) -> bool:
@@ -267,7 +336,10 @@ class LineSessionClient:
                         self._text_buffer += content
                         self._schedule_debounced_flush()
                         self._call_logger.debug(
-                            f"Line agent text fragment len={len(content)}",
+                            (
+                                f"Line agent text fragment len={len(content)} "
+                                f"buffer_len={len(self._text_buffer)}"
+                            ),
                             event="line.session.agent_text",
                         )
                 elif out_type == "tool_call":
@@ -374,7 +446,10 @@ class LineSessionClient:
         if "primary, secondary, or investment" in a:
             return any(k in u for k in ("primary", "secondary", "investment"))
         if "sole or joint owner" in a:
-            return any(k in u for k in ("sole", "soul", "joint"))
+            return any(k in u for k in ("sole", "soul", "joint", "one", "two")) or u in {
+                "1",
+                "2",
+            }
         if "currently for sale" in a:
             return any(k in u for k in ("yes", "no", "yep", "nope"))
 
@@ -477,6 +552,7 @@ class LineSessionClient:
         try:
             await asyncio.sleep(self._no_response_watchdog_sec)
             ask = (self._last_tool_ask or "").strip() or "Could you repeat that?"
+            ask = self._clarify_prompt_for_ask(ask)
             emitted = await self._enqueue_ask_if_needed(
                 ask,
                 event="line.session.no_response_watchdog",
@@ -494,6 +570,25 @@ class LineSessionClient:
             )
         except asyncio.CancelledError:
             raise
+
+    @staticmethod
+    def _clarify_prompt_for_ask(ask: str) -> str:
+        """Use short disambiguation prompts after no-response/garbled turns."""
+        a = (ask or "").strip()
+        low = a.lower()
+        if "first name" in low:
+            return "Did not catch clearly. Say first name only."
+        if "last name" in low:
+            return "Did not catch clearly. Say last name only."
+        if "date of birth" in low:
+            return "Did not catch clearly. Say date of birth, month day year."
+        if "property address" in low:
+            return "Did not catch clearly. Say street address only."
+        if "email" in low:
+            return "Did not catch clearly. Say email slowly."
+        if "phone" in low:
+            return "Did not catch clearly. Say phone number digit by digit."
+        return a or "Could you repeat that?"
 
     async def send_user_speaking_start(self) -> None:
         """Barge-in: cancel agent generation (ConversationRunner cancel_filter)."""
@@ -617,6 +712,7 @@ class LineSessionClient:
             r"\b(i didn'?t hear|didn'?t catch|what did you say)\b",
             r"\b(i'?m lost|i'?m confused|what do you need|what do i do)\b",
             r"\b(pardon|excuse me|sorry what)\b",
+            r"\b(thank you|thanks)\b",
         )
         return any(re.search(p, t) for p in patterns)
 
