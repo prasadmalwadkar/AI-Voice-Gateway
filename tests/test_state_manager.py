@@ -281,6 +281,10 @@ def test_infer_ownership_garbles():
     assert infer_ownership_from_transcript("Soul or not.") == "Sole owner"
     assert infer_ownership_from_transcript("Soul.") == "Sole owner"
     assert infer_ownership_from_transcript("Stole.") == "Sole owner"
+    assert infer_ownership_from_transcript("one") == "Sole owner"
+    assert infer_ownership_from_transcript("1") == "Sole owner"
+    assert infer_ownership_from_transcript("two") == "Joint owner"
+    assert infer_ownership_from_transcript("2") == "Joint owner"
     assert infer_ownership_from_transcript("hello world") is None
 
 
@@ -363,6 +367,22 @@ def test_infer_name_fields():
     assert infer_name_fields_from_transcript("But it's sad.", need_first=True, need_last=True) == {}
     assert infer_name_fields_from_transcript("Primary.", need_first=True, need_last=True) == {}
     assert infer_name_fields_from_transcript("12345", need_first=True, need_last=True) == {}
+    assert infer_name_fields_from_transcript("Whatever.", need_first=True, need_last=True) == {}
+    assert infer_name_fields_from_transcript("My brother.", need_first=False, need_last=True) == {}
+    assert infer_name_fields_from_transcript("Thank you.", need_first=True, need_last=True) == {}
+    # Duplicate STT tokens: never set same string as first + last in one save.
+    assert infer_name_fields_from_transcript(
+        "Alex Alex", need_first=True, need_last=True
+    ) == {"first_name": "Alex"}
+    assert infer_name_fields_from_transcript(
+        "Alex Rivera", need_first=True, need_last=True, slot_focus="first"
+    ) == {"first_name": "Alex"}
+    assert infer_name_fields_from_transcript(
+        "Alex Rivera", need_first=True, need_last=True, slot_focus="last"
+    ) == {"last_name": "Rivera"}
+    assert infer_name_fields_from_transcript(
+        "Rivera", need_first=False, need_last=True, slot_focus="last"
+    ) == {"last_name": "Rivera"}
 
 
 def test_heuristic_result_contract():
@@ -537,6 +557,47 @@ async def test_preline_heuristic_empty_transcript():
         result = await apply_voice_intake_heuristics_before_line("")
 
     assert result.handled is False
+
+
+async def test_preline_partial_phone_reprompt_skips_tool():
+    """5–9 digits in contact stage → deterministic reprompt, no state update."""
+    from agent.schema import HeuristicResult, HelocApplicationState
+    from agent.state_manager import (
+        PARTIAL_MOBILE_PHONE_REPROMPT,
+        apply_voice_intake_heuristics_before_line,
+    )
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line("555-1234")
+
+    assert isinstance(result, HeuristicResult)
+    assert result.handled is True
+    assert result.handled_field == "mobile_phone_number"
+    assert result.stage == "contact"
+    assert result.ask_next == PARTIAL_MOBILE_PHONE_REPROMPT
+    mock_tool.func.assert_not_called()
+
+
+def test_normalize_agent_tts_pins_offstage_narration_for_phone_ask():
+    """Model echoes property/income while asking phone → speak current_ask only."""
+    from app.line_session_client import LineSessionClient
+
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._last_tool_ask = "Mobile phone?"
+    raw = (
+        "I have your income at 80k and property on Main Street. Mobile phone?"
+    )
+    assert LineSessionClient._normalize_agent_text_for_tts(client, raw) == "Mobile phone?"
 
 
 async def test_preline_heuristic_field_already_filled():
@@ -842,6 +903,8 @@ def test_status_check_utterance_short_circuit_match():
         assert fn("Hello, you there?") is True
         assert fn("what's next?") is True
         assert fn("go ahead") is True
+        assert fn("thank you") is True
+        assert fn("thanks") is True
         assert fn("my last name is Smith") is False
 
     lsc = LineSessionClient._is_status_check_utterance
@@ -896,6 +959,17 @@ def test_mismatched_question_detection():
     assert fn("Any other income?", "Any other income?") is False
     assert fn("I see. Let me note that.", "Any other income?") is False
     assert fn("Got it!", "Sole or joint owner?") is False
+
+
+def test_looks_like_answer_to_ownership_numeric_shortcuts():
+    from app.line_session_client import LineSessionClient
+
+    fn = LineSessionClient._looks_like_answer_to_ask
+    ask = "Sole or joint owner? Say one for sole, two for joint."
+    assert fn(ask, "1") is True
+    assert fn(ask, "2") is True
+    assert fn(ask, "one") is True
+    assert fn(ask, "two") is True
 
 
 if __name__ == "__main__":

@@ -30,3 +30,5 @@ logs/
 
 # Local orchestrator session dumps only (replay JSON stays tracked)
 scripts/fixtures/voice_replays/orchestrator_runs/
+
+FILE_REFERENCE.md
