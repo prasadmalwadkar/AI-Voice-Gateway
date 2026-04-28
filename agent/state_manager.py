@@ -34,7 +34,7 @@ import logging
 import os
 import re
 import time
-from typing import Annotated, List, Literal, Optional
+from typing import Annotated, Any, List, Literal, Optional
 
 from pydantic import ValidationError
 from line.llm_agent import loopback_tool
@@ -65,8 +65,42 @@ browser_manager = BrowserManager()
 _browser_sync_inflight: Optional[asyncio.Task[None]] = None
 _SENSITIVE_FIELDS = frozenset({"password", "confirm_password"})
 _pending_low_conf_confirmation: Optional[dict] = None
+_customer_prefill: dict[str, Any] = {}
+_prefill_confirm_pending: Optional[dict[str, Any]] = None
+_prefill_rejected_fields: set[str] = set()
 
-
+_PREFILL_FIELD_ALIASES = {
+    "property_address": "address_line_1",
+    "address": "address_line_1",
+    "property_type": "occupancy_type",
+    "phone": "mobile_phone_number",
+    "phone_number": "mobile_phone_number",
+    "email": "email_address",
+    "for_sale": "is_currently_for_sale",
+    "currently_for_sale": "is_currently_for_sale",
+}
+_PREFILL_ALLOWED_FIELDS = frozenset(
+    {
+        "address_line_1",
+        "apt_suite",
+        "city",
+        "state",
+        "zipcode",
+        "ownership_type",
+        "occupancy_type",
+        "is_currently_for_sale",
+        "annual_pre_tax_income",
+        "other_income",
+        "primary_source_of_income",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "suffix",
+        "date_of_birth",
+        "mobile_phone_number",
+        "email_address",
+    }
+)
 async def _await_inflight_browser_sync() -> None:
     global _browser_sync_inflight
     t0 = time.perf_counter()
@@ -96,13 +130,29 @@ def _should_force_inline_browser_sync(sync_updates: dict) -> bool:
     """
     stage = browser_manager.get_current_stage()
     if stage == "property":
-        # Only occupancy completion should block inline here. Address selection
-        # and ownership fill are expensive/non-boundary and can run async.
         return "occupancy_type" in sync_updates
     if stage == "for-sale":
         # This answer completes for-sale page and can trigger next navigation.
         return "is_currently_for_sale" in sync_updates
     return False
+
+
+def _should_wait_for_address_sync(sync_updates: dict) -> bool:
+    if os.getenv("PATH2_WAIT_FOR_ADDRESS_SYNC", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return False
+    return browser_manager.get_current_stage() == "property" and "address_line_1" in sync_updates
+
+
+def _use_deterministic_address_parsing() -> bool:
+    return os.getenv("PATH2_DETERMINISTIC_ADDRESS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _redact_sensitive_map(data: dict) -> dict:
@@ -117,6 +167,263 @@ def _redact_if_sensitive(field_name: str, value: object) -> object:
     if field_name in _SENSITIVE_FIELDS and value is not None:
         return "***REDACTED***"
     return value
+
+
+def _normalize_prefill_key(key: str) -> str:
+    normalized = (key or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return _PREFILL_FIELD_ALIASES.get(normalized, normalized)
+
+
+def _normalize_prefill_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "listed", "for sale"}:
+        return True
+    if text in {"0", "false", "no", "n", "not listed", "not for sale"}:
+        return False
+    return None
+
+
+def _normalize_prefill_value(field_name: str, value: Any) -> Any:
+    if value is None or value == "":
+        return None
+    if field_name == "ownership_type":
+        text = str(value).strip().lower()
+        if "joint" in text:
+            return "Joint owner"
+        if "sole" in text or "single" in text:
+            return "Sole owner"
+    if field_name == "occupancy_type":
+        text = str(value).strip().lower()
+        if "secondary" in text or "second" in text:
+            return "Secondary property"
+        if "investment" in text or "rental" in text:
+            return "Investment property"
+        if "primary" in text or "main" in text:
+            return "Primary property"
+    if field_name == "is_currently_for_sale":
+        return _normalize_prefill_bool(value)
+    if field_name in {"annual_pre_tax_income", "other_income"}:
+        if isinstance(value, int):
+            return value
+        digits = re.sub(r"[^\d]", "", str(value))
+        return int(digits) if digits else None
+    if field_name == "primary_source_of_income":
+        text = str(value).strip()
+        normalized = re.sub(r"\s+", " ", text).lower()
+        allowed = {
+            "alimony": "Alimony",
+            "child support": "Child support",
+            "employed full-time": "Employed full-time",
+            "employed full time": "Employed full-time",
+            "employed part-time": "Employed part-time",
+            "employed part time": "Employed part-time",
+            "public assistance program": "Public assistance program",
+            "retired": "Retired",
+            "self-employed": "Self-employed",
+            "self employed": "Self-employed",
+            "separate maintenance payments": "Separate maintenance payments",
+            "unemployed / furloughed": "Unemployed / furloughed",
+            "unemployed": "Unemployed / furloughed",
+            "furloughed": "Unemployed / furloughed",
+        }
+        return allowed.get(normalized, text)
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def set_customer_prefill(
+    payload: Optional[dict[str, Any]],
+    *,
+    caller_from: Optional[str] = None,
+    call_sid: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Store external customer data as unconfirmed per-call prefill candidates.
+
+    Values are validated through ``HelocApplicationState`` assignment but are not
+    written into ``application_state`` until the caller explicitly confirms.
+    """
+    global _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields
+    _customer_prefill = {}
+    _prefill_confirm_pending = None
+    _prefill_rejected_fields = set()
+    _clear_pending_low_confidence_confirmation()
+    if not payload:
+        return {}
+
+    validator_state = HelocApplicationState()
+    for raw_key, raw_value in payload.items():
+        field_name = _normalize_prefill_key(str(raw_key))
+        if field_name not in _PREFILL_ALLOWED_FIELDS:
+            continue
+        value = _normalize_prefill_value(field_name, raw_value)
+        if value is None:
+            continue
+        try:
+            setattr(validator_state, field_name, value)
+        except (ValidationError, ValueError) as e:
+            logger.warning(
+                "Ignoring invalid prefill field %s: %s",
+                field_name,
+                str(e).split("\n")[-1],
+            )
+            continue
+        _customer_prefill[field_name] = getattr(validator_state, field_name)
+
+    if _customer_prefill:
+        logger.info(
+            "Customer prefill loaded | fields=%s caller_last4=%s call_sid=%s",
+            sorted(_customer_prefill.keys()),
+            re.sub(r"\D", "", caller_from or "")[-4:] or "unknown",
+            call_sid or "unknown",
+        )
+    return dict(_customer_prefill)
+
+
+def get_customer_prefill_fields() -> list[str]:
+    return sorted(_customer_prefill.keys())
+
+
+def _format_prefill_value(field_name: str, value: Any) -> str:
+    if field_name == "is_currently_for_sale":
+        return "currently for sale" if value else "not currently for sale"
+    if field_name in {"annual_pre_tax_income", "other_income"}:
+        try:
+            return f"${int(value):,}"
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _prefill_prompt_for_values(values: dict[str, Any]) -> str:
+    if "first_name" in values and "last_name" in values:
+        return (
+            "I have your legal name as "
+            f"{values['first_name']} {values['last_name']}. Is that correct?"
+        )
+    field_name, value = next(iter(values.items()))
+    label = _field_display_name(field_name)
+    if field_name == "address_line_1":
+        parts = [str(value)]
+        city = values.get("city")
+        state = values.get("state")
+        zipcode = values.get("zipcode")
+        if city:
+            parts.append(str(city))
+        if state:
+            parts.append(str(state))
+        if zipcode:
+            parts.append(str(zipcode))
+        return (
+            "I have the property address on file as "
+            f"{', '.join(parts)}. Is that correct?"
+        )
+    if field_name == "ownership_type":
+        prefix = (
+            "Got it, I've saved your address. "
+            if application_state.address_line_1 not in (None, "")
+            else ""
+        )
+        if value == "Sole owner":
+            return (
+                f"{prefix}Regarding ownership, I have you down as the sole owner. "
+                "Is that still correct?"
+            )
+        if value == "Joint owner":
+            return (
+                f"{prefix}Regarding ownership, I have you down as a joint owner. "
+                "Is that still correct?"
+            )
+    if field_name == "occupancy_type":
+        return (
+            "I have this listed as "
+            f"{_format_prefill_value(field_name, value).lower()}. Is that still correct?"
+        )
+    if field_name == "mobile_phone_number":
+        return f"I have your mobile number as {value}. Is that correct?"
+    if field_name == "email_address":
+        return f"I have your email as {value}. Is that correct?"
+    if field_name == "is_currently_for_sale":
+        return f"I have the property as {_format_prefill_value(field_name, value)}. Is that still correct?"
+    return (
+        f"I have your {label} as "
+        f"{_format_prefill_value(field_name, value)}. Is that still correct?"
+    )
+
+
+def _prefill_values_for_field(field_name: str, stage_num: int) -> dict[str, Any]:
+    if field_name in _prefill_rejected_fields or field_name not in _customer_prefill:
+        return {}
+    if getattr(application_state, field_name, None) not in (None, ""):
+        return {}
+    values = {field_name: _customer_prefill[field_name]}
+    if field_name == "address_line_1":
+        for extra_field in ("apt_suite", "city", "state", "zipcode"):
+            if (
+                extra_field in _customer_prefill
+                and extra_field not in _prefill_rejected_fields
+                and getattr(application_state, extra_field, None) in (None, "")
+            ):
+                values[extra_field] = _customer_prefill[extra_field]
+    if stage_num == 4 and field_name == "first_name":
+        if (
+            "last_name" in _customer_prefill
+            and "last_name" not in _prefill_rejected_fields
+            and application_state.last_name in (None, "")
+        ):
+            values["last_name"] = _customer_prefill["last_name"]
+    return values
+
+
+def _set_prefill_confirm_pending(values: dict[str, Any]) -> str:
+    global _prefill_confirm_pending
+    prompt = _prefill_prompt_for_values(values)
+    _prefill_confirm_pending = {"values": dict(values), "ask": prompt}
+    return prompt
+
+
+def has_pending_prefill_confirmation() -> bool:
+    return bool(_prefill_confirm_pending)
+
+
+def get_initial_intake_ask() -> Optional[str]:
+    """Return the current deterministic Ask next for dynamic call introductions."""
+    ask = _ask_from_missing_line(get_missing_fields() or "")
+    if not ask:
+        return None
+    first_name = str(_customer_prefill.get("first_name") or "").strip()
+    greeting = f"Hi {first_name}, " if first_name else ""
+    if ask in {"What is the property address?", "Can you tell me the property address?"}:
+        return f"{greeting}can you tell me your property address?"
+    if first_name and ask.startswith("I have "):
+        return greeting + ask
+    return ask
+
+
+def _current_prefill_confirmation_values() -> dict[str, Any]:
+    """
+    Recover the active on-file confirmation values if a stale TTS/LLM path lost
+    ``_prefill_confirm_pending`` before the caller answered yes/no.
+    """
+    if _prefill_confirm_pending:
+        return dict(_prefill_confirm_pending.get("values") or {})
+    missing_line = get_missing_fields() or ""
+    if not _prefill_confirm_pending:
+        return {}
+    ask = _prefill_confirm_pending.get("ask") or ""
+    if ask and ask in missing_line:
+        return dict(_prefill_confirm_pending.get("values") or {})
+    return {}
+
+
+def _clear_prefill_confirm_pending() -> None:
+    global _prefill_confirm_pending
+    _prefill_confirm_pending = None
 
 
 def has_pending_low_confidence_confirmation() -> bool:
@@ -337,9 +644,12 @@ async def ensure_browser_ready() -> None:
 async def reset_state() -> None:
     """Reset the application state and browser for a new call."""
     await _await_inflight_browser_sync()
-    global application_state
+    global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields
     application_state = HelocApplicationState()
     _clear_pending_low_confidence_confirmation()
+    _customer_prefill = {}
+    _prefill_confirm_pending = None
+    _prefill_rejected_fields = set()
     # If a previous browser was left running, shut it down so we start fresh
     if browser_manager.is_running:
         logger.info("Closing stale browser session...")
@@ -367,6 +677,23 @@ def get_missing_fields() -> str:
             f"{stage_header} Still needed: {label}. "
             f'Ask next: "{_pending_low_conf_ask()}"'
         )
+
+    if _prefill_confirm_pending:
+        pending_values = _prefill_confirm_pending.get("values") or {}
+        active_values = {
+            field_name: value
+            for field_name, value in pending_values.items()
+            if field_name not in _prefill_rejected_fields
+            and getattr(state, field_name, None) in (None, "")
+        }
+        if active_values:
+            label = ", ".join(_field_display_name(f) for f in active_values.keys())
+            stage_header = f"[BROWSER STAGE: {browser_manager.get_current_stage().upper()}]"
+            return (
+                f"{stage_header} Still needed: {label}. "
+                f'Ask next: "{_prefill_confirm_pending.get("ask")}"'
+            )
+        _clear_prefill_confirm_pending()
 
     # WCL /register: picking one row from the address dropdown fills street, city, state, zip
     # in the browser. User is never asked for city/state/zip in voice—only the street line for
@@ -427,27 +754,27 @@ def get_missing_fields() -> str:
     }
     # Short scripted asks per field. Keep deterministic to avoid drift.
     field_to_question = {
-        "address_line_1": "What is the property address?",
-        "ownership_type": "What is the ownership type: sole or joint?",
+        "address_line_1": "Can you tell me the property address?",
+        "ownership_type": "Are you the sole owner, or is it jointly owned?",
         "occupancy_type": (
-            "What is the property type: primary, secondary, or investment?"
+            "Is this your primary home, a second home, or an investment property?"
         ),
         "is_currently_for_sale": (
-            "Is the property currently for sale?"
+            "Is the property currently listed for sale?"
         ),
-        "annual_pre_tax_income": "What is your annual pre-tax income?",
+        "annual_pre_tax_income": "What's your annual pre-tax income?",
         "other_income": "Any other income to include?",
-        "primary_source_of_income": "What is your primary income source?",
-        "first_name": "What is your first name?",
+        "primary_source_of_income": "What's your main income source?",
+        "first_name": "What's your first name?",
         "middle_name": "Middle name? Optional.",
-        "last_name": "What is your last name?",
+        "last_name": "What's your last name?",
         "suffix": "Any suffix like Jr or Sr? Optional.",
-        "date_of_birth": "What is your date of birth?",
-        "mobile_phone_number": "What is your mobile phone number?",
-        "email_address": "What is your email address?",
+        "date_of_birth": "What's your date of birth?",
+        "mobile_phone_number": "What's the best mobile number for this application?",
+        "email_address": "What's the best email for this application?",
         "agreed_to_privacy_policy": (
-            "To continue, I need your consent to the Privacy Policy, Terms of Service, "
-            "and a soft credit pull. It will not affect your credit score. Do you agree?"
+            "Do you agree to the Privacy Policy, Terms of Service, and a soft credit pull? "
+            "It will not affect your credit score."
         ),
         "agreed_to_commerce_communication": (
             "Do you agree to receive electronic communications about this application?"
@@ -541,7 +868,11 @@ def get_missing_fields() -> str:
 
     question_hint = ""
     if first_missing_field:
-        preset = field_to_question.get(first_missing_field)
+        prefill_values = _prefill_values_for_field(first_missing_field, current_stage_num)
+        if prefill_values:
+            preset = _set_prefill_confirm_pending(prefill_values)
+        else:
+            preset = field_to_question.get(first_missing_field)
         if preset:
             question_hint = f' Ask next: "{preset}"'
 
@@ -751,6 +1082,13 @@ def looks_like_answer_for_current_field(text: str, missing_line: str) -> bool:
     low = normalized.lower()
     bare = re.sub(r"[^\w\s']", " ", low)
     bare = re.sub(r"\s+", " ", bare).strip()
+
+    if (
+        "on file" in ask
+        or "is that correct" in ask
+        or "is that still correct" in ask
+    ):
+        return infer_yes_no_from_transcript(normalized) is not None
 
     if "property address" in ask:
         if infer_property_address_from_transcript(normalized):
@@ -1209,6 +1547,21 @@ def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
     low = re.sub(r"\s+", " ", low).strip()
     # Common STT garble on phone audio: "one million" -> "one medium".
     low = re.sub(r"\b(medium|millian|millon)\b", "million", low)
+    # Common STT garble: "my annual" -> "manual".
+    low = re.sub(r"\bmanual\b", "annual", low)
+    stripped = low
+    stripped = re.sub(
+        r"\b(my|the|our|this|that)\b",
+        " ",
+        stripped,
+    )
+    stripped = re.sub(
+        r"\b(annual|yearly|year)\s+(pre\s*-?\s*tax|pretax)?\s*income\b",
+        " ",
+        stripped,
+    )
+    stripped = re.sub(r"\b(pre\s*-?\s*tax|pretax|income|salary|is|it'?s|about|around)\b", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
 
     _millionish = r"(?=\s*(?:million|\bm\b|\bk\b))"
 
@@ -1276,7 +1629,7 @@ def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
         "eight": "8",
         "nine": "9",
     }
-    wtokens = [re.sub(r"[^a-z0-9]", "", t) for t in low.split()]
+    wtokens = [re.sub(r"[^a-z0-9]", "", t) for t in stripped.split()]
     if wtokens and all(t in digit_word_map for t in wtokens):
         seq = "".join(digit_word_map[t] for t in wtokens).lstrip("0") or "0"
         try:
@@ -1287,7 +1640,7 @@ def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
             pass
 
     # --- spoken words: "eighty thousand", "one point five million" ---
-    spoken = _spoken_number_to_int(low)
+    spoken = _spoken_number_to_int(low) or _spoken_number_to_int(stripped)
     if spoken is not None and spoken >= 1_000 and spoken <= _MAX_INFERRED_ANNUAL_INCOME:
         return (spoken, one_one_five_point_sub)
 
@@ -1655,6 +2008,30 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
     rest = re.sub(r"\bct\b", "court", rest)
     rest = re.sub(r"\bpkwy\b", "parkway", rest)
     rest = re.sub(r"\bst\b", "street", rest)
+    ordinal_word_to_num = {
+        "first": "1st",
+        "second": "2nd",
+        "third": "3rd",
+        "fourth": "4th",
+        "fifth": "5th",
+        "sixth": "6th",
+        "seventh": "7th",
+        "eighth": "8th",
+        "ninth": "9th",
+        "tenth": "10th",
+        "eleventh": "11th",
+        "twelfth": "12th",
+        "thirteenth": "13th",
+        "fourteenth": "14th",
+        "fifteenth": "15th",
+        "sixteenth": "16th",
+        "seventeenth": "17th",
+        "eighteenth": "18th",
+        "nineteenth": "19th",
+        "twentieth": "20th",
+    }
+    for w, n in ordinal_word_to_num.items():
+        rest = re.sub(rf"\b{w}\b", n, rest)
     rest = re.sub(r"\s+", " ", rest).strip(" .,-")
     if had_comma:
         street_line = re.match(
@@ -1675,7 +2052,75 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
         rest_l,
     ):
         return None
-    return f"{num} {rest.title()}"
+    formatted_tokens: list[str] = []
+    for token in rest.split():
+        if re.search(r"\d", token):
+            formatted_tokens.append(token.lower())
+        else:
+            formatted_tokens.append(token.capitalize())
+    return f"{num} {' '.join(formatted_tokens)}"
+
+
+_STATE_NAME_TO_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
+    "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH",
+    "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI",
+    "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
+    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+
+
+def _state_abbr_from_text(text: str) -> Optional[str]:
+    normalized = re.sub(r"[^a-zA-Z\s]", " ", text or "")
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    for name, abbr in _STATE_NAME_TO_ABBR.items():
+        if re.search(rf"\b{re.escape(name)}\b", normalized):
+            return abbr
+    m = re.search(r"\b([A-Z]{2})\b\s*$", (text or "").strip().upper())
+    if m and m.group(1) in set(_STATE_NAME_TO_ABBR.values()):
+        return m.group(1)
+    return None
+
+
+def infer_property_city_state_from_transcript(text: str) -> dict[str, str]:
+    """Conservative city/state hints from same address utterance."""
+    if not text or not str(text).strip():
+        return {}
+    out: dict[str, str] = {}
+
+    parts = [p.strip(" .") for p in re.split(r",", str(text)) if p.strip(" .")]
+    if len(parts) >= 2:
+        city_part = parts[1]
+        state_from_city_part = _state_abbr_from_text(city_part)
+        city = city_part
+        if state_from_city_part:
+            out["state"] = state_from_city_part
+            city = re.sub(r"\b[A-Z]{2}\b", " ", city, flags=re.IGNORECASE)
+            for state_name in _STATE_NAME_TO_ABBR:
+                city = re.sub(rf"\b{re.escape(state_name)}\b", " ", city, flags=re.IGNORECASE)
+        city = re.sub(r"\b\d{5}\b", " ", city)
+        city = re.sub(r"[^a-zA-Z\s.-]", " ", city)
+        city = re.sub(r"\s+", " ", city).strip(" .-")
+        if city and not _state_abbr_from_text(city):
+            out["city"] = city.title()
+        if len(parts) >= 3:
+            state = _state_abbr_from_text(parts[2])
+            if state:
+                out["state"] = state
+
+    if "state" not in out:
+        state = _state_abbr_from_text(str(text))
+        if state:
+            out["state"] = state
+    return out
 
 
 def _name_slot_focus_from_missing(missing_blob: str) -> Optional[str]:
@@ -1927,6 +2372,21 @@ def infer_yes_no_from_transcript(text: str) -> Optional[bool]:
     if not text:
         return None
     t = text.strip().lower().rstrip(".,!?")
+    compact = re.sub(r"[^\w\s']", " ", t)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    repeated_tokens = compact.split()
+    if repeated_tokens and len(set(repeated_tokens)) == 1:
+        t = repeated_tokens[0]
+    if re.search(
+        r"\b(yes|yeah|yep|yup|correct|right|agree|agreed|absolutely|definitely|sure)\b",
+        compact,
+    ) and not re.search(
+        r"\b(no|nope|nah|don't|do not|not really|negative|disagree)\b",
+        compact,
+    ):
+        return True
+    if re.search(r"\b(no|nope|nah|negative|disagree)\b", compact):
+        return False
     if t in {
         "yes", "yeah", "yep", "yup", "correct", "right",
         "i agree", "agree", "sure", "of course", "absolutely",
@@ -2059,6 +2519,11 @@ async def update_application_state(
     current_stage = browser_manager.get_current_stage()
     allowed_now = stage_to_allowed_fields.get(current_stage)
 
+    if _pending_low_conf_confirmation and any(
+        value is not None for value in local_vars.values()
+    ):
+        _clear_pending_low_confidence_confirmation()
+
     if raw_user_input and _pending_low_conf_confirmation:
         pending_yes_no = infer_yes_no_from_transcript(raw_user_input)
         if pending_yes_no is True:
@@ -2084,10 +2549,18 @@ async def update_application_state(
 
     # STT often garbles "sole owner" / "primary property"; infer if LLM omitted fields.
     if raw_user_input and browser_manager.get_current_stage() == "property":
-        if local_vars.get("address_line_1") is None and application_state.address_line_1 is None:
+        if (
+            _use_deterministic_address_parsing()
+            and local_vars.get("address_line_1") is None
+            and application_state.address_line_1 is None
+        ):
             inferred_addr = infer_property_address_from_transcript(raw_user_input)
             if inferred_addr:
                 local_vars["address_line_1"] = inferred_addr
+        if local_vars.get("address_line_1") is not None:
+            for key, value in infer_property_city_state_from_transcript(raw_user_input).items():
+                if local_vars.get(key) is None and getattr(application_state, key, None) is None:
+                    local_vars[key] = value
         # Same utterance must not fill both: "one"/"1" is sole owner, not primary occupancy.
         # If this call already sets occupancy, do not infer ownership (e.g. "two" for
         # secondary must not become joint owner).
@@ -2107,11 +2580,6 @@ async def update_application_state(
             inferred_fs = infer_for_sale_from_transcript(raw_user_input)
             if inferred_fs is not None:
                 local_vars["is_currently_for_sale"] = inferred_fs
-
-    if _pending_low_conf_confirmation and any(
-        value is not None for value in local_vars.values()
-    ):
-        _clear_pending_low_confidence_confirmation()
 
     # Determine effective confidence (default to 1.0 if not provided)
     score = confidence_score if confidence_score is not None else 1.0
@@ -2259,8 +2727,12 @@ async def update_application_state(
     if updates:
         ucopy = dict(updates)
         inline_sync = (
-            not bool(deterministic_call)
-            and (_use_inline_browser_sync() or _should_force_inline_browser_sync(ucopy))
+            _use_inline_browser_sync()
+            or _should_wait_for_address_sync(ucopy)
+            or (
+                not bool(deterministic_call)
+                and _should_force_inline_browser_sync(ucopy)
+            )
         )
         if inline_sync:
             try:
@@ -2361,18 +2833,18 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             return None
         if field == "ownership_type":
             return (
-                "I'm assuming sole owner as ownership type for now. "
-                "What is the property type: primary, secondary, or investment?"
+                "I'm assuming sole owner for now. "
+                "Is this your primary home, a second home, or an investment property?"
             )
         if field == "occupancy_type":
             return (
-                "I'm assuming primary as property type for now. "
-                "Is the property currently for sale?"
+                "I'm assuming primary home for now. "
+                "Is the property currently listed for sale?"
             )
         if field == "is_currently_for_sale":
             return (
-                "I'm assuming the property is not currently for sale for now. "
-                "What is your annual pre-tax income?"
+                "I'm assuming it is not listed for sale for now. "
+                "What's your annual pre-tax income?"
             )
         if field == "annual_pre_tax_income":
             return (
@@ -2387,9 +2859,29 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         if field == "primary_source_of_income":
             return (
                 "I'm assuming employed full-time as income source for now. "
-                "What is your first name?"
+                "What's your first name?"
             )
         return ask
+
+    def _with_save_ack(field: str, ask: Optional[str]) -> Optional[str]:
+        if not ask:
+            return None
+        low = ask.strip().lower()
+        if low.startswith(
+            (
+                "i didn't",
+                "please",
+                "to continue",
+                "do you agree",
+                "i'm assuming",
+            )
+        ):
+            return ask
+        if field == "address_line_1":
+            prefix = "Got it, I'll pull that up."
+        else:
+            return ask
+        return f"{prefix} {ask}"
 
     def _ok(ask: Optional[str], field: str, stage: str) -> HeuristicResult:
         logger.info(
@@ -2398,7 +2890,12 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             stage,
             extra={"event": "state.deterministic_handled", "field": field, "stage": stage},
         )
-        return HeuristicResult(handled=True, ask_next=ask, handled_field=field, stage=stage)
+        return HeuristicResult(
+            handled=True,
+            ask_next=_with_save_ack(field, ask),
+            handled_field=field,
+            stage=stage,
+        )
 
     def _fail(stage: str) -> HeuristicResult:
         return HeuristicResult(handled=False, stage=stage)
@@ -2409,6 +2906,52 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
     if transcript_is_status_check(text):
         return _NOT_HANDLED
     stage = browser_manager.get_current_stage()
+    yn_for_prefill = infer_yes_no_from_transcript(text)
+    prefill_confirmation_values = (
+        _current_prefill_confirmation_values()
+        if _prefill_confirm_pending or yn_for_prefill is not None
+        else {}
+    )
+    if prefill_confirmation_values:
+        yn = yn_for_prefill
+        if yn is None:
+            ask = (
+                (_prefill_confirm_pending or {}).get("ask")
+                or _prefill_prompt_for_values(prefill_confirmation_values)
+            )
+            return _ok(ask, "prefill_confirmation", stage)
+
+        pending_values = dict(prefill_confirmation_values)
+        _clear_prefill_confirm_pending()
+        if yn is False:
+            _prefill_rejected_fields.update(pending_values.keys())
+            ask = _ask_from_missing_line(get_missing_fields() or "")
+            return _ok(ask, "prefill_confirmation_rejected", stage)
+
+        for field_name in pending_values:
+            _customer_prefill.pop(field_name, None)
+        _clear_pending_low_confidence_confirmation()
+        try:
+            tool_result = await update_application_state.func(
+                None,
+                **pending_values,
+                confidence_score=1.0,
+                raw_user_input=text,
+                deterministic_call=True,
+            )
+            return _ok(
+                _extract_ask_next(tool_result),
+                "prefill_confirmation",
+                stage,
+            )
+        except Exception as e:
+            logger.warning(
+                "apply_voice_intake_heuristics_before_line prefill confirmation failed: %s",
+                e,
+                exc_info=True,
+            )
+            return _fail(stage)
+
     if has_pending_low_confidence_confirmation():
         yn = infer_yes_no_from_transcript(text)
         if yn is not None:
@@ -2431,7 +2974,7 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                 return _fail(stage)
 
     if stage == "property":
-        if application_state.address_line_1 is None:
+        if _use_deterministic_address_parsing() and application_state.address_line_1 is None:
             addr = infer_property_address_from_transcript(text)
             if addr is not None:
                 try:
