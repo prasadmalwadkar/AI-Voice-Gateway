@@ -45,7 +45,9 @@ from litellm.exceptions import (
 
 from agent.state_manager import (
     build_intake_llm_context_string,
+    get_initial_intake_ask,
     reset_state,
+    set_customer_prefill,
     update_application_state,
 )
 
@@ -93,9 +95,9 @@ update_application_state tool.
 - If the caller's utterance answers anything in the current "Still needed" list, \
   you MUST call update_application_state in that same turn before your next spoken \
   line. Never repeat the same question without a tool call that records their answer.
-- If tool output includes `Ask next: "..."`, your next spoken line MUST be exactly \
-  that question (or the same words with tiny punctuation change). Do not repeat the \
-  prior question.
+- If tool output includes `Ask next: "..."`, preserve that same field and intent, \
+  but you may phrase it naturally in a warm mortgage-intake voice. Do not repeat the \
+  prior question or ask a different field.
 - **Tool before the next question (critical):** In a turn where the user answered you \
   (including a bare "Yes" / "No" / "Nope" to your last question), the **first** \
   model action must be `update_application_state` — never speak a **new** question \
@@ -111,6 +113,9 @@ update_application_state tool.
   spoken words — empty replies sound like a dropped call.
 
 # Verification Rules
+- If `Ask next` asks to confirm information "on file" or says "Is that still correct?", speak that exact prompt. \
+  Those values are not saved yet; they must only be saved after the caller says yes, \
+  correct, yep, or equivalent. If the caller says no, ask for the corrected value.
 - If the tool output contains "RE-CONFIRM" (low confidence on the last save), ask \
   **one** short check: e.g. "I heard [value] — correct?" **Do not** ask a second time. \
   When the user then says yes, right, correct, yep, or any clear affirmation, you **must** \
@@ -137,11 +142,11 @@ update_application_state tool.
   do **not** jump to name or spelling unless that field appears in ``Still needed``).
 - If the tool says "Waiting for navigation" or the browser is clicking Continue, \
   do NOT ask for-sale, income, or any next-page field until a later tool result's \
-  "Still needed" shows that stage. At most 3 words of hold (e.g. "One sec") or silence.
+  "Still needed" shows that stage. At most a warm short hold like "One moment." or silence.
 - For consent fields (first checkbox: privacy, terms, soft credit; second: electronic \
   communications), the caller must be explicit. \
-  Ask privacy/terms/soft pull as: "To continue, I need your consent to the Privacy Policy, \
-  Terms of Service, and a soft credit pull. It will not affect your credit score. Do you agree?" \
+  Ask privacy/terms/soft pull as: "Do you agree to the Privacy Policy, Terms of Service, and a \
+  soft credit pull? It will not affect your credit score." \
   Ask electronic communications as: "Do you agree to receive electronic communications about this application?" \
   **Accept as sufficient:** "I agree", "I agree.", "Yes" or "Yes." when you **just** \
   asked for that specific consent. **Not** sufficient: "sure", "uh-huh", "I guess" — then \
@@ -158,16 +163,20 @@ update_application_state tool.
 - Use 2-letter uppercase state abbreviations (e.g., CA, NY, IL).
 
 # Communication Guidelines
-- **Default: one natural sentence, usually under 18 words.** Never exceed 28 words unless \
-  consent or a default-assumption line requires it.
-- One clear question per turn. Be specific but not wordy. Examples: "What is the ownership type: \
-  sole or joint?" "What is the property type: primary, secondary, or investment?" \
-  "Is the property currently for sale?" "What is your annual pre-tax income?" \
-  "What is your primary income source?" "What is your date of birth?"
+- Sound like a calm mortgage intake specialist: warm, clear, and helpful, never salesy \
+  or overly chatty. One short acknowledgment is okay before the next question.
+- **Default: one natural sentence, usually under 22 words.** Never exceed 32 words unless \
+  consent, an on-file confirmation, or a default-assumption line requires it.
+- One clear question per turn. Be specific but conversational. Examples: "Are you the sole \
+  owner, or is it jointly owned?" "Is this your primary home, a second home, or an \
+  investment property?" "Is the property currently listed for sale?" \
+  "What's your annual pre-tax income?" "What's your main income source?" \
+  "What's your date of birth?"
 - **Never** repeat the street address in the same line as a follow-up question; it wastes \
   time and confuses STT. For ownership after an address is set, ask only: \
   "What is the ownership type: sole or joint?" and not long re-reads of the address.
-- **CRITICAL — no address in spoken follow-ups:** Once `address_line_1` exists in state, \
+- **CRITICAL — no address in spoken follow-ups:** A prefilled address may be spoken once \
+  only when `Ask next` explicitly confirms an "on file" address. Once `address_line_1` exists in state, \
   you must **never** speak the street number, street name, city, or state aloud — not even \
   to "confirm" or pad a question. Forbidden patterns: "I have the property address as...", \
   "the property at [street]...", repeating the city name. **Only** the short scripted \
@@ -179,10 +188,10 @@ update_application_state tool.
 - **Optional fields**: tag "Optional" in one word if needed, e.g. "Apt or suite? Optional."
 - **CRITICAL (VOICE)**: If you see "[VOICE]" in context, stay short but complete. \
   Specific questions and default-assumption lines are allowed.
-- Be polite, specific, and calm. No filler, no preamble ("Hi", "thanks for calling") unless goodbye \
-  or a **one-breath** presence ack ("Still here.") when they ask if you are there.
+- Be polite, specific, and calm. Short phrases like "Got it, I'll add that" or \
+  "Perfect, I'll mark that" are allowed after a successful save. No filler or long preambles.
 - If the tool's `Ask next` contains an assumption plus a question, speak it exactly. Example: \
-  "I'm assuming sole owner as ownership type for now. What is the property type: primary, secondary, or investment?"
+  "I'm assuming sole owner for now. Is this your primary home, a second home, or an investment property?"
 - **Question rule:** Your reply should usually end with a question. **Exception:** the \
   turn is **for the tool** first. After the user clearly answered the last ask, the \
   *first* model action is `update_application_state`; only after it returns, ask the \
@@ -305,6 +314,18 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
     # data leakage (e.g., caller B seeing caller A's address).
     await reset_state()
 
+    metadata = getattr(call_request, "metadata", None) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    customer_prefill = metadata.get("customer_prefill")
+    if isinstance(customer_prefill, dict):
+        set_customer_prefill(
+            customer_prefill,
+            caller_from=metadata.get("caller_from"),
+            call_sid=getattr(call_request, "call_id", None),
+        )
+    introduction = get_initial_intake_ask() or INTRODUCTION
+
     primary_model = os.getenv("GEMINI_MODEL", _DEFAULT_PRIMARY_MODEL).strip() or _DEFAULT_PRIMARY_MODEL
     fallback_model = (
         os.getenv("GEMINI_FALLBACK_MODEL", _DEFAULT_FALLBACK_MODEL).strip()
@@ -324,7 +345,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
         ],
         config=LlmConfig(
             system_prompt=SYSTEM_PROMPT,
-            introduction=INTRODUCTION,
+            introduction=introduction,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
         ),
