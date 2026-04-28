@@ -6,6 +6,7 @@ Uses AsyncCartesia.tts.websocket_connect; one connection per call, new context p
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -41,7 +42,7 @@ def default_generation_config() -> Dict[str, float]:
     Speed: [0.6, 1.5] — 0.6 is slowest, 1.0 is Cartesia default.
     Volume: [0.5, 2.0] — boost above 1.0 for PSTN audibility.
     """
-    speed = max(0.6, min(1.5, float(os.getenv("CARTESIA_TTS_SPEED", "0.75"))))
+    speed = max(0.6, min(1.5, float(os.getenv("CARTESIA_TTS_SPEED", "1.05"))))
     volume = max(0.5, min(2.0, float(os.getenv("CARTESIA_TTS_VOLUME", "2.0"))))
     return {"speed": speed, "volume": volume}
 
@@ -55,6 +56,8 @@ class CartesiaSonicMulawTTS:
         self._manager: Any = None
         self._conn: Any = None
         self._current_ctx: Any = None
+        self._stream_task: Optional[asyncio.Task[None]] = None
+        self._cancelled = False
 
     async def connect(self) -> None:
         api_key = os.getenv("CARTESIA_API_KEY", "")
@@ -88,6 +91,7 @@ class CartesiaSonicMulawTTS:
         self._call_logger.info("Cartesia TTS closed", event="cartesia.tts.closed")
 
     async def cancel_current(self) -> None:
+        self._cancelled = True
         ctx = self._current_ctx
         if ctx is not None:
             try:
@@ -95,6 +99,9 @@ class CartesiaSonicMulawTTS:
             except Exception:
                 pass
             self._current_ctx = None
+        task = self._stream_task
+        if task is not None and not task.done():
+            task.cancel()
 
     async def speak_text(
         self,
@@ -103,9 +110,14 @@ class CartesiaSonicMulawTTS:
     ) -> None:
         """
         Synthesize `text` and invoke callback for each raw µ-law chunk (decoded from API).
+
+        The receive loop runs in a child task so that cancel_current() can
+        interrupt a blocked ``ctx.receive()`` immediately via task.cancel().
         """
         if not text.strip() or self._conn is None:
             return
+
+        self._cancelled = False
 
         model_id = os.getenv("CARTESIA_TTS_MODEL_ID", "sonic-3")
         voice = default_voice()
@@ -123,7 +135,9 @@ class CartesiaSonicMulawTTS:
         t0 = time.monotonic()
         chunks = 0
         last_chunk_at = t0
-        try:
+
+        async def _do_stream() -> None:
+            nonlocal chunks, last_chunk_at
             await ctx.send(
                 model_id=model_id,
                 transcript=text,
@@ -133,6 +147,8 @@ class CartesiaSonicMulawTTS:
                 generation_config=gen_cfg,
             )
             async for event in ctx.receive():
+                if self._cancelled:
+                    break
                 now = time.monotonic()
                 if now - t0 > _TTS_MAX_WALL_SEC:
                     self._call_logger.warning(
@@ -149,7 +165,7 @@ class CartesiaSonicMulawTTS:
                 et = getattr(event, "type", None)
                 if et == "chunk":
                     audio = event.audio
-                    if audio:
+                    if audio and not self._cancelled:
                         chunks += 1
                         last_chunk_at = now
                         await on_mulaw_chunk(audio)
@@ -160,10 +176,26 @@ class CartesiaSonicMulawTTS:
                         event="cartesia.tts.chunk_error",
                     )
                     break
-            elapsed = time.monotonic() - t0
-            self._call_logger.debug(
-                f"TTS done: {chunks} chunks in {elapsed:.2f}s",
-                event="cartesia.tts.utterance_done",
+
+        self._stream_task = asyncio.create_task(_do_stream())
+        try:
+            await self._stream_task
+        except asyncio.CancelledError:
+            if not self._cancelled:
+                raise
+            self._call_logger.info(
+                f"TTS cancelled after {chunks} chunks",
+                event="cartesia.tts.cancelled",
             )
         finally:
+            task = self._stream_task
+            self._stream_task = None
             self._current_ctx = None
+            if task is not None and not task.done():
+                task.cancel()
+
+        elapsed = time.monotonic() - t0
+        self._call_logger.debug(
+            f"TTS done: {chunks} chunks in {elapsed:.2f}s",
+            event="cartesia.tts.utterance_done",
+        )
