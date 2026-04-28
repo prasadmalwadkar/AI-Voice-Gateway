@@ -86,6 +86,8 @@ class LineSessionClient:
         self._no_response_watchdog_task: Optional[asyncio.Task[None]] = None
         self._last_spoken_ask_text: str = ""
         self._last_spoken_ask_ts = 0.0
+        self._clarification_ask_key: str = ""
+        self._clarification_count: int = 0
         self._ask_spoken_this_turn = False
 
     async def connect(self) -> None:
@@ -159,12 +161,42 @@ class LineSessionClient:
         ):
             return current_ask
 
+        # Model sometimes echoes SYSTEM_PROMPT examples (e.g. "full last name")
+        # while Still needed is still property / income — never speak that aloud.
+        if current_ask and self._model_leaks_name_intake_before_that_stage(t, current_ask):
+            return current_ask
+
         if current_ask and self._model_leaks_offstage_for_personal_ask(t, current_ask):
             return current_ask
 
         if current_ask and self._text_contains_mismatched_question(t, current_ask):
             return current_ask
         return t
+
+    _NAME_FIELD_LEAK_RE = re.compile(
+        r"\b(full\s+)?last\s+name\b|\bfirst\s+name\b|\blegal\s+name\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _is_name_or_contact_intake_ask(current_ask: str) -> bool:
+        ca = (current_ask or "").lower()
+        return any(
+            m in ca
+            for m in (
+                "first name",
+                "last name",
+                "date of birth",
+                "mobile phone",
+                "phone number",
+                "email address",
+            )
+        )
+
+    def _model_leaks_name_intake_before_that_stage(self, text: str, current_ask: str) -> bool:
+        if self._is_name_or_contact_intake_ask(current_ask):
+            return False
+        return bool(self._NAME_FIELD_LEAK_RE.search(text))
 
     _PERSONAL_FIELD_ASK_MARKERS = (
         "phone",
@@ -780,10 +812,44 @@ class LineSessionClient:
             return "I didn't catch email. Please say it slowly."
         return "I didn't catch an answer. Please say it another way."
 
+    @staticmethod
+    def _spelling_clarification_for_ask(ask: str) -> str:
+        low = (ask or "").strip().lower()
+        if "first name" in low:
+            return (
+                "I still didn't catch first name. Please spell it slowly, "
+                "letter by letter."
+            )
+        if "last name" in low:
+            return (
+                "I still didn't catch last name. Please spell it slowly, "
+                "letter by letter."
+            )
+        if "property address" in low or "street address" in low:
+            return "Please spell the street address slowly, one word at a time."
+        if "email" in low:
+            return "Please spell the email slowly, letter by letter."
+        if "date of birth" in low:
+            return "Please say date of birth slowly, one word at a time."
+        if "annual pre-tax income" in low or "annual income" in low:
+            return "Please say the income slowly, one word at a time."
+        return "Please say it slowly again, or spell it if needed."
+
     async def enqueue_clarification_for_current_ask(self) -> bool:
         """Clarify invalid/noisy answer without replacing current Ask next."""
         ask = (self._last_tool_ask or "").strip()
-        response = self._clarification_for_ask(ask)
+        key = ask.lower()
+        if key and key == getattr(self, "_clarification_ask_key", ""):
+            self._clarification_count = getattr(self, "_clarification_count", 0) + 1
+        else:
+            self._clarification_ask_key = key
+            self._clarification_count = 1
+        if self._clarification_count >= 3:
+            response = self._spelling_clarification_for_ask(ask)
+        elif self._clarification_count == 1:
+            response = ask if ask else self._clarification_for_ask(ask)
+        else:
+            response = self._clarification_for_ask(ask)
         self._ask_spoken_this_turn = False
         return await self._enqueue_ask_if_needed(
             response,
