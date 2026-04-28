@@ -1,5 +1,5 @@
 """
-Twilio Media Streams ↔ Cartesia Ink STT ↔ Line /ws (LlmAgent) ↔ Sonic TTS.
+Twilio Media Streams ↔ selected STT ↔ Line /ws (LlmAgent) ↔ Sonic TTS.
 
 Path2 single-brain pipeline: no Cartesia Calls API.
 """
@@ -13,7 +13,7 @@ import os
 import re
 import time
 import uuid
-from typing import Optional
+from typing import Any, AsyncIterator, Optional, Protocol
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -25,6 +25,7 @@ from agent.state_manager import (
     get_missing_fields,
     has_pending_low_confidence_confirmation,
     infer_email_from_transcript,
+    infer_phone_from_transcript,
     infer_property_address_from_transcript,
     looks_like_answer_for_current_field,
     reset_state,
@@ -33,6 +34,7 @@ from agent.state_manager import (
 )
 from app.cartesia_stt_client import CartesiaInkSTTSession
 from app.cartesia_tts_mulaw import CartesiaSonicMulawTTS
+from app.deepgram_stt_client import DeepgramFluxSTTSession
 from app.line_session_client import LineSessionClient
 from app.conversation_transcript import append_transcript_turn
 from app.intake_audit import log_intake_event
@@ -85,6 +87,13 @@ DETERMINISTIC_GOODBYE_DRAIN_SEC = float(
 )
 DETERMINISTIC_FOLLOWUP_POLL_SEC = 0.25
 DETERMINISTIC_FOLLOWUP_MAX_WAIT_SEC = 8.0
+CALLER_RESPONSE_WATCHDOG_SECS = max(
+    1.0, float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_SECS", "10.0"))
+)
+CALLER_RESPONSE_WATCHDOG_PREFIX = os.getenv(
+    "TWILIO_CALLER_RESPONSE_WATCHDOG_PREFIX",
+    "I couldn't hear you, can you say that again?",
+).strip()
 PIPELINE_DEBUG_ENABLED = os.getenv("TWILIO_PIPELINE_DEBUG", "1").strip().lower() in (
     "1",
     "true",
@@ -102,9 +111,40 @@ MEDIA_DEBUG_INTERVAL_FRAMES = max(
 VAD_BARGE_IN_ENABLED = os.getenv("TWILIO_VAD_BARGE_IN_ENABLED", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
-VAD_RMS_THRESHOLD = max(1, int(os.getenv("TWILIO_VAD_RMS_THRESHOLD", "500")))
-VAD_CONSEC_FRAMES = max(1, int(os.getenv("TWILIO_VAD_CONSEC_FRAMES", "4")))
+VAD_RMS_THRESHOLD = max(1, int(os.getenv("TWILIO_VAD_RMS_THRESHOLD", "400")))
+VAD_CONSEC_FRAMES = max(1, int(os.getenv("TWILIO_VAD_CONSEC_FRAMES", "3")))
 VAD_ECHO_GRACE_SECS = max(0.0, float(os.getenv("TWILIO_VAD_ECHO_GRACE_SECS", "0.25")))
+
+
+class STTSession(Protocol):
+    async def connect(self) -> None:
+        ...
+
+    async def send_mulaw_bytes(self, data: bytes) -> bool:
+        ...
+
+    def iter_events(self) -> AsyncIterator[dict[str, Any]]:
+        ...
+
+    async def close(self) -> None:
+        ...
+
+
+def _configured_stt_provider() -> str:
+    provider = os.getenv("PATH2_STT_PROVIDER", "cartesia").strip().lower()
+    return provider or "cartesia"
+
+
+def _create_stt_session(call_logger: CallLogger) -> STTSession:
+    provider = _configured_stt_provider()
+    if provider in {"cartesia", "ink"}:
+        return CartesiaInkSTTSession(call_logger)
+    if provider in {"deepgram", "flux"}:
+        return DeepgramFluxSTTSession(call_logger)
+    raise RuntimeError(
+        "Unsupported PATH2_STT_PROVIDER "
+        f"{provider!r}; expected 'cartesia' or 'deepgram'"
+    )
 
 
 def _is_status_check_utterance(text: str) -> bool:
@@ -112,7 +152,7 @@ def _is_status_check_utterance(text: str) -> bool:
 
 
 class TwilioLineBridge:
-    """Bridge one Twilio call through Ink STT + Line LlmAgent + Sonic TTS."""
+    """Bridge one Twilio call through STT + Line LlmAgent + Sonic TTS."""
 
     def __init__(
         self,
@@ -129,13 +169,14 @@ class TwilioLineBridge:
         self._session_ready = False
         self._first_audio_sent = False
 
-        self._stt: Optional[CartesiaInkSTTSession] = None
+        self._stt: Optional[STTSession] = None
         self._line: Optional[LineSessionClient] = None
         self._tts: Optional[CartesiaSonicMulawTTS] = None
 
         self._stt_task: Optional[asyncio.Task[None]] = None
         self._tts_task: Optional[asyncio.Task[None]] = None
         self._end_watch_task: Optional[asyncio.Task[None]] = None
+        self._caller_response_watchdog_task: Optional[asyncio.Task[None]] = None
         self._deterministic_followup_task: Optional[asyncio.Task[None]] = None
         self._address_buffer_task: Optional[asyncio.Task[None]] = None
         self._address_final_buffer: list[str] = []
@@ -150,11 +191,14 @@ class TwilioLineBridge:
         self._vad_consec_high: int = 0
 
         self._agent_playing = False
+        self._agent_playing_started_at = 0.0
         self._last_agent_audio_time = 0.0
         self._last_barge_at = 0.0
         self._barge_in_accept_final_until = 0.0
         self._deterministic_answer_guard_until = 0.0
         self._current_tts_text = ""
+        self._caller_response_prompt = ""
+        self._caller_response_watchdog_seq = 0
 
     async def run(self) -> None:
         self._running = True
@@ -256,7 +300,8 @@ class TwilioLineBridge:
         from_num = self.call_sid or "unknown"
         to_num = os.getenv("TWILIO_PATH2_TO_NUMBER", "west-capital")
 
-        self._stt = CartesiaInkSTTSession(self.call_logger)
+        stt_provider = _configured_stt_provider()
+        self._stt = _create_stt_session(self.call_logger)
         await self._stt.connect()
 
         self._line = LineSessionClient(
@@ -298,7 +343,7 @@ class TwilioLineBridge:
         )
 
         self.call_logger.info(
-            f"Path2 session ready | line={line_url}",
+            f"Path2 session ready | line={line_url} stt_provider={stt_provider}",
             event="path2.session.ready",
         )
 
@@ -326,6 +371,72 @@ class TwilioLineBridge:
         if not PIPELINE_DEBUG_ENABLED:
             return
         self.call_logger.info(message, event=event)
+
+    def _cancel_caller_response_watchdog(self) -> None:
+        self._caller_response_watchdog_seq += 1
+        t = self._caller_response_watchdog_task
+        if t and not t.done():
+            t.cancel()
+        self._caller_response_watchdog_task = None
+
+    @staticmethod
+    def _caller_response_prompt_from_agent_text(text: str) -> str:
+        t = re.sub(r"\s+", " ", (text or "").strip())
+        if not t:
+            return ""
+        prefix = CALLER_RESPONSE_WATCHDOG_PREFIX
+        if prefix and t.lower().startswith(prefix.lower()):
+            t = t[len(prefix):].strip()
+        if not t or t == DETERMINISTIC_GOODBYE_TEXT.strip():
+            return ""
+        return t
+
+    def _schedule_caller_response_watchdog(self, agent_text: str) -> None:
+        prompt = self._caller_response_prompt_from_agent_text(agent_text)
+        if self._line:
+            current_ask = (getattr(self._line, "_last_tool_ask", "") or "").strip()
+            if current_ask and (
+                "i didn't catch" in prompt.lower()
+                or "please say" in prompt.lower()
+                or "please spell" in prompt.lower()
+            ):
+                prompt = current_ask
+        if not prompt or not self._line:
+            self._cancel_caller_response_watchdog()
+            return
+        self._cancel_caller_response_watchdog()
+        self._caller_response_prompt = prompt
+        seq = self._caller_response_watchdog_seq
+        self._caller_response_watchdog_task = asyncio.create_task(
+            self._caller_response_watchdog(seq),
+            name="path2_caller_response_watchdog",
+        )
+
+    async def _caller_response_watchdog(self, seq: int) -> None:
+        try:
+            await asyncio.sleep(CALLER_RESPONSE_WATCHDOG_SECS)
+            if (
+                not self._running
+                or not self._line
+                or seq != self._caller_response_watchdog_seq
+            ):
+                return
+            prompt = self._caller_response_prompt.strip()
+            if not prompt:
+                return
+            repeat = f"{CALLER_RESPONSE_WATCHDOG_PREFIX} {prompt}".strip()
+            await self._line.tts_queue.put(repeat)
+            await broadcast_stt(
+                kind="agent_caller_response_watchdog",
+                text=repeat,
+                call_sid=self.call_sid,
+            )
+            self.call_logger.info(
+                f"Caller response watchdog repeat queued | prompt='{prompt[:120]}'",
+                event="path2.caller_response_watchdog",
+            )
+        except asyncio.CancelledError:
+            raise
 
     @staticmethod
     def _is_number_only_fragment(text: str) -> bool:
@@ -399,7 +510,7 @@ class TwilioLineBridge:
         if not VAD_BARGE_IN_ENABLED or not self._agent_playing:
             self._vad_consec_high = 0
             return
-        if (now - self._last_agent_audio_time) < VAD_ECHO_GRACE_SECS:
+        if (now - self._agent_playing_started_at) < VAD_ECHO_GRACE_SECS:
             self._vad_consec_high = 0
             return
         rms = self._compute_mulaw_rms(data)
@@ -435,7 +546,9 @@ class TwilioLineBridge:
         # Echo guard should still protect us from our own TTS. If STT hears a
         # different meaningful phrase while we speak, treat it as caller barge-in.
         if in_echo and self._looks_like_current_agent_echo(text):
-            return False
+            missing = get_missing_fields() or ""
+            if not looks_like_answer_for_current_field(text.strip(), missing):
+                return False
         return True
 
     def _property_address_still_missing(self) -> bool:
@@ -544,7 +657,9 @@ class TwilioLineBridge:
         base = CONTACT_PHONE_BUFFER_SECS
         if merged:
             digits = re.sub(r"\D", "", merged)
-            if 0 < len(digits) < 10:
+            if not infer_phone_from_transcript(merged) and (
+                digits or re.search(r"\b(zero|oh|one|two|three|four|five|six|seven|eight|nine)\b", merged.lower())
+            ):
                 return CONTACT_PHONE_BUFFER_PARTIAL_SECS
         return base
 
@@ -615,8 +730,7 @@ class TwilioLineBridge:
         )
         merged = re.sub(r"\s+", " ", " ".join(self._contact_final_buffer)).strip()
         if mode == "phone":
-            digits = re.sub(r"\D", "", merged)
-            if len(digits) >= 10:
+            if infer_phone_from_transcript(merged):
                 await self._flush_contact_buffer(reason="complete_phone_digits")
                 return True
         else:
@@ -679,6 +793,10 @@ class TwilioLineBridge:
         if not cached or age > STT_PARTIAL_CACHE_MAX_AGE_SECS:
             return final_text
         if infer_property_address_from_transcript(cached):
+            if self._current_tts_text.strip() and self._looks_like_current_agent_echo(
+                cached
+            ):
+                return final_text
             self._log_pipeline_debug(
                 (
                     "Substituting STT final with recent partial cache | "
@@ -704,6 +822,7 @@ class TwilioLineBridge:
                     is_final = bool(msg.get("is_final"))
                     if not text:
                         continue
+                    self._cancel_caller_response_watchdog()
                     confidence = (
                         msg.get("confidence")
                         or msg.get("avg_logprob")
@@ -853,6 +972,7 @@ class TwilioLineBridge:
             f"Handling STT final | text='{text[:160]}'",
             event="path2.stt.final_handle_start",
         )
+        self._cancel_caller_response_watchdog()
         await broadcast_stt(
             kind="user_final",
             text=text,
@@ -1056,6 +1176,7 @@ class TwilioLineBridge:
                 event="path2.tts.dequeue",
             )
             self._agent_playing = True
+            self._agent_playing_started_at = time.monotonic()
             self._current_tts_text = text
             self._deterministic_answer_guard_until = 0.0
             speak_t0 = time.perf_counter()
@@ -1077,13 +1198,17 @@ class TwilioLineBridge:
                     # Let Twilio finish buffered playback before opening mic turn.
                     await asyncio.sleep(TTS_DRAIN_SECS)
                 self._agent_playing = False
+                self._agent_playing_started_at = 0.0
                 self._current_tts_text = ""
                 if (text or "").strip() == DETERMINISTIC_GOODBYE_TEXT.strip():
+                    self._cancel_caller_response_watchdog()
                     await broadcast_stt(
                         kind="call_ended",
                         text="deterministic_goodbye",
                         call_sid=self.call_sid,
                     )
+                else:
+                    self._schedule_caller_response_watchdog(text)
 
     async def _send_mulaw_to_twilio(self, mulaw: bytes) -> None:
         self._last_agent_audio_time = time.monotonic()
@@ -1137,10 +1262,16 @@ class TwilioLineBridge:
             pass
 
         self._cancel_deterministic_followup_task()
+        self._cancel_caller_response_watchdog()
         self._cancel_address_buffer_task()
         self._address_final_buffer = []
         self._discard_contact_buffer()
-        for t in (self._stt_task, self._tts_task, self._end_watch_task):
+        for t in (
+            self._stt_task,
+            self._tts_task,
+            self._end_watch_task,
+            self._caller_response_watchdog_task,
+        ):
             if t and not t.done():
                 t.cancel()
                 try:
@@ -1151,6 +1282,7 @@ class TwilioLineBridge:
         self._stt_task = None
         self._tts_task = None
         self._end_watch_task = None
+        self._caller_response_watchdog_task = None
 
         if self._line:
             try:

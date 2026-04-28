@@ -1,13 +1,11 @@
-import sys
-import os
+"""HelocApplicationState validation and ``generate_password`` behavior."""
 
-# Add the project root to sys.path so we can import from 'agent'
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import pytest
 
 from agent.schema import HelocApplicationState
 
+
 def test_heloc_schema():
-    # 1. Test basic data assignment
     state = HelocApplicationState(
         first_name="John",
         last_name="Smith",
@@ -15,94 +13,58 @@ def test_heloc_schema():
         city="Springfield",
         state="IL",
         zipcode="62704",
-        occupancy_type="Primary property" # Must match Literal exactly
+        occupancy_type="Primary property",
     )
-    
-    print(f"Name: {state.first_name} {state.last_name}")
-    print(f"Address: {state.address_line_1}, {state.city}, {state.state} {state.zipcode}")
-    print(f"Occupancy: {state.occupancy_type}")
 
-    # 2. Test the Password Generation Logic (The 12-char rule)
-    # Scenario A: Normal name (John#62704 = 10 chars) -> Should trigger firstname_lastname fallback
+    assert state.first_name == "John"
+    assert state.last_name == "Smith"
+    assert state.occupancy_type == "Primary property"
+
     pass_1 = state.generate_password("62704")
-    print(f"\nPassword 1 (John_Smith#62704): {pass_1} | Length: {len(pass_1)}")
+    assert len(pass_1) >= 12
 
-    # Scenario B: Very short name (Ed#62704 = 8 chars) -> Should trigger padding fallback
     state.first_name = "Ed"
     state.last_name = "Wu"
     pass_2 = state.generate_password("62704")
-    print(f"Password 2 (Ed_Wu#62704!2026): {pass_2} | Length: {len(pass_2)}")
+    assert len(pass_2) >= 12
 
-    # Scenario C: Long name -> Should pass on first attempt
     state.first_name = "Alexander"
     state.last_name = "Hamilton"
     pass_3 = state.generate_password("62704")
-    print(f"Password 3 (Alexander#62704): {pass_3} | Length: {len(pass_3)}")
+    assert len(pass_3) >= 12
 
-    # 3. Test Validation Error (Try an invalid dropdown value)
-    try:
-        state.occupancy_type = "My house" # Not in our Literal list
-    except ValueError as e:
-        print("\nValidation Success: Correctly rejected invalid occupancy type.")
+    with pytest.raises(ValueError):
+        state.occupancy_type = "My house"
 
-    # =========================================================================
-    # 4. Field Validator Tests
-    # =========================================================================
-    print("\n--- Field Validator Tests ---")
-    
-    # 4a. Phone number: valid 10-digit
     state.mobile_phone_number = "213-555-0100"
-    print(f"✅ Phone (stripped): {state.mobile_phone_number}")
-    
-    # 4b. Phone number: with country code prefix (should strip leading 1)
-    state.mobile_phone_number = "1-213-555-0100"
-    print(f"✅ Phone (stripped country code): {state.mobile_phone_number}")
-    
-    # 4c. Phone number: too short (should fail)
-    try:
-        state.mobile_phone_number = "555-1234"
-    except (ValueError, Exception):
-        print("✅ Phone rejected: 7 digits correctly caught.")
-    
-    # 4d. Zipcode: valid
-    state.zipcode = "90007"
-    print(f"✅ Zipcode: {state.zipcode}")
-    
-    # 4e. Zipcode: invalid (too short)
-    try:
-        state.zipcode = "900"
-    except (ValueError, Exception):
-        print("✅ Zipcode rejected: 3 digits correctly caught.")
-    
-    # 4f. Date of birth: valid
-    state.date_of_birth = "03/15/1990"
-    print(f"✅ DOB: {state.date_of_birth}")
-    
-    # 4g. Date of birth: invalid format
-    try:
-        state.date_of_birth = "March 15 1990"
-    except (ValueError, Exception):
-        print("✅ DOB rejected: bad format correctly caught.")
-    
-    # 4h. Email: valid
-    state.email_address = "john.smith@example.com"
-    print(f"✅ Email: {state.email_address}")
-    
-    # 4i. Email: invalid
-    try:
-        state.email_address = "not-an-email"
-    except (ValueError, Exception):
-        print("✅ Email rejected: no @ sign correctly caught.")
-    
-    # 4j. State: valid
-    state.state = "ca"  # should normalize to CA
-    print(f"✅ State (normalized): {state.state}")
-    
-    # 4k. State: invalid
-    try:
-        state.state = "XX"
-    except (ValueError, Exception):
-        print("✅ State rejected: 'XX' correctly caught.")
+    assert state.mobile_phone_number == "2135550100"
 
-if __name__ == "__main__":
-    test_heloc_schema()
+    state.mobile_phone_number = "1-213-555-0100"
+    assert state.mobile_phone_number == "2135550100"
+
+    with pytest.raises(ValueError):
+        state.mobile_phone_number = "555-1234"
+
+    state.zipcode = "90007"
+    assert state.zipcode == "90007"
+
+    with pytest.raises(ValueError):
+        state.zipcode = "900"
+
+    state.date_of_birth = "03/15/1990"
+    assert state.date_of_birth == "03/15/1990"
+
+    with pytest.raises(ValueError):
+        state.date_of_birth = "March 15 1990"
+
+    state.email_address = "john.smith@example.com"
+    assert state.email_address == "john.smith@example.com"
+
+    with pytest.raises(ValueError):
+        state.email_address = "not-an-email"
+
+    state.state = "ca"
+    assert state.state == "CA"
+
+    with pytest.raises(ValueError):
+        state.state = "XX"

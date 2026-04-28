@@ -1,20 +1,13 @@
-"""
-Tests for Twilio bridge helpers (Cartesia debug redaction / logging gates).
-
-Run: python -m unittest tests.test_twilio_bridge -v
-"""
+"""Twilio bridge helpers: Cartesia debug redaction, logging gates, STT factory."""
 
 import os
-import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from app.twilio_bridge import (  # noqa: E402
-    _log_cartesia_frame_if_enabled,
-    _redact_cartesia_value,
-)
+from app.cartesia_stt_client import CartesiaInkSTTSession
+from app.deepgram_stt_client import DeepgramFluxSTTSession
+from app.twilio_bridge import _log_cartesia_frame_if_enabled, _redact_cartesia_value
+from app.twilio_line_bridge import _create_stt_session
 
 
 class TestRedactCartesiaValue(unittest.TestCase):
@@ -78,5 +71,18 @@ class TestLogCartesiaFrameIfEnabled(unittest.TestCase):
         log.info.assert_called_once()
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestPath2STTProviderSelection(unittest.TestCase):
+    def test_defaults_to_cartesia(self):
+        with patch.dict(os.environ, {}, clear=True):
+            session = _create_stt_session(MagicMock())
+        self.assertIsInstance(session, CartesiaInkSTTSession)
+
+    def test_selects_deepgram(self):
+        with patch.dict(os.environ, {"PATH2_STT_PROVIDER": "deepgram"}):
+            session = _create_stt_session(MagicMock())
+        self.assertIsInstance(session, DeepgramFluxSTTSession)
+
+    def test_rejects_unknown_provider(self):
+        with patch.dict(os.environ, {"PATH2_STT_PROVIDER": "bogus"}):
+            with self.assertRaises(RuntimeError):
+                _create_stt_session(MagicMock())

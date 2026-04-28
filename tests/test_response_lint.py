@@ -1,11 +1,6 @@
 """Unit tests for agent/response_lint.py (no server required)."""
 
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from agent.response_lint import (  # noqa: E402
+from agent.response_lint import (
     contains_address_leak,
     first_turn_after_address_ok,
     occupancy_ask_without_ownership_cue,

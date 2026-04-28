@@ -1,10 +1,8 @@
 import asyncio
 import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agent.browser_manager import BrowserManager
 
 
@@ -90,7 +88,3 @@ async def test_form_filling():
         print("\n9. Shutting down browser...")
         await manager.shutdown()
         print("   Done.")
-
-
-if __name__ == "__main__":
-    asyncio.run(test_form_filling())

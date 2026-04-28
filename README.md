@@ -1,6 +1,6 @@
 # AI Voice Gateway
 
-HELOC phone intake for **West Capital Lending** on the default telephony stack: Twilio **µ-law** audio **→** **Cartesia Ink** streaming STT ([`app/cartesia_stt_client.py`](app/cartesia_stt_client.py), default model `ink-whisper`) **→** **Cartesia Line** `LlmAgent` on **`/ws`** (Gemini **on your server**) **→** **Cartesia Sonic** TTS ([`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)) **→** Twilio. [`app/twilio_line_bridge.py`](app/twilio_line_bridge.py) + [`app/line_session_client.py`](app/line_session_client.py) implement that path. **Playwright** syncs the WCL form via [`agent/state_manager.py`](agent/state_manager.py).
+HELOC phone intake for **West Capital Lending** on the default telephony stack: Twilio **µ-law** audio **→** switchable streaming STT (**Cartesia Ink** by default via [`app/cartesia_stt_client.py`](app/cartesia_stt_client.py), or **Deepgram Flux** via [`app/deepgram_stt_client.py`](app/deepgram_stt_client.py)) **→** **Cartesia Line** `LlmAgent` on **`/ws`** (Gemini **on your server**) **→** **Cartesia Sonic** TTS ([`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)) **→** Twilio. [`app/twilio_line_bridge.py`](app/twilio_line_bridge.py) + [`app/line_session_client.py`](app/line_session_client.py) implement that path. **Playwright** syncs the WCL form via [`agent/state_manager.py`](agent/state_manager.py).
 
 Set `TWILIO_VOICE_MODE` to anything other than `path2`, `line`, or `local` to use [`app/twilio_bridge.py`](app/twilio_bridge.py) instead: audio goes to Cartesia’s fully hosted agent (no server-side `LlmAgent` or Playwright sync, and no Ink/Sonic clients from this repo).
 
@@ -30,11 +30,17 @@ Create **`.env`** in the repo root (never commit). Common variables:
 | Variable | Purpose |
 | --- | --- |
 | `GEMINI_API_KEY` | LLM |
-| `CARTESIA_API_KEY` | Ink STT + Sonic TTS (bridge path) or hosted agent |
+| `CARTESIA_API_KEY` | Ink STT + Sonic TTS (bridge path) or hosted agent. Still required for Sonic TTS when using Deepgram STT. |
 | `TWILIO_VOICE_MODE` | `path2` (default), `line`, `local` → bridge uses Ink + Sonic modules + Line `/ws` + server-side `LlmAgent`; otherwise → hosted Cartesia agent bridge |
+| `PATH2_STT_PROVIDER` | `cartesia` (default) or `deepgram` for STT only |
+| `DEEPGRAM_API_KEY` | Required only when `PATH2_STT_PROVIDER=deepgram` |
 | `HOST`, `PORT` | Bind for [`run.py`](run.py); default `0.0.0.0:8000` |
 | `CARTESIA_STT_MAX_SILENCE_SECS` | Silence before STT final (default ~0.45) |
+| `DEEPGRAM_STT_MODEL` | Deepgram Flux model when provider is `deepgram`; default `flux-general-en` |
+| `DEEPGRAM_STT_EOT_THRESHOLD`, `DEEPGRAM_STT_EAGER_EOT_THRESHOLD`, `DEEPGRAM_STT_EOT_TIMEOUT_MS` | Deepgram Flux end-of-turn tuning |
+| `DEEPGRAM_STT_KEYTERMS` | Optional comma-separated Deepgram keyterms, e.g. domain words or names |
 | `CARTESIA_TTS_SPEED`, `CARTESIA_TTS_VOLUME` | Sonic tuning ([`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)) |
+| `TWILIO_CALLER_RESPONSE_WATCHDOG_SECS` | Seconds to wait after an agent prompt before repeating it if no user final is handled; default `10.0` |
 
 Optional observability:
 
@@ -56,7 +62,7 @@ python run.py
 
 ## Voice without a phone (dev)
 
-**Orchestrator** connects to **`WS /media-stream`** (same entry point as Twilio), so it runs **[`TwilioLineBridge`](app/twilio_line_bridge.py)** — the same **Ink** STT and **Sonic** TTS code as a real call ([`app/cartesia_stt_client.py`](app/cartesia_stt_client.py), [`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)), then Line **`/ws`** and the same `LlmAgent`.
+**Orchestrator** connects to **`WS /media-stream`** (same entry point as Twilio), so it runs **[`TwilioLineBridge`](app/twilio_line_bridge.py)** — the same STT provider selected by `PATH2_STT_PROVIDER` and **Sonic** TTS code as a real call ([`app/cartesia_stt_client.py`](app/cartesia_stt_client.py), [`app/deepgram_stt_client.py`](app/deepgram_stt_client.py), [`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)), then Line **`/ws`** and the same `LlmAgent`.
 
 ```bash
 # terminal 1
