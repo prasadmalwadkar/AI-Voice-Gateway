@@ -146,6 +146,10 @@ def _pending_low_conf_ask() -> str:
     pending = _pending_low_conf_confirmation or {}
     values = pending.get("values") or {}
     attempts = int(pending.get("attempts") or 1)
+    if "first_name" in values:
+        return f"I heard first name {values['first_name']}. Is that correct?"
+    if "last_name" in values:
+        return f"I heard last name {values['last_name']}. Is that correct?"
     if "address_line_1" in values:
         if attempts >= 2:
             return "Please spell the street address slowly; there may be background noise."
@@ -751,12 +755,31 @@ def looks_like_answer_for_current_field(text: str, missing_line: str) -> bool:
     if "property address" in ask:
         if infer_property_address_from_transcript(normalized):
             return True
-        address_tokens = (
-            "street", "st", "avenue", "ave", "boulevard", "blvd",
-            "road", "rd", "drive", "dr", "lane", "ln", "court", "ct",
-            "parkway", "pkwy", "place", "pl",
+        if any(ch.isdigit() for ch in bare):
+            return True
+        address_patterns = (
+            r"\blos\s+angeles\b",
+            r"\bcalifornia\b",
+            r"\bstreet\b",
+            r"\bst\b",
+            r"\bavenue\b",
+            r"\bave\b",
+            r"\bboulevard\b",
+            r"\bblvd\b",
+            r"\broad\b",
+            r"\brd\b",
+            r"\bdrive\b",
+            r"\bdr\b",
+            r"\blane\b",
+            r"\bln\b",
+            r"\bcourt\b",
+            r"\bct\b",
+            r"\bparkway\b",
+            r"\bpkwy\b",
+            r"\bplace\b",
+            r"\bpl\b",
         )
-        return any(ch.isdigit() for ch in bare) or any(tok in bare for tok in address_tokens)
+        return any(re.search(p, bare) for p in address_patterns)
 
     if "ownership type" in ask or "sole or joint" in ask:
         if infer_ownership_from_transcript(normalized):
@@ -832,6 +855,19 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
             return "Joint owner"
         if re.search(r"\bjoint\b", seg):
             return "Joint owner"
+        # Joint STT garbles (prefer owner-phrased to avoid spurious "join" matches).
+        if re.search(
+            r"\bjoin(?:ed|t)?\s+owners?\b"
+            r"|\bjoist\s+owners?\b"
+            r"|\bjoynt\s+owners?\b"
+            r"|\bjointed\s+owners?\b"
+            r"|\bjointly\s+owned\b"
+            r"|\bjoint\s+owners?\b",
+            seg,
+        ):
+            return "Joint owner"
+        if re.search(r"\bfull\s+owners?\b", seg):
+            return "Sole owner"
         if re.fullmatch(r"stole\.?", seg):
             return "Sole owner"
         if re.fullmatch(r"soul\.?", seg):
@@ -865,6 +901,7 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         return "Joint owner"
     if re.search(
         r"\b(sole|soul|soil|solo)\s*owners?\b"
+        r"|\bfull\s+owners?\b"
         r"|so\s+alone"
         r"|so,?\s*loner"
         r"|stole\s*,?\s*stole"
@@ -876,10 +913,23 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         r"|\bfoam\s+owners?\b"
         r"|\bsold\s+owners?\b"
         r"|\bsool\b"
-        r"|\bsoul\s+or\s+not\b",
+        r"|\bsoul\s+or\s+not\b"
+        r"|\bstore\s+owners?\b"
+        r"|\bstored\s+owner\b"
+        r"|\bstore\s+owner\b",
         low,
     ):
         return "Sole owner"
+    if re.search(
+        r"\bjoin(?:ed|t)?\s+owners?\b"
+        r"|\bjoist\s+owners?\b"
+        r"|\bjoynt\s+owners?\b"
+        r"|\bjointed\s+owners?\b"
+        r"|\bjointly\s+owned\b"
+        r"|\bjoint\s+owners?\b",
+        low,
+    ):
+        return "Joint owner"
     return None
 
 
@@ -908,14 +958,32 @@ def infer_occupancy_from_transcript(text: str) -> Optional[OccupancyType]:
         return "Secondary property"
     if re.fullmatch(r"\s*(3|three|tree|free)\s*[.,!?]?\s*", low):
         return "Investment property"
-    if re.search(r"\b(investment|investor|rental\s+property)\b", low):
+    if re.search(
+        r"\b(investment|investor|rental\s+property|rental\s+home|income\s+property|"
+        r"non[- ]?owner\s+occupied|landlord|flip\s+(?:house|property))\b",
+        low,
+    ):
         return "Investment property"
-    if re.search(r"\bsecondary\b|\bsecond\s+home\b|\bvacation\s+home\b", low):
+    if re.search(
+        r"\bsecondary\b"
+        r"|\bsec+ondary\b"
+        r"|\bsecond\s+home\b"
+        r"|\bsecond\s+property\b"
+        r"|\bvacation\s+home\b"
+        r"|\bvacation\s+house\b"
+        r"|\bweekend\s+home\b"
+        r"|\bski\s+(?:house|home)\b",
+        low,
+    ):
         return "Secondary property"
     if re.search(
         r"\bprimary\s+property\b"
         r"|\bprimary\b"
+        r"|\bprimer\b"
+        r"|\bprime\s+home\b"
+        r"|\bfirst\s+home\b"
         r"|\bmain\s+home\b"
+        r"|\bmain\s+residence\b"
         r"|\bowner\s*[- ]?\s*occupied\b",
         low,
     ):
@@ -1113,44 +1181,83 @@ def _spoken_number_to_int(text: str) -> Optional[int]:
     return total if total > 0 else None
 
 
-def infer_annual_income_from_transcript(text: str) -> Optional[int]:
-    """Map spoken annual income to integer dollars.
+# Spoken-income heuristics can exceed 100M (e.g. "two two five million" → 225M).
+_MAX_INFERRED_ANNUAL_INCOME = 999_999_999
+# Below CONFIDENCE_THRESHOLD so update_application_state requires explicit confirmation.
+_INCOME_AMBIGUOUS_STT_CONFIDENCE = 0.82
 
-    Handles: raw digits ("100000"), suffix shorthand ("80K", "1.5M"),
-    spoken words ("eighty thousand", "two hundred fifty thousand"),
-    and contextual bare numbers ("eighty" -> 80000 in HELOC context).
+
+def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
+    """Return (annual income in USD or None, fragile_stt_repair).
+
+    ``fragile_stt_repair`` is True when the value depended on a brittle
+    spoken-money rule (``one one five``→1.5M or digit-style ``two two
+    five``+million→225M). Callers should pass ``confidence_score`` of
+    ``_INCOME_AMBIGUOUS_STT_CONFIDENCE`` (below ``CONFIDENCE_THRESHOLD``) so the
+    user confirms before save.
     """
     if not text or not str(text).strip():
-        return None
+        return (None, False)
     text = normalize_answer_scaffold(text)
     if not text:
-        return None
+        return (None, False)
     low = text.lower().strip()
     # Keep decimal dot in numeric forms (1.5m), but remove sentence punctuation.
     low = low.replace(",", " ")
     low = re.sub(r"(?<!\d)\.(?!\d)", " ", low)
     low = re.sub(r"[?!]", " ", low)
     low = re.sub(r"\s+", " ", low).strip()
+    # Common STT garble on phone audio: "one million" -> "one medium".
+    low = re.sub(r"\b(medium|millian|millon)\b", "million", low)
+
+    _millionish = r"(?=\s*(?:million|\bm\b|\bk\b))"
+
+    # "two two five million" / "… m" / "… k" = three digit words then multiplier
+    # (225M / 225K). Do NOT treat as dropped "point" (that would be 2.5M — wrong).
+    if re.search(rf"\btwo\s+two\s+five\b{_millionish}", low):
+        if re.search(r"\btwo\s+two\s+five\s+million\b", low) or re.search(
+            r"\btwo\s+two\s+five\s+m\b", low
+        ):
+            val = 225 * 1_000_000
+        elif re.search(r"\btwo\s+two\s+five\s+k\b", low):
+            val = 225 * 1_000
+        else:
+            val = None
+        if val is not None and 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
+            return (val, True)
+
+    # STT drops "point": "one one five million" -> sums 1+1+5 then × million (wrong).
+    one_one_five_point_sub = False
+    if re.search(rf"\bone\s+one\s+five\b{_millionish}", low):
+        one_one_five_point_sub = True
+        low = re.sub(rf"\bone\s+one\s+five\b{_millionish}", "one point five", low)
 
     # --- suffix shorthand: "1M", "1.5m", "80K", "80 k" ---
     m = re.search(r"(\d+(?:\.\d+)?)\s*m\b", low)
     if m:
         val = int(float(m.group(1)) * 1_000_000)
-        if 0 < val <= 100_000_000:
-            return val
+        if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
+            return (val, one_one_five_point_sub)
     m = re.search(r"(\d+(?:\.\d+)?)\s*k\b", low)
     if m:
         val = int(float(m.group(1)) * 1_000)
-        if 0 < val <= 100_000_000:
-            return val
+        if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
+            return (val, one_one_five_point_sub)
+    m = re.fullmatch(r"([a-z\s-]+)\s+k\b", low)
+    if m:
+        spoken_k = _spoken_number_to_int(m.group(1).replace("-", " "))
+        if spoken_k is not None:
+            val = spoken_k * 1_000
+            if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
+                return (val, one_one_five_point_sub)
 
     # --- raw digit string: "1-0-0-0-0-0" / "1000000" / "100000" ---
     digits_only = re.sub(r"\D", "", low)
     if digits_only:
         try:
             val = int(digits_only)
-            if 0 < val <= 100_000_000:
-                return val
+            if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
+                return (val, one_one_five_point_sub)
         except ValueError:
             pass
 
@@ -1174,22 +1281,35 @@ def infer_annual_income_from_transcript(text: str) -> Optional[int]:
         seq = "".join(digit_word_map[t] for t in wtokens).lstrip("0") or "0"
         try:
             val = int(seq)
-            if 0 < val <= 100_000_000:
-                return val
+            if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
+                return (val, one_one_five_point_sub)
         except ValueError:
             pass
 
     # --- spoken words: "eighty thousand", "one point five million" ---
     spoken = _spoken_number_to_int(low)
-    if spoken is not None and spoken >= 1_000 and spoken <= 100_000_000:
-        return spoken
+    if spoken is not None and spoken >= 1_000 and spoken <= _MAX_INFERRED_ANNUAL_INCOME:
+        return (spoken, one_one_five_point_sub)
 
     # --- contextual bare number: "eighty" -> 80_000 in HELOC income context ---
     # Small bare numbers (1-999) likely mean thousands.
     if spoken is not None and 1 <= spoken <= 999:
-        return spoken * 1_000
+        scaled = spoken * 1_000
+        if 0 < scaled <= _MAX_INFERRED_ANNUAL_INCOME:
+            return (scaled, one_one_five_point_sub)
 
-    return None
+    return (None, False)
+
+
+def infer_annual_income_from_transcript(text: str) -> Optional[int]:
+    """Map spoken annual income to integer dollars.
+
+    Handles: raw digits ("100000"), suffix shorthand ("80K", "1.5M"),
+    spoken words ("eighty thousand", "two hundred fifty thousand"),
+    and contextual bare numbers ("eighty" -> 80000 in HELOC context).
+    """
+    value, _meta = infer_annual_income_meta(text)
+    return value
 
 
 def infer_other_income_from_transcript(text: str) -> Optional[int]:
@@ -1227,6 +1347,77 @@ _MONTH_NAMES: dict[str, int] = {
 }
 _MONTH_PAT = "|".join(_MONTH_NAMES.keys())
 
+_ORDINAL_WORDS: dict[str, str] = {
+    "first": "one",
+    "second": "two",
+    "third": "three",
+    "fourth": "four",
+    "fifth": "five",
+    "sixth": "six",
+    "seventh": "seven",
+    "eighth": "eight",
+    "ninth": "nine",
+    "tenth": "ten",
+    "eleventh": "eleven",
+    "twelfth": "twelve",
+    "thirteenth": "thirteen",
+    "fourteenth": "fourteen",
+    "fifteenth": "fifteen",
+    "sixteenth": "sixteen",
+    "seventeenth": "seventeen",
+    "eighteenth": "eighteen",
+    "nineteenth": "nineteen",
+    "twentieth": "twenty",
+    "thirtieth": "thirty",
+}
+
+
+def _parse_spoken_day(value: str) -> Optional[int]:
+    cleaned = re.sub(r"[^a-z0-9\s-]", " ", value.lower())
+    cleaned = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", cleaned)
+    cleaned = cleaned.replace("-", " ")
+    tokens = [
+        _ORDINAL_WORDS.get(token, token)
+        for token in re.split(r"\s+", cleaned.strip())
+        if token
+    ]
+    if not tokens:
+        return None
+    if len(tokens) == 1 and tokens[0].isdigit():
+        day = int(tokens[0])
+    else:
+        day = _spoken_number_to_int(" ".join(tokens))
+    if day is not None and 1 <= day <= 31:
+        return day
+    return None
+
+
+def _parse_spoken_year(value: str) -> Optional[int]:
+    cleaned = re.sub(r"[^a-z0-9\s-]", " ", value.lower()).replace("-", " ")
+    tokens = [t for t in re.split(r"\s+", cleaned.strip()) if t]
+    if not tokens:
+        return None
+    digits = "".join(t for t in tokens if t.isdigit())
+    if len(digits) == 4 and all(t.isdigit() for t in tokens):
+        year = int(digits)
+        return year if 1900 <= year <= 2010 else None
+    if len(tokens) == 1 and tokens[0].isdigit():
+        year = int(tokens[0])
+        return year if 1900 <= year <= 2010 else None
+
+    if len(tokens) >= 2:
+        prefix = _spoken_number_to_int(tokens[0])
+        suffix = _spoken_number_to_int(" ".join(tokens[1:]))
+        if prefix in {19, 20} and suffix is not None and 0 <= suffix <= 99:
+            year = prefix * 100 + suffix
+            if 1900 <= year <= 2010:
+                return year
+
+    year = _spoken_number_to_int(" ".join(tokens))
+    if year is not None and 1900 <= year <= 2010:
+        return year
+    return None
+
 
 def infer_dob_from_transcript(text: str) -> Optional[str]:
     """Parse DOB from numeric (MM/DD/YYYY) or spoken ('January 5th 1990') forms."""
@@ -1244,6 +1435,12 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
             return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
 
     low = text.lower().strip()
+    # Deepgram/phone garble: "first Jan ..." can arrive as "first ten ...".
+    low = re.sub(
+        r"\b(first|1st)\s+ten\s+(?=eighteen|nineteen|twenty|\d{4}\b)",
+        r"\1 jan ",
+        low,
+    )
 
     # Spoken: "January 5th 1990", "march 15 1985"
     m = re.search(
@@ -1268,6 +1465,30 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
         if 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
             return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
 
+    # Fully spoken: "January first nineteen ninety two"
+    m = re.search(
+        rf"\b({_MONTH_PAT})\s+([a-z0-9\s-]+?)\s+((?:eighteen|nineteen|twenty|\d{{4}})\b[a-z0-9\s-]*)",
+        low,
+    )
+    if m:
+        mm = _MONTH_NAMES[m.group(1)]
+        dd = _parse_spoken_day(m.group(2))
+        yyyy = _parse_spoken_year(m.group(3))
+        if dd is not None and yyyy is not None:
+            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
+
+    # Fully spoken reversed: "first January nineteen ninety two"
+    m = re.search(
+        rf"\b([a-z0-9\s-]+?)\s+({_MONTH_PAT})\s+((?:eighteen|nineteen|twenty|\d{{4}})\b[a-z0-9\s-]*)",
+        low,
+    )
+    if m:
+        dd = _parse_spoken_day(m.group(1))
+        mm = _MONTH_NAMES[m.group(2)]
+        yyyy = _parse_spoken_year(m.group(3))
+        if dd is not None and yyyy is not None:
+            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
+
     return None
 
 
@@ -1288,7 +1509,46 @@ def infer_phone_from_transcript(text: str) -> Optional[str]:
         d = d[1:]
     if len(d) == 10:
         return d
+    spoken = _spoken_digit_sequence_to_digits(text)
+    if len(spoken) == 11 and spoken.startswith("1"):
+        spoken = spoken[1:]
+    if len(spoken) == 10:
+        return spoken
     return None
+
+
+def _spoken_digit_sequence_to_digits(text: str) -> str:
+    digit_word_map = {
+        "zero": "0",
+        "oh": "0",
+        "o": "0",
+        "one": "1",
+        "won": "1",
+        "two": "2",
+        "too": "2",
+        "to": "2",
+        "three": "3",
+        "four": "4",
+        "for": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "ate": "8",
+        "nine": "9",
+    }
+    cleaned = normalize_answer_scaffold(text)
+    cleaned = re.sub(r"\b(area|code|phone|number|is|my|mobile|cell)\b", " ", cleaned.lower())
+    tokens = re.findall(r"[a-z]+|\d", cleaned)
+    digits: list[str] = []
+    for token in tokens:
+        if token.isdigit():
+            digits.append(token)
+        elif token in digit_word_map:
+            digits.append(digit_word_map[token])
+        else:
+            return ""
+    return "".join(digits)
 
 
 def get_contact_buffer_mode() -> Optional[Literal["phone", "email"]]:
@@ -1339,25 +1599,43 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
     # Normalize punctuation/noise around the leading street number.
     low = re.sub(r"[^\w\s,.-]", " ", low)
     low = re.sub(r"\s+", " ", low).strip()
-    # Contextual STT repair for common address garbles. Keep risky words scoped to
-    # address-shaped phrases so non-address chatter does not become a street.
-    low = re.sub(r"\b(\d{1,6})[\s,.-]+based\s+items\b", r"\1 west adams", low)
-    low = re.sub(r"\b(\d{1,6})[\s,.-]+based\b", r"\1 west", low)
-    low = re.sub(r"\bbest\b", "west", low)
-    low = re.sub(r"\bwaste\b", "west", low)
-    low = re.sub(r"\bwest\s+items\b", "west adams", low)
-    low = re.sub(r"\b(best|west)\s+items\b", "west adams", low)
-    low = re.sub(r"\b(delivered|bilibod|lewart|lewat)\b", "boulevard", low)
-    low = re.sub(r"\bwill\s+live\s+at\b", "boulevard", low)
-    low = re.sub(r"\bwill\s+be\s+allowed\b", "boulevard", low)
-    low = re.sub(r"\bof\s+(levad|lewat|lewart)\b", "boulevard", low)
-    low = re.sub(r"\band\s+boulevard\b", "boulevard", low)
-    low = re.sub(r"\bof\s+boulevard\b", "boulevard", low)
-    low = re.sub(r"\bloss\b", "los angeles", low)
-    low = re.sub(r"\bsothe\b", "south", low)
-    low = re.sub(r"\bnortest\b", "northeast", low)
+    had_comma = "," in low
+    low_number_scan = re.sub(r"[,.-]+", " ", low)
+    low_number_scan = re.sub(r"\s+", " ", low_number_scan).strip()
+    words_to_digits = re.match(
+        r"^((?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+        r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+        r"hundred)\s+){1,8})([a-z].*)$",
+        low_number_scan,
+    )
+    if words_to_digits:
+        g1 = words_to_digits.group(1).strip()
+        g2 = (words_to_digits.group(2) or "").strip()
+        merged_phrase = g1
+        tail = g2
+        if g2:
+            parts2 = g2.split()
+            if parts2:
+                first_w = re.sub(r"[^a-z0-9]", "", parts2[0]).lower()
+                if first_w in _WORD_NUMS:
+                    combined = _spoken_number_to_int(f"{g1} {first_w}".strip())
+                    head_only = _spoken_number_to_int(g1)
+                    if combined is not None and (
+                        head_only is None or combined != head_only
+                    ):
+                        merged_phrase = f"{g1} {first_w}".strip()
+                        tail = " ".join(parts2[1:]).strip()
+        digit_seq = _spoken_digit_sequence_to_digits(
+            merged_phrase.replace("-", " ")
+        )
+        if digit_seq:
+            number = int(digit_seq)
+        else:
+            number = _spoken_number_to_int(merged_phrase.replace("-", " "))
+        if number is not None:
+            low = f"{number} {tail}".strip()
     low = re.sub(r"\s+", " ", low).strip()
-    # Reject common STT garbage phrases after repair attempts.
     if re.search(r"\b(lost|list|students|items|below|where)\b", low):
         return None
     m = re.match(r"^\s*(\d{1,6})[\s,.-]+([a-z0-9\s.-]{3,})", low)
@@ -1369,11 +1647,6 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
     rest = re.split(r",|\bin\s+[a-z]+\b|\bcalifornia\b|\bca\b", rest, maxsplit=1)[0].strip()
     if not rest:
         return None
-    # Common STT fixes.
-    rest = re.sub(r"\band\s+lewart\b", "boulevard", rest)
-    rest = re.sub(r"\blewart\b", "boulevard", rest)
-    rest = re.sub(r"\blewat\b", "boulevard", rest)
-    rest = re.sub(r"\bof\s+lewat\b", "boulevard", rest)
     rest = re.sub(r"\bblvd\b", "boulevard", rest)
     rest = re.sub(r"\bave\b", "avenue", rest)
     rest = re.sub(r"\brd\b", "road", rest)
@@ -1383,9 +1656,24 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
     rest = re.sub(r"\bpkwy\b", "parkway", rest)
     rest = re.sub(r"\bst\b", "street", rest)
     rest = re.sub(r"\s+", " ", rest).strip(" .,-")
+    if had_comma:
+        street_line = re.match(
+            r"^(.+?\b(?:street|avenue|boulevard|road|drive|lane|court|parkway|place)\b)",
+            rest,
+        )
+        if street_line:
+            rest = street_line.group(1).strip()
     if re.fullmatch(r"(los angeles|california|ca)", rest):
         return None
     if len(rest) < 3:
+        return None
+    rest_l = rest.lower()
+    if re.fullmatch(
+        r"(zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+        r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)",
+        rest_l,
+    ):
         return None
     return f"{num} {rest.title()}"
 
@@ -1442,6 +1730,16 @@ def infer_name_fields_from_transcript(
     s = normalize_answer_scaffold(text).lower()
     if not s:
         return {}
+    spelled = _spoken_letters_to_word(s)
+    if spelled:
+        if slot_focus == "first" and need_first:
+            return {"first_name": spelled}
+        if slot_focus == "last" and need_last:
+            return {"last_name": spelled}
+        if need_first and not need_last:
+            return {"first_name": spelled}
+        if need_last and not need_first:
+            return {"last_name": spelled}
     # Hard-reject common off-topic/garbled phrases seen on PSTN STT for name turns.
     # This avoids writing junk like "Whatever" / "Brother" into legal name fields.
     if re.search(
@@ -1546,6 +1844,79 @@ def infer_name_fields_from_transcript(
     elif need_last:
         out["last_name"] = t2
     return out
+
+
+def _spoken_letters_to_word(text: str) -> Optional[str]:
+    """Join slow spelled names: 'P R A S A D' -> 'Prasad'."""
+    if not text or not str(text).strip():
+        return None
+    letter_words = {
+        "a": "a",
+        "ay": "a",
+        "b": "b",
+        "be": "b",
+        "bee": "b",
+        "c": "c",
+        "see": "c",
+        "sea": "c",
+        "d": "d",
+        "dee": "d",
+        "e": "e",
+        "ee": "e",
+        "f": "f",
+        "eff": "f",
+        "g": "g",
+        "gee": "g",
+        "h": "h",
+        "aitch": "h",
+        "i": "i",
+        "eye": "i",
+        "j": "j",
+        "jay": "j",
+        "k": "k",
+        "kay": "k",
+        "l": "l",
+        "el": "l",
+        "m": "m",
+        "em": "m",
+        "n": "n",
+        "en": "n",
+        "o": "o",
+        "oh": "o",
+        "p": "p",
+        "pee": "p",
+        "q": "q",
+        "cue": "q",
+        "queue": "q",
+        "r": "r",
+        "are": "r",
+        "s": "s",
+        "ess": "s",
+        "t": "t",
+        "tea": "t",
+        "tee": "t",
+        "u": "u",
+        "you": "u",
+        "v": "v",
+        "vee": "v",
+        "w": "w",
+        "doubleyou": "w",
+        "x": "x",
+        "ex": "x",
+        "y": "y",
+        "why": "y",
+        "z": "z",
+        "zee": "z",
+        "zed": "z",
+    }
+    cleaned = re.sub(r"\b(letter|letters|spelled|spell|is)\b", " ", text.lower())
+    tokens = re.findall(r"[a-z]+", cleaned)
+    letters = [letter_words.get(token) for token in tokens]
+    if not letters or any(letter is None for letter in letters):
+        return None
+    if len(letters) < 2 or len(letters) > 30:
+        return None
+    return "".join(letters).title()
 
 
 def infer_yes_no_from_transcript(text: str) -> Optional[bool]:
@@ -2230,12 +2601,13 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         if not parsed:
             return _fail(stage)
         handled_field = "first_name" if parsed.get("first_name") else "last_name"
+        confidence = 0.80 if _spoken_letters_to_word(text) else 0.95
         try:
             tool_result = await update_application_state.func(
                 None,
                 first_name=parsed.get("first_name"),
                 last_name=parsed.get("last_name"),
-                confidence_score=0.95,
+                confidence_score=confidence,
                 raw_user_input=text,
                 deterministic_call=True,
             )
@@ -2278,13 +2650,16 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
-            inc = infer_annual_income_from_transcript(text)
+            inc, fragile_income = infer_annual_income_meta(text)
             if inc is not None:
                 try:
+                    income_conf = (
+                        _INCOME_AMBIGUOUS_STT_CONFIDENCE if fragile_income else 0.95
+                    )
                     tool_result = await update_application_state.func(
                         None,
                         annual_pre_tax_income=inc,
-                        confidence_score=0.95,
+                        confidence_score=income_conf,
                         raw_user_input=text,
                         deterministic_call=True,
                     )
