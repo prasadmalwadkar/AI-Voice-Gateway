@@ -35,7 +35,7 @@ PAGE_7_DATA = {
     "password": "Test_User#90007",
     "confirm_password": "Test_User#90007",
     "agreed_to_privacy_policy": True,
-    "agreed_to_credit_pull": True,
+    "agreed_to_commerce_communication": True,
 }
 
 @pytest.mark.browser

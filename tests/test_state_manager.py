@@ -34,8 +34,11 @@ UNCERTAINTY_MARKERS = [
     "let me check",
 ]
 
-CONFIDENCE_THRESHOLD = 0.80
-HIGH_CONFIDENCE_FIELDS = {"agreed_to_credit_pull", "agreed_to_privacy_policy"}
+CONFIDENCE_THRESHOLD = 0.85
+HIGH_CONFIDENCE_FIELDS = {
+    "agreed_to_privacy_policy",
+    "agreed_to_commerce_communication",
+}
 
 
 def detect_uncertainty(raw_input: str) -> list[str]:
@@ -113,12 +116,12 @@ def test_confidence_threshold():
     print(f"✅ High confidence ({score}) passes threshold ({CONFIDENCE_THRESHOLD})")
 
     # Borderline — equal to threshold passes
-    score = 0.80
+    score = 0.85
     assert score >= CONFIDENCE_THRESHOLD
     print(f"✅ Borderline ({score}) passes threshold")
 
     # Just below threshold
-    score = 0.79
+    score = 0.84
     assert score < CONFIDENCE_THRESHOLD
     print(f"✅ Below threshold ({score})")
 
@@ -141,20 +144,20 @@ def test_consent_field_logic():
     print("=== Consent Field Logic Tests ===\n")
 
     # Consent with high confidence — should be accepted
-    field = "agreed_to_credit_pull"
+    field = "agreed_to_privacy_policy"
     score = 0.95
     value = True
     is_low = score < CONFIDENCE_THRESHOLD
     should_reject = field in HIGH_CONFIDENCE_FIELDS and (is_low or not value)
     assert not should_reject
-    print(f"✅ Credit pull consent (confidence={score}, value={value}): ACCEPTED")
+    print(f"✅ Privacy consent (confidence={score}, value={value}): ACCEPTED")
 
     # Consent with low confidence — should be rejected
     score = 0.5
     is_low = score < CONFIDENCE_THRESHOLD
     should_reject = field in HIGH_CONFIDENCE_FIELDS and (is_low or not value)
     assert should_reject
-    print(f"✅ Credit pull consent (confidence={score}, value={value}): REJECTED (low confidence)")
+    print(f"✅ Privacy consent (confidence={score}, value={value}): REJECTED (low confidence)")
 
     # Consent with value=False — should be rejected
     score = 0.95
@@ -162,7 +165,7 @@ def test_consent_field_logic():
     is_low = score < CONFIDENCE_THRESHOLD
     should_reject = field in HIGH_CONFIDENCE_FIELDS and (is_low or not value)
     assert should_reject
-    print(f"✅ Credit pull consent (confidence={score}, value={value}): REJECTED (False)")
+    print(f"✅ Privacy consent (confidence={score}, value={value}): REJECTED (False)")
 
     # Non-consent field with low confidence — should NOT be rejected by consent logic
     field = "first_name"
@@ -277,6 +280,7 @@ def test_infer_ownership_garbles():
     assert infer_ownership_from_transcript("toll owner") == "Sole owner"
     assert infer_ownership_from_transcript("So, loner.") == "Sole owner"
     assert infer_ownership_from_transcript("So loner") == "Sole owner"
+    assert infer_ownership_from_transcript("So alone.") == "Sole owner"
     assert infer_ownership_from_transcript("Sool, honado.") == "Sole owner"
     assert infer_ownership_from_transcript("Soul or not.") == "Sole owner"
     assert infer_ownership_from_transcript("Soul.") == "Sole owner"
@@ -285,6 +289,7 @@ def test_infer_ownership_garbles():
     assert infer_ownership_from_transcript("1") == "Sole owner"
     assert infer_ownership_from_transcript("two") == "Joint owner"
     assert infer_ownership_from_transcript("2") == "Joint owner"
+    assert infer_ownership_from_transcript("I am sole owner") == "Sole owner"
     assert infer_ownership_from_transcript("When.") == "Sole owner"
     assert infer_ownership_from_transcript("when") == "Sole owner"
     assert infer_ownership_from_transcript("hello world") is None
@@ -311,6 +316,7 @@ def test_infer_occupancy_and_for_sale():
     from agent.state_manager import infer_occupancy_from_transcript, infer_for_sale_from_transcript
 
     assert infer_occupancy_from_transcript("primary") == "Primary property"
+    assert infer_occupancy_from_transcript("it's primary") == "Primary property"
     assert infer_occupancy_from_transcript("secondary home") == "Secondary property"
     assert infer_occupancy_from_transcript("investment") == "Investment property"
     assert infer_occupancy_from_transcript("1") == "Primary property"
@@ -319,6 +325,7 @@ def test_infer_occupancy_and_for_sale():
     assert infer_occupancy_from_transcript("When?") == "Primary property"
 
     assert infer_for_sale_from_transcript("yes") is True
+    assert infer_for_sale_from_transcript("it's no") is False
     assert infer_for_sale_from_transcript("nope") is False
     assert infer_for_sale_from_transcript("yeah") is True
     assert infer_for_sale_from_transcript("nah") is False
@@ -353,6 +360,16 @@ def test_infer_phone_email_yesno_and_address():
     assert infer_yes_no_from_transcript("Nope.") is False
 
     assert infer_property_address_from_transcript("325 west adams boulevard los angeles") == "325 West Adams Boulevard Los Angeles"
+    assert infer_property_address_from_transcript("325 best items delivered loss") == "325 West Adams Boulevard Los Angeles"
+    assert infer_property_address_from_transcript(
+        "325 based items will live at loss"
+    ) == "325 West Adams Boulevard Los Angeles"
+    assert infer_property_address_from_transcript(
+        "325 waste items will be allowed loss"
+    ) == "325 West Adams Boulevard Los Angeles"
+    assert infer_property_address_from_transcript("it's 123 11th ave northeast new york") == "123 11Th Avenue Northeast New York"
+    assert infer_property_address_from_transcript("West Adams, Bilibod, Los Angeles") is None
+    assert infer_property_address_from_transcript("123 sothe nortest road") == "123 South Northeast Road"
     assert infer_property_address_from_transcript("hello there") is None
 
 
@@ -373,9 +390,12 @@ def test_infer_name_fields():
     assert infer_name_fields_from_transcript("my name is Alex", need_first=True, need_last=False) == {
         "first_name": "Alex"
     }
-    assert infer_name_fields_from_transcript("Alex Rivera", need_first=True, need_last=True) == {
+    assert infer_name_fields_from_transcript("my name is Alex Rivera", need_first=True, need_last=True) == {
         "first_name": "Alex",
         "last_name": "Rivera",
+    }
+    assert infer_name_fields_from_transcript("Alex Rivera", need_first=True, need_last=True) == {
+        "first_name": "Alex"
     }
     assert infer_name_fields_from_transcript("Rivera", need_first=False, need_last=True) == {
         "last_name": "Rivera"
@@ -387,6 +407,8 @@ def test_infer_name_fields():
     assert infer_name_fields_from_transcript("Whatever.", need_first=True, need_last=True) == {}
     assert infer_name_fields_from_transcript("My brother.", need_first=False, need_last=True) == {}
     assert infer_name_fields_from_transcript("Thank you.", need_first=True, need_last=True) == {}
+    assert infer_name_fields_from_transcript("You good?", need_first=True, need_last=True) == {}
+    assert infer_name_fields_from_transcript("Can you hear me?", need_first=True, need_last=True) == {}
     # Duplicate STT tokens: never set same string as first + last in one save.
     assert infer_name_fields_from_transcript(
         "Alex Alex", need_first=True, need_last=True
@@ -494,11 +516,10 @@ def _make_tool_result(ask_next: str) -> str:
 
 
 _OCCUPANCY_ASK_NEXT = (
-    "Primary, secondary, or investment? "
-    "Say one for primary, two for secondary, three for investment."
+    "What is the property type: primary, secondary, or investment?"
 )
 _FOR_SALE_ASK_NEXT = (
-    "Is the property currently for sale? Say one for yes, two for no."
+    "Is the property currently for sale?"
 )
 
 
@@ -516,7 +537,13 @@ _FOR_SALE_ASK_NEXT = (
         ),
         ("for-sale", "no", "is_currently_for_sale", "Annual pre-tax income?", {}),
         ("for-sale", "1", "is_currently_for_sale", "Annual pre-tax income?", {}),
-        ("consent", "yes", "agreed_to_privacy_policy", "Agree to marketing texts?", {}),
+        (
+            "consent",
+            "yes",
+            "agreed_to_privacy_policy",
+            "Agree to electronic communications?",
+            {},
+        ),
         ("name", "Alex", "first_name", "Last name?", {}),
         ("income", "80K", "annual_pre_tax_income", "Other income?", {}),
         (
@@ -620,6 +647,10 @@ async def test_preline_idk_falls_back_sole_ownership():
     assert call_kw["ownership_type"] == DEFAULT_INTAKE_OWNERSHIP
     assert call_kw["raw_user_input"] is None
     assert call_kw["confidence_score"] == 0.95
+    assert result.ask_next == (
+        "I'm assuming sole owner as ownership type for now. "
+        "What is the property type: primary, secondary, or investment?"
+    )
 
 
 async def test_preline_heuristic_env_killswitch():
@@ -732,14 +763,17 @@ async def test_mark_deterministic_turn_resets_flags():
     client._ask_dedup_window_sec = 3.0
     client._post_fallback_mute_model_sec = 1.8
     client._mute_model_text_until = 0.0
+    client._debounce_task = None
+    client._text_buffer = "stale buffered text"
     client.tts_queue = asyncio.Queue()
+    await client.tts_queue.put("old queued ask")
 
     # Create mock tasks that are "running"
     mock_task = MagicMock()
     mock_task.done.return_value = False
     client._no_response_watchdog_task = mock_task
     client._turn_watchdog_task = mock_task
-    client._pending_ask_fallback_task = mock_task
+    client._pending_ask_fallback_task = None
 
     await client.mark_deterministic_turn("What is your name?")
 
@@ -747,11 +781,12 @@ async def test_mark_deterministic_turn_resets_flags():
     assert client._fallback_spoken_text == ""
     assert client._ask_spoken_this_turn is True  # Set by _enqueue_ask_if_needed
     assert client._awaiting_turn_response is False
+    assert client._text_buffer == ""
 
     # Verify watchdogs cancelled
-    assert mock_task.cancel.call_count == 3
+    assert mock_task.cancel.call_count == 2
 
-    # Verify ask was queued for TTS
+    # Verify stale ask was drained and new ask was queued for TTS
     assert not client.tts_queue.empty()
     queued = client.tts_queue.get_nowait()
     assert queued == "What is your name?"
@@ -778,6 +813,8 @@ async def test_mark_deterministic_turn_no_ask():
     client._ask_dedup_window_sec = 3.0
     client._post_fallback_mute_model_sec = 1.8
     client._mute_model_text_until = 0.0
+    client._debounce_task = None
+    client._text_buffer = ""
     client.tts_queue = asyncio.Queue()
     client._no_response_watchdog_task = None
     client._turn_watchdog_task = None
@@ -792,7 +829,7 @@ async def test_mark_deterministic_turn_no_ask():
 
 
 async def test_send_user_transcript_status_ping_repeats_current_ask_without_llm():
-    """Status check utterance should repeat current ask and skip LLM frames."""
+    """Status check utterance should acknowledge presence and skip LLM frames."""
     from app.line_session_client import LineSessionClient
 
     client = LineSessionClient.__new__(LineSessionClient)
@@ -819,10 +856,31 @@ async def test_send_user_transcript_status_ping_repeats_current_ask_without_llm(
     await client.send_user_transcript("Hello, you there?")
 
     client._enqueue_ask_if_needed.assert_awaited_once_with(
-        LineSessionClient.BRIEF_REPEAT_PROMPT,
-        event="line.session.status_check_repeat_ask",
+        "Yes, I'm here. Last name?",
+        event="line.session.status_check_response",
     )
     client._ws.send.assert_not_called()
+
+
+async def test_clear_pending_speech_drains_stale_tts_queue():
+    """Barge-in cleanup should remove stale queued asks before next question."""
+    from app.line_session_client import LineSessionClient
+
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client._debounce_task = None
+    client._pending_ask_fallback_task = None
+    client._text_buffer = "old buffered words"
+    client._fallback_spoken_text = "old fallback"
+    client.tts_queue = asyncio.Queue()
+    await client.tts_queue.put("old ownership question")
+    await client.tts_queue.put("old fallback question")
+
+    await client.clear_pending_speech(reason="test")
+
+    assert client._text_buffer == ""
+    assert client._fallback_spoken_text == ""
+    assert client.tts_queue.empty()
 
 
 # ---------------------------------------------------------------------------
@@ -878,7 +936,6 @@ async def test_bridge_routes_not_handled_to_llm():
     with (
         patch("app.twilio_line_bridge.apply_voice_intake_heuristics_before_line",
               new_callable=AsyncMock, return_value=not_handled),
-        patch("app.twilio_line_bridge.apply_voice_intake_heuristics", new_callable=AsyncMock),
         patch("app.twilio_line_bridge.broadcast_stt", new_callable=AsyncMock),
         patch("app.twilio_line_bridge.path2_debug_log", new_callable=AsyncMock),
         patch("app.twilio_line_bridge.path2_set_debug_call", return_value=None),
@@ -909,7 +966,7 @@ async def test_bridge_triggers_deterministic_goodbye_on_terminal_deterministic()
     handled_terminal = HeuristicResult(
         handled=True,
         ask_next=None,
-        handled_field="agreed_to_credit_pull",
+        handled_field="agreed_to_commerce_communication",
         stage="consent",
     )
 
@@ -940,12 +997,12 @@ async def test_bridge_does_not_trigger_goodbye_when_missing_fields_remain():
     handled_terminal = HeuristicResult(
         handled=True,
         ask_next=None,
-        handled_field="agreed_to_credit_pull",
+        handled_field="agreed_to_commerce_communication",
         stage="consent",
     )
 
     result = handled_terminal
-    missing = "[BROWSER STAGE: CONSENT] Still needed: consent for electronic communications and soft credit pull"
+    missing = "[BROWSER STAGE: CONSENT] Still needed: electronic communications consent"
     if result.handled and mock_line:
         await mock_line.mark_deterministic_turn(result.ask_next)
         if result.ask_next is None and not (missing or "").strip():
@@ -990,6 +1047,10 @@ def test_status_check_utterance_short_circuit_match():
 
     for fn in (_is_status_check_utterance, LineSessionClient._is_status_check_utterance):
         assert fn("Hello, you there?") is True
+        assert fn("You good?") is True
+        assert fn("Can you hear me?") is True
+        assert fn("Are we good?") is True
+        assert fn("Still with me?") is True
         assert fn("what's next?") is True
         assert fn("go ahead") is True
         assert fn("thank you") is True
@@ -1010,6 +1071,274 @@ def test_status_check_utterance_short_circuit_match():
     assert lsc("what do you need?") is True
     assert lsc("325 West Adams Boulevard") is False
     assert lsc("sole owner") is False
+
+
+def test_looks_like_answer_for_current_field_rejects_non_answer():
+    from agent.state_manager import looks_like_answer_for_current_field
+
+    missing = (
+        '[BROWSER STAGE: PROPERTY] Still needed: ownership type '
+        'Ask next: "What is the ownership type: sole or joint?"'
+    )
+    assert looks_like_answer_for_current_field("Sorry.", missing) is False
+    assert looks_like_answer_for_current_field("That's all.", missing) is False
+    assert looks_like_answer_for_current_field("I'm so lonely.", missing) is False
+    assert looks_like_answer_for_current_field("So, Lonas.", missing) is True
+    assert looks_like_answer_for_current_field("sole owner", missing) is True
+
+
+def test_clarification_for_ownership_is_not_same_question():
+    from app.line_session_client import LineSessionClient
+
+    ask = "What is the ownership type: sole or joint?"
+    clarification = LineSessionClient._clarification_for_ask(ask)
+    assert clarification == "I didn't catch ownership type. You can say sole or joint."
+    assert clarification != ask
+
+
+async def test_enqueue_status_check_response_includes_current_ask():
+    from app.line_session_client import LineSessionClient
+
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._last_tool_ask = "What is your date of birth?"
+    client._ask_spoken_this_turn = True
+    client._last_spoken_ask_text = ""
+    client._last_spoken_ask_ts = 0.0
+    client._ask_dedup_window_sec = 3.0
+    client._post_fallback_mute_model_sec = 1.8
+    client._mute_model_text_until = 0.0
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client.tts_queue = asyncio.Queue()
+
+    assert await client.enqueue_status_check_response() is True
+    assert client.tts_queue.get_nowait() == "Yes, I'm here. What is your date of birth?"
+
+
+def test_expanded_consent_prompts():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import get_missing_fields
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "consent"
+    mock_browser._page = None
+    state = HelocApplicationState(
+        address_line_1="123 Main Street",
+        ownership_type="Sole owner",
+        occupancy_type="Primary property",
+        is_currently_for_sale=False,
+        annual_pre_tax_income=100000,
+        other_income=0,
+        primary_source_of_income="Employed full-time",
+        first_name="Alex",
+        last_name="Rivera",
+        date_of_birth="01/05/1990",
+        mobile_phone_number="2135550101",
+        email_address="alex@example.com",
+    )
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+    ):
+        missing = get_missing_fields()
+
+    assert "Privacy Policy" in missing
+    assert "Terms of Service" in missing
+    assert "soft credit pull" in missing
+    assert "will not affect your credit score" in missing
+
+
+def test_barge_in_partial_filter_accepts_real_answers_not_noise():
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    fn = TwilioLineBridge._looks_like_meaningful_barge_in
+    assert fn("sole owner") is True
+    assert fn("yes") is True
+    assert fn("1") is True
+    assert fn(".") is False
+    assert fn("um") is False
+    assert fn("So.") is False
+    assert fn("So.", preserve_so_for_ownership_ask=True) is True
+
+
+def test_path2_noise_optional_so_preserve_for_ownership_ask():
+    from app.path2_stt_noise import path2_stt_final_is_drop_noise
+
+    assert path2_stt_final_is_drop_noise("So.") is True
+    assert path2_stt_final_is_drop_noise("So.", preserve_so_for_ownership_ask=True) is False
+
+
+def test_final_stt_barge_in_rejects_agent_echo_but_accepts_user_speech():
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+    bridge._agent_playing = True
+    bridge._last_barge_at = 0.0
+    bridge._current_tts_text = "Is the property currently for sale?"
+
+    assert bridge._should_trigger_barge_in(
+        "currently for sale",
+        in_echo=True,
+        now=10.0,
+    ) is False
+    assert bridge._should_trigger_barge_in(
+        "primary",
+        in_echo=True,
+        now=10.0,
+    ) is True
+    assert bridge._should_trigger_barge_in(
+        "no",
+        in_echo=True,
+        now=10.0,
+    ) is True
+
+
+def test_final_stt_barge_in_respects_cooldown_and_agent_playing():
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+    bridge._agent_playing = False
+    bridge._last_barge_at = 0.0
+    bridge._current_tts_text = "What is the property type?"
+
+    assert bridge._should_trigger_barge_in(
+        "primary",
+        in_echo=True,
+        now=10.0,
+    ) is False
+
+    bridge._agent_playing = True
+    bridge._last_barge_at = 9.5
+    assert bridge._should_trigger_barge_in(
+        "primary",
+        in_echo=True,
+        now=10.0,
+    ) is False
+
+
+async def test_low_confidence_update_requires_single_confirmation():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        _clear_pending_low_confidence_confirmation,
+        update_application_state,
+    )
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    state = HelocApplicationState()
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+    ):
+        result = await update_application_state.func(
+            None,
+            ownership_type="Sole owner",
+            confidence_score=0.5,
+            raw_user_input="sole owner",
+        )
+
+    assert "Update PENDING" in result
+    assert 'Ask next: "I didn\'t catch that correctly. Can you repeat?"' in result
+    assert state.ownership_type is None
+    _clear_pending_low_confidence_confirmation()
+
+
+async def test_low_confidence_address_asks_for_repeat_not_generic_confirmation():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        _clear_pending_low_confidence_confirmation,
+        update_application_state,
+    )
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    state = HelocApplicationState()
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+    ):
+        result = await update_application_state.func(
+            None,
+            address_line_1="325 West Adams Boulevard",
+            confidence_score=0.5,
+            raw_user_input="325 best items delivered loss",
+        )
+
+    assert "Update PENDING" in result
+    assert 'Ask next: "I didn\'t catch that correctly. Please repeat the street address."' in result
+    assert 'Ask next: "Is that correct?"' not in result
+    assert state.address_line_1 is None
+    _clear_pending_low_confidence_confirmation()
+
+
+async def test_pending_low_confidence_yes_commits_candidate():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        _clear_pending_low_confidence_confirmation,
+        update_application_state,
+    )
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+    mock_browser._page = None
+
+    state = HelocApplicationState()
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
+    ):
+        await update_application_state.func(
+            None,
+            address_line_1="325 West Adams Boulevard",
+            confidence_score=0.5,
+            raw_user_input="325 best items delivered loss",
+        )
+        result = await update_application_state.func(
+            None,
+            confidence_score=1.0,
+            raw_user_input="Yes.",
+        )
+
+    assert state.address_line_1 == "325 West Adams Boulevard"
+    assert "ownership type" in result
+    _clear_pending_low_confidence_confirmation()
+
+
+async def test_pending_low_confidence_no_clears_candidate():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        _clear_pending_low_confidence_confirmation,
+        has_pending_low_confidence_confirmation,
+        update_application_state,
+    )
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+    mock_browser._page = None
+
+    state = HelocApplicationState()
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+    ):
+        await update_application_state.func(
+            None,
+            address_line_1="325 West Adams Boulevard",
+            confidence_score=0.5,
+            raw_user_input="325 best items delivered loss",
+        )
+        result = await update_application_state.func(
+            None,
+            confidence_score=1.0,
+            raw_user_input="No.",
+        )
+
+    assert state.address_line_1 is None
+    assert has_pending_low_confidence_confirmation() is False
+    assert "What is the property address?" in result
+    _clear_pending_low_confidence_confirmation()
 
 
 def test_strong_pin_normalize_agent_text():
@@ -1067,13 +1396,83 @@ def test_looks_like_answer_to_ownership_numeric_shortcuts():
     from app.line_session_client import LineSessionClient
 
     fn = LineSessionClient._looks_like_answer_to_ask
-    ask = "Sole or joint owner? Say one for sole, two for joint."
+    ask = "What is the ownership type: sole or joint?"
     assert fn(ask, "1") is True
     assert fn(ask, "2") is True
     assert fn(ask, "one") is True
     assert fn(ask, "two") is True
     assert fn(ask, "sad") is False
     assert fn(ask, "um") is False
+
+
+def test_compute_mulaw_rms_silence_vs_speech():
+    """_compute_mulaw_rms returns ~0 for silence, high for speech-like bytes."""
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    silence = bytes([0xFF] * 160)
+    rms_silence = TwilioLineBridge._compute_mulaw_rms(silence)
+    assert rms_silence < 1.0, f"Silence RMS should be ~0, got {rms_silence}"
+
+    speech = bytes([0x00] * 160)
+    rms_speech = TwilioLineBridge._compute_mulaw_rms(speech)
+    assert rms_speech > 1000, f"Max-amplitude RMS should be high, got {rms_speech}"
+
+    assert TwilioLineBridge._compute_mulaw_rms(b"") == 0.0
+
+
+async def test_gate_order_idk_reaches_default_not_clarification():
+    """'I don't know' during ownership ask must bypass non-answer gate and reach heuristic defaults."""
+    from agent.schema import HeuristicResult, HelocApplicationState
+    from agent.state_manager import (
+        DEFAULT_INTAKE_OWNERSHIP,
+        apply_voice_intake_heuristics_before_line,
+    )
+
+    mock_state = HelocApplicationState(address_line_1="123 Main St")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+    mock_browser._page = None
+
+    tool_return = _make_tool_result(
+        "What is the property type: primary, secondary, or investment?"
+    )
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(return_value=tool_return)
+        result = await apply_voice_intake_heuristics_before_line("I don't know")
+
+    assert result.handled is True
+    assert result.handled_field == "ownership_type"
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["ownership_type"] == DEFAULT_INTAKE_OWNERSHIP
+    assert call_kw["raw_user_input"] is None
+
+
+def test_ownership_garbles_soon_sown_sewn_zone():
+    from agent.state_manager import infer_ownership_from_transcript
+
+    assert infer_ownership_from_transcript("soon") == "Sole owner"
+    assert infer_ownership_from_transcript("so on") == "Sole owner"
+    assert infer_ownership_from_transcript("sown") == "Sole owner"
+    assert infer_ownership_from_transcript("sewn") == "Sole owner"
+    assert infer_ownership_from_transcript("zone") == "Sole owner"
+
+
+def test_address_repair_waste_levad():
+    from agent.state_manager import infer_property_address_from_transcript
+
+    result = infer_property_address_from_transcript(
+        "325 waste adams of levad los angeles"
+    )
+    assert result is not None
+    assert "West" in result
+    assert "Adams" in result
+    assert "Boulevard" in result
 
 
 if __name__ == "__main__":
@@ -1093,6 +1492,9 @@ if __name__ == "__main__":
     test_expanded_yes_no_aliases()
     test_expanded_for_sale_aliases()
     test_expanded_email_normalization()
+    test_compute_mulaw_rms_silence_vs_speech()
+    test_ownership_garbles_soon_sown_sewn_zone()
+    test_address_repair_waste_levad()
     print("=" * 50)
     print("ALL STATE MANAGER TESTS PASSED")
     print("=" * 50)
