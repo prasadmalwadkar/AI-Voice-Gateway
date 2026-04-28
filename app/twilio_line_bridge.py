@@ -18,14 +18,18 @@ from typing import Optional
 from fastapi import WebSocket, WebSocketDisconnect
 
 from agent.state_manager import (
-    apply_voice_intake_heuristics,
+    _ask_from_missing_line,
     apply_voice_intake_heuristics_before_line,
     ensure_browser_ready,
     get_contact_buffer_mode,
     get_missing_fields,
+    has_pending_low_confidence_confirmation,
     infer_email_from_transcript,
     infer_property_address_from_transcript,
+    looks_like_answer_for_current_field,
     reset_state,
+    transcript_is_status_check,
+    transcript_requests_intake_default,
 )
 from app.cartesia_stt_client import CartesiaInkSTTSession
 from app.cartesia_tts_mulaw import CartesiaSonicMulawTTS
@@ -41,11 +45,14 @@ from app.path2_transcript_debug import (
     path2_set_debug_call,
 )
 
-ECHO_GUARD_SECONDS = max(0.30, float(os.getenv("TWILIO_PATH2_ECHO_GUARD_SECS", "1.2")))
+ECHO_GUARD_SECONDS = max(0.30, float(os.getenv("TWILIO_PATH2_ECHO_GUARD_SECS", "0.45")))
 BARGE_IN_COOLDOWN_SECS = 0.8
+BARGE_IN_FINAL_GRACE_SECS = max(
+    0.5, float(os.getenv("TWILIO_BARGE_IN_FINAL_GRACE_SECS", "2.5"))
+)
 ANSWER_GUARD_SECS = float(os.getenv("TWILIO_PATH2_ANSWER_GUARD_SECS", "2.0"))
-TTS_STARTUP_DELAY_SECS = max(0.0, float(os.getenv("TWILIO_TTS_STARTUP_DELAY_SECS", "2.0")))
-TTS_DRAIN_SECS = max(0.0, float(os.getenv("TWILIO_TTS_DRAIN_SECS", "1.5")))
+TTS_STARTUP_DELAY_SECS = max(0.0, float(os.getenv("TWILIO_TTS_STARTUP_DELAY_SECS", "0.3")))
+TTS_DRAIN_SECS = max(0.0, float(os.getenv("TWILIO_TTS_DRAIN_SECS", "0.25")))
 ADDRESS_FINAL_BUFFER_WINDOW_SECS = max(
     0.0, float(os.getenv("TWILIO_ADDRESS_FINAL_BUFFER_WINDOW_SECS", "1.0"))
 )
@@ -91,24 +98,17 @@ MEDIA_DEBUG_INTERVAL_FRAMES = max(
     20, int(os.getenv("TWILIO_MEDIA_DEBUG_INTERVAL_FRAMES", "100"))
 )
 
+# VAD (Voice Activity Detection) barge-in via mu-law RMS energy.
+VAD_BARGE_IN_ENABLED = os.getenv("TWILIO_VAD_BARGE_IN_ENABLED", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+VAD_RMS_THRESHOLD = max(1, int(os.getenv("TWILIO_VAD_RMS_THRESHOLD", "500")))
+VAD_CONSEC_FRAMES = max(1, int(os.getenv("TWILIO_VAD_CONSEC_FRAMES", "4")))
+VAD_ECHO_GRACE_SECS = max(0.0, float(os.getenv("TWILIO_VAD_ECHO_GRACE_SECS", "0.25")))
+
 
 def _is_status_check_utterance(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    t = re.sub(r"[^\w\s?']", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    patterns = (
-        r"\b(you there|are you there|still there|hello)\b",
-        r"\b(what'?s next|next question|go ahead|continue)\b",
-        r"\b(what'?s the question|what is the question|which question)\b",
-        r"\b(repeat|say that again|say again|come again)\b",
-        r"\b(i didn'?t hear|didn'?t catch|what did you say)\b",
-        r"\b(i'?m lost|i'?m confused|what do you need|what do i do)\b",
-        r"\b(pardon|excuse me|sorry what)\b",
-        r"\b(thank you|thanks)\b",
-    )
-    return any(re.search(p, t) for p in patterns)
+    return transcript_is_status_check(text)
 
 
 class TwilioLineBridge:
@@ -146,13 +146,15 @@ class TwilioLineBridge:
         self._last_stt_partial_ts: float = 0.0
         self._rx_media_frames = 0
         self._rx_media_bytes = 0
-        self._last_rx_media_ts = 0.0
         self._last_stt_event_ts = time.monotonic()
+        self._vad_consec_high: int = 0
 
         self._agent_playing = False
         self._last_agent_audio_time = 0.0
         self._last_barge_at = 0.0
+        self._barge_in_accept_final_until = 0.0
         self._deterministic_answer_guard_until = 0.0
+        self._current_tts_text = ""
 
     async def run(self) -> None:
         self._running = True
@@ -201,7 +203,6 @@ class TwilioLineBridge:
                     now_media = time.monotonic()
                     self._rx_media_frames += 1
                     self._rx_media_bytes += len(data)
-                    self._last_rx_media_ts = now_media
                     if self._rx_media_frames % MEDIA_DEBUG_INTERVAL_FRAMES == 0:
                         self._log_pipeline_debug(
                             (
@@ -212,6 +213,7 @@ class TwilioLineBridge:
                             ),
                             event="twilio.media.ingress",
                         )
+                    await self._vad_check_barge_in(data, now_media)
                     sent = await self._stt.send_mulaw_bytes(data)
                     if not sent:
                         # STT socket closed (Cartesia end or race with shutdown) —
@@ -329,6 +331,113 @@ class TwilioLineBridge:
     def _is_number_only_fragment(text: str) -> bool:
         return re.fullmatch(r"\d{1,6}[.]?", (text or "").strip()) is not None
 
+    @staticmethod
+    def _looks_like_meaningful_barge_in(
+        text: str,
+        *,
+        preserve_so_for_ownership_ask: bool = False,
+    ) -> bool:
+        t = re.sub(r"\s+", " ", (text or "").strip())
+        if len(t) == 1:
+            return t.isdigit()
+        if len(t) < 2:
+            return False
+        if re.fullmatch(r"[-.,?!]+", t):
+            return False
+        if path2_stt_final_is_drop_noise(
+            t,
+            preserve_so_for_ownership_ask=preserve_so_for_ownership_ask,
+        ):
+            return False
+        return any(ch.isalnum() for ch in t)
+
+    def _ownership_ask_active(self) -> bool:
+        missing = get_missing_fields() or ""
+        ask = (_ask_from_missing_line(missing) or "").lower()
+        return "ownership type" in ask or "sole or joint" in ask
+
+    @staticmethod
+    def _speech_tokens(text: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+    def _looks_like_current_agent_echo(self, text: str) -> bool:
+        """True when STT text looks like the TTS currently being played."""
+        spoken_tokens = self._speech_tokens(text)
+        agent_tokens = self._speech_tokens(self._current_tts_text)
+        if not spoken_tokens or not agent_tokens:
+            return False
+
+        spoken_norm = " ".join(spoken_tokens)
+        agent_norm = " ".join(agent_tokens)
+        if len(spoken_norm) >= 8 and spoken_norm in agent_norm:
+            return True
+
+        agent_set = set(agent_tokens)
+        overlap = sum(1 for token in spoken_tokens if token in agent_set)
+        if len(spoken_tokens) <= 2:
+            return overlap == len(spoken_tokens) and any(
+                len(token) >= 4 for token in spoken_tokens
+            )
+        return (overlap / len(spoken_tokens)) >= 0.67
+
+    @staticmethod
+    def _compute_mulaw_rms(data: bytes) -> float:
+        """RMS energy of mu-law encoded audio frame (ITU-T G.711)."""
+        if not data:
+            return 0.0
+        total = 0.0
+        for b in data:
+            u = ~b & 0xFF
+            t = ((u & 0x0F) << 3) | 0x84
+            t <<= (u & 0x70) >> 4
+            sample = (0x84 - t) if (u & 0x80) else (t - 0x84)
+            total += sample * sample
+        return (total / len(data)) ** 0.5
+
+    async def _vad_check_barge_in(self, data: bytes, now: float) -> None:
+        """Fire barge-in when consecutive high-energy frames detected during TTS."""
+        if not VAD_BARGE_IN_ENABLED or not self._agent_playing:
+            self._vad_consec_high = 0
+            return
+        if (now - self._last_agent_audio_time) < VAD_ECHO_GRACE_SECS:
+            self._vad_consec_high = 0
+            return
+        rms = self._compute_mulaw_rms(data)
+        if rms >= VAD_RMS_THRESHOLD:
+            self._vad_consec_high += 1
+            if self._vad_consec_high >= VAD_CONSEC_FRAMES:
+                self._log_pipeline_debug(
+                    f"VAD barge-in triggered | rms={rms:.0f} consec={self._vad_consec_high}",
+                    event="path2.vad.barge_in",
+                )
+                self._vad_consec_high = 0
+                self._last_barge_at = now
+                await self._barge_in()
+        else:
+            self._vad_consec_high = 0
+
+    def _should_trigger_barge_in(
+        self,
+        text: str,
+        *,
+        in_echo: bool,
+        now: float,
+    ) -> bool:
+        if not self._agent_playing:
+            return False
+        if (now - self._last_barge_at) < BARGE_IN_COOLDOWN_SECS:
+            return False
+        if not self._looks_like_meaningful_barge_in(
+            text,
+            preserve_so_for_ownership_ask=self._ownership_ask_active(),
+        ):
+            return False
+        # Echo guard should still protect us from our own TTS. If STT hears a
+        # different meaningful phrase while we speak, treat it as caller barge-in.
+        if in_echo and self._looks_like_current_agent_echo(text):
+            return False
+        return True
+
     def _property_address_still_missing(self) -> bool:
         missing_now = (get_missing_fields() or "").lower()
         return "property address (street)" in missing_now
@@ -339,9 +448,7 @@ class TwilioLineBridge:
         if t and not t.done() and t is not asyncio.current_task():
             t.cancel()
 
-    async def _flush_address_buffer(
-        self, *, reason: str, process_merged: bool = True
-    ) -> None:
+    async def _flush_address_buffer(self, *, reason: str) -> None:
         parts = [p.strip() for p in self._address_final_buffer if (p or "").strip()]
         self._address_final_buffer = []
         self._cancel_address_buffer_task()
@@ -367,8 +474,6 @@ class TwilioLineBridge:
                 text=merged,
                 call_sid=self.call_sid,
             )
-            return
-        if not process_merged:
             return
         await broadcast_stt(
             kind="user_final_merged",
@@ -630,10 +735,10 @@ class TwilioLineBridge:
                             text=text,
                             call_sid=self.call_sid,
                         )
-                        if (
-                            not in_echo
-                            and self._agent_playing
-                            and (now - self._last_barge_at) >= BARGE_IN_COOLDOWN_SECS
+                        if self._should_trigger_barge_in(
+                            text,
+                            in_echo=in_echo,
+                            now=now,
                         ):
                             self._log_pipeline_debug(
                                 f"Barge-in trigger from partial | text='{text[:120]}'",
@@ -643,7 +748,20 @@ class TwilioLineBridge:
                             await self._barge_in()
                         continue
 
-                    if in_echo:
+                    if self._should_trigger_barge_in(
+                        text,
+                        in_echo=in_echo,
+                        now=now,
+                    ):
+                        self._log_pipeline_debug(
+                            f"Barge-in trigger from final | text='{text[:120]}'",
+                            event="path2.barge_in.trigger",
+                        )
+                        self._last_barge_at = now
+                        await self._barge_in()
+
+                    bypass_echo_after_barge = now < self._barge_in_accept_final_until
+                    if in_echo and not bypass_echo_after_barge:
                         self.call_logger.debug(
                             "Skipping STT final during echo guard",
                             event="path2.stt.echo_skip",
@@ -658,8 +776,16 @@ class TwilioLineBridge:
                             event="path2.stt.echo_skip_debug",
                         )
                         continue
+                    if in_echo and bypass_echo_after_barge:
+                        self._log_pipeline_debug(
+                            f"Accepting post-barge final during echo guard | text='{text[:120]}'",
+                            event="path2.stt.echo_bypass_after_barge",
+                        )
 
-                    if path2_stt_final_is_drop_noise(text):
+                    if path2_stt_final_is_drop_noise(
+                        text,
+                        preserve_so_for_ownership_ask=self._ownership_ask_active(),
+                    ):
                         await broadcast_stt(
                             kind="user_final_noise_dropped",
                             text=text,
@@ -688,6 +814,7 @@ class TwilioLineBridge:
                     if await self._buffer_contact_fragment(text):
                         continue
 
+                    self._barge_in_accept_final_until = 0.0
                     await self._handle_final_transcript(text)
 
                 elif mtype == "error":
@@ -743,6 +870,36 @@ class TwilioLineBridge:
                 },
             )
             append_transcript_turn(self.call_sid or "", "user", text)
+            missing_snapshot = get_missing_fields() or ""
+            ask_from_missing = self._extract_ask_next(missing_snapshot)
+            if ask_from_missing and _is_status_check_utterance(text) and self._line:
+                self._log_pipeline_debug(
+                    (
+                        "Status-check short-circuit before deterministic parsing "
+                        f"| text='{text[:120]}' ask='{ask_from_missing}'"
+                    ),
+                    event="path2.status_check.shortcircuit",
+                )
+                self._line.inject_ask_next_hint(ask_from_missing, schedule_fallback=False)
+                await self._line.enqueue_status_check_response()
+                return
+            if (
+                ask_from_missing
+                and self._line
+                and not has_pending_low_confidence_confirmation()
+                and not transcript_requests_intake_default(text)
+                and not looks_like_answer_for_current_field(text, missing_snapshot)
+            ):
+                self._log_pipeline_debug(
+                    (
+                        "Non-answer clarification before Line/LLM "
+                        f"| text='{text[:120]}' ask='{ask_from_missing}'"
+                    ),
+                    event="path2.non_answer.clarify",
+                )
+                self._line.inject_ask_next_hint(ask_from_missing, schedule_fallback=False)
+                await self._line.enqueue_clarification_for_current_ask()
+                return
             result = await apply_voice_intake_heuristics_before_line(text)
             if result.handled and self._line:
                 self._log_pipeline_debug(
@@ -790,37 +947,14 @@ class TwilioLineBridge:
                     "Deterministic did not handle final; forwarding to Line/LLM",
                     event="path2.stt.final_to_llm",
                 )
-                missing_snapshot = get_missing_fields() or ""
-                ask_from_missing = self._extract_ask_next(missing_snapshot)
-                if (
-                    ask_from_missing
-                    and _is_status_check_utterance(text)
-                    and self._line
-                ):
-                    self._log_pipeline_debug(
-                        (
-                            "Status-check short-circuit to deterministic ask "
-                            f"(no Line user/agent transcript logs) | text='{text[:120]}' "
-                            f"ask='{ask_from_missing}'"
-                        ),
-                        event="path2.status_check.shortcircuit",
-                    )
-                    await self._line.enqueue_brief_repeat_for_pending_ask()
-                    return
                 if result.ask_next and self._line:
                     self._line.inject_ask_next_hint(result.ask_next)
                 t0_line = time.perf_counter()
                 if self._line:
                     await self._line.send_user_transcript(text)
-                t_after_line = time.perf_counter()
-                await apply_voice_intake_heuristics(text)
-                line_user_ms = round((t_after_line - t0_line) * 1000, 2)
-                heuristics_ms = round(
-                    (time.perf_counter() - t_after_line) * 1000, 2
-                )
+                line_user_ms = round((time.perf_counter() - t0_line) * 1000, 2)
                 await path2_debug_log(
                     "path2.stt_final_to_line",
-                    heuristics_ms=heuristics_ms,
                     line_user_send_ms=line_user_ms,
                     total_handoff_ms=round((time.perf_counter() - t0) * 1000, 2),
                     text_preview=(text or "")[:160],
@@ -831,10 +965,13 @@ class TwilioLineBridge:
     async def _barge_in(self) -> None:
         self.call_logger.info("Barge-in: cancel TTS + Line + Twilio clear", event="path2.barge_in")
         self._discard_contact_buffer()
+        self._barge_in_accept_final_until = time.monotonic() + BARGE_IN_FINAL_GRACE_SECS
         if self._tts:
             await self._tts.cancel_current()
         self._agent_playing = False
+        self._current_tts_text = ""
         if self._line:
+            await self._line.clear_pending_speech(reason="barge_in")
             await self._line.send_user_speaking_start()
         await self._send_twilio_clear(reason="barge_in")
 
@@ -852,11 +989,7 @@ class TwilioLineBridge:
 
     @staticmethod
     def _extract_ask_next(text: str) -> Optional[str]:
-        m = re.search(r'Ask next:\s*"([^"]+)"', text or "")
-        if not m:
-            return None
-        ask = (m.group(1) or "").strip()
-        return ask or None
+        return _ask_from_missing_line(text) or None
 
     def _cancel_deterministic_followup_task(self) -> None:
         t = self._deterministic_followup_task
@@ -923,6 +1056,7 @@ class TwilioLineBridge:
                 event="path2.tts.dequeue",
             )
             self._agent_playing = True
+            self._current_tts_text = text
             self._deterministic_answer_guard_until = 0.0
             speak_t0 = time.perf_counter()
             try:
@@ -943,6 +1077,7 @@ class TwilioLineBridge:
                     # Let Twilio finish buffered playback before opening mic turn.
                     await asyncio.sleep(TTS_DRAIN_SECS)
                 self._agent_playing = False
+                self._current_tts_text = ""
                 if (text or "").strip() == DETERMINISTIC_GOODBYE_TEXT.strip():
                     await broadcast_stt(
                         kind="call_ended",

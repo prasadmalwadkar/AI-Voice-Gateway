@@ -61,11 +61,11 @@ already given. Ask for ONE or TWO related fields at a time.
 5. Legal name: first, middle (optional), last, suffix (optional).
 6. Date of birth.
 7. Mobile phone number and email address.
-8. Verbal consent to Privacy Policy and Terms of Service. The caller must \
-   clearly say "I agree" — vague responses like "sure" are not sufficient.
-9. Verbal consent to Electronic Communications Policy and a soft credit \
-   pull. CRITICAL: say "soft credit pull" and explain it will NOT affect \
-   their credit score. Again, require a clear "I agree."
+8. One verbal consent to Privacy Policy, Terms of Service, and soft credit \
+   pull (single first checkbox). CRITICAL: say "soft credit pull" and that it will \
+   NOT affect their credit score. Require a clear "I agree."
+9. Verbal consent to the Electronic Communications Policy (second checkbox). \
+   Again, require a clear "I agree."
 10. Once all information is collected, read back a brief summary and let \
     them know a secure password has been generated for their new account.
 

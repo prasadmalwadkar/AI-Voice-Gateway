@@ -28,7 +28,7 @@ from app.logging_config import CallLogger
 def _build_stt_websocket_url() -> str:
     # Lower = faster turn-end (snappier), higher = fewer mid-sentence cuts.
     # Recommended: 0.25–0.30 for local mic, 0.40–0.55 for Twilio PSTN.
-    silence = max(0.20, float(os.getenv("CARTESIA_STT_MAX_SILENCE_SECS", "0.45")))
+    silence = max(0.20, float(os.getenv("CARTESIA_STT_MAX_SILENCE_SECS", "0.55")))
     q: dict[str, str] = {
         "model": os.getenv("CARTESIA_STT_MODEL", "ink-whisper"),
         "language": os.getenv("CARTESIA_STT_LANGUAGE", "en"),
@@ -68,7 +68,7 @@ class CartesiaInkSTTSession:
         self._call_logger.info(
             (
                 "Cartesia STT WebSocket connected | "
-                f"max_silence={os.getenv('CARTESIA_STT_MAX_SILENCE_SECS', '0.45')} "
+                f"max_silence={os.getenv('CARTESIA_STT_MAX_SILENCE_SECS', '0.55')} "
                 f"min_volume={os.getenv('CARTESIA_STT_MIN_VOLUME', '0.0')} "
                 f"model={os.getenv('CARTESIA_STT_MODEL', 'ink-whisper')}"
             ),
