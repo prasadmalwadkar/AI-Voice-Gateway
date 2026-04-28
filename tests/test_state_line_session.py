@@ -137,10 +137,28 @@ async def test_send_user_transcript_status_ping_repeats_current_ask_without_llm(
     await client.send_user_transcript("Hello, you there?")
 
     client._enqueue_ask_if_needed.assert_awaited_once_with(
-        "Yes, I'm here. Last name?",
+        "Last name?",
         event="line.session.status_check_response",
     )
     client._ws.send.assert_not_called()
+
+
+async def test_no_response_watchdog_repeats_pending_ask_not_generic_prompt():
+    from app.line_session_client import LineSessionClient
+
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._last_tool_ask = "Regarding ownership, I have you down as the sole owner. Is that still correct?"
+    client._no_response_watchdog_sec = 0.0
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client._call_logger.call_sid = "test"
+    client._enqueue_ask_if_needed = AsyncMock(return_value=True)
+
+    await client._no_response_watchdog()
+
+    client._enqueue_ask_if_needed.assert_awaited_once_with(
+        "Regarding ownership, I have you down as the sole owner. Is that still correct?",
+        event="line.session.no_response_watchdog",
+    )
 
 
 async def test_clear_pending_speech_drains_stale_tts_queue():

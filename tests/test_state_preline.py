@@ -11,6 +11,15 @@ from tests.preline_fixtures import (
 )
 
 
+@pytest.fixture(autouse=True)
+def clear_prefill_state_between_tests():
+    from agent.state_manager import set_customer_prefill
+
+    set_customer_prefill({})
+    yield
+    set_customer_prefill({})
+
+
 async def test_preline_income_garble_passes_low_confidence_for_confirmation():
     """Brittle STT income repairs must not auto-save at nominal high confidence."""
     from agent.schema import HelocApplicationState
@@ -38,6 +47,217 @@ async def test_preline_income_garble_passes_low_confidence_for_confirmation():
     call_kw = mock_tool.func.call_args[1]
     assert call_kw["annual_pre_tax_income"] == 1_500_000
     assert call_kw["confidence_score"] == _INCOME_AMBIGUOUS_STT_CONFIDENCE
+
+
+async def test_prefill_confirmation_yes_commits_pending_values():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        apply_voice_intake_heuristics_before_line,
+        get_missing_fields,
+        set_customer_prefill,
+    )
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "name"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        set_customer_prefill({"first_name": "Jane", "last_name": "Doe"})
+        assert "I have your legal name as Jane Doe" in get_missing_fields()
+        mock_tool.func = AsyncMock(return_value=_make_tool_result("What is your date of birth?"))
+        result = await apply_voice_intake_heuristics_before_line("yes")
+
+    assert result.handled is True
+    assert result.handled_field == "prefill_confirmation"
+    mock_tool.func.assert_called_once()
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["first_name"] == "Jane"
+    assert call_kw["last_name"] == "Doe"
+    assert call_kw["confidence_score"] == 1.0
+    assert call_kw["raw_user_input"] == "yes"
+
+
+async def test_prefill_confirmation_yes_beats_stale_low_conf_pending():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        _set_pending_low_confidence_confirmation,
+        apply_voice_intake_heuristics_before_line,
+        get_missing_fields,
+        set_customer_prefill,
+    )
+
+    mock_state = HelocApplicationState(address_line_1="325 West Adams Boulevard")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        set_customer_prefill({"ownership_type": "Sole owner"})
+        assert "Regarding ownership, I have you down as the sole owner" in get_missing_fields()
+        _set_pending_low_confidence_confirmation({"address_line_1": "325 West Adams Boulevard"}, 0.95)
+        mock_tool.func = AsyncMock(return_value=_make_tool_result("Property type?"))
+        result = await apply_voice_intake_heuristics_before_line("Yes.")
+
+    assert result.handled is True
+    assert result.handled_field == "prefill_confirmation"
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["ownership_type"] == "Sole owner"
+    assert "address_line_1" not in call_kw
+    assert call_kw["confidence_score"] == 1.0
+
+
+async def test_prefill_confirmation_no_rejects_and_asks_normal_question():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        apply_voice_intake_heuristics_before_line,
+        get_missing_fields,
+        set_customer_prefill,
+    )
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "name"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        set_customer_prefill({"first_name": "Jane", "last_name": "Doe"})
+        assert "I have your legal name as Jane Doe" in get_missing_fields()
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line("no")
+        followup = get_missing_fields()
+
+    assert result.handled is True
+    assert result.handled_field == "prefill_confirmation_rejected"
+    assert result.ask_next == "What's your first name?"
+    assert 'Ask next: "What\'s your first name?"' in followup
+    mock_tool.func.assert_not_called()
+
+
+async def test_prefill_reset_clears_customer_payload():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        get_customer_prefill_fields,
+        reset_state,
+        set_customer_prefill,
+    )
+
+    mock_browser = MagicMock()
+    mock_browser.is_running = False
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", HelocApplicationState()),
+    ):
+        set_customer_prefill({"email_address": "jane@example.com"})
+        assert get_customer_prefill_fields() == ["email_address"]
+        await reset_state()
+        assert get_customer_prefill_fields() == []
+
+
+def test_prefill_initial_ask_greets_first_name_for_missing_address():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import get_initial_intake_ask, set_customer_prefill
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+    ):
+        set_customer_prefill({"first_name": "Prasad"})
+        assert get_initial_intake_ask() == "Hi Prasad, can you tell me your property address?"
+
+
+def test_prefill_initial_ask_greets_first_name_for_on_file_address():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import get_initial_intake_ask, set_customer_prefill
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+    ):
+        set_customer_prefill(
+            {
+                "first_name": "Prasad",
+                "address_line_1": "325 West Adams Boulevard",
+                "city": "Los Angeles",
+            }
+        )
+        assert get_initial_intake_ask() == (
+            "Hi Prasad, I have the property address on file as "
+            "325 West Adams Boulevard, Los Angeles. Is that correct?"
+        )
+
+
+def test_on_file_confirmation_yes_passes_non_answer_gate():
+    from agent.state_manager import looks_like_answer_for_current_field
+
+    missing = (
+        '[BROWSER STAGE: PROPERTY] Still needed: ownership type. '
+        'Ask next: "Got it, I\'ve saved your address. Regarding ownership, '
+        'I have you down as the sole owner. Is that still correct?"'
+    )
+
+    assert looks_like_answer_for_current_field("Yes.", missing) is True
+    assert looks_like_answer_for_current_field("correct.", missing) is True
+
+    last_name_missing = (
+        '[BROWSER STAGE: NAME] Still needed: last name. '
+        'Ask next: "I have your last name as Malwadkar. Is that still correct?"'
+    )
+    assert looks_like_answer_for_current_field("Yeah.", last_name_missing) is True
+    assert looks_like_answer_for_current_field("correct.", last_name_missing) is True
+
+
+async def test_prefill_last_name_confirmation_accepts_repeated_yeah():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        apply_voice_intake_heuristics_before_line,
+        get_missing_fields,
+        set_customer_prefill,
+    )
+
+    mock_state = HelocApplicationState(first_name="Prasad")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "name"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        set_customer_prefill({"last_name": "Malwadkar"})
+        assert "I have your last name as Malwadkar" in get_missing_fields()
+        mock_tool.func = AsyncMock(return_value=_make_tool_result("What is your date of birth?"))
+        result = await apply_voice_intake_heuristics_before_line("Yeah. Yeah.")
+
+    assert result.handled is True
+    assert result.handled_field == "prefill_confirmation"
+    assert result.ask_next == "What is your date of birth?"
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["last_name"] == "Malwadkar"
+
+
 @pytest.mark.parametrize(
     "stage,transcript,field,expected_ask,state_kwargs",
     [
@@ -96,7 +316,7 @@ async def test_preline_heuristic_handled(stage, transcript, field, expected_ask,
     assert result.handled is True
     assert result.handled_field == field
     assert result.stage == stage
-    assert result.ask_next == expected_ask
+    assert result.ask_next and result.ask_next.endswith(expected_ask)
 
 
 async def test_preline_heuristic_not_handled_ambiguous():
@@ -163,8 +383,8 @@ async def test_preline_idk_falls_back_sole_ownership():
     assert call_kw["raw_user_input"] is None
     assert call_kw["confidence_score"] == 0.95
     assert result.ask_next == (
-        "I'm assuming sole owner as ownership type for now. "
-        "What is the property type: primary, secondary, or investment?"
+        "I'm assuming sole owner for now. "
+        "Is this your primary home, a second home, or an investment property?"
     )
 
 

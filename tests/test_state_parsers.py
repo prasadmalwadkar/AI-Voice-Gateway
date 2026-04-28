@@ -27,6 +27,8 @@ def test_infer_annual_income():
         ("two two five k", 225_000),
         ("one million", 1_000_000),
         ("one million.", 1_000_000),
+        ("my annual pre tax income is one million", 1_000_000),
+        ("manual pretax income is one million", 1_000_000),
         ("one medium", 1_000_000),
         ("One medium.", 1_000_000),
         ("one fifty k", 150_000),
@@ -87,6 +89,7 @@ def test_infer_dob_spoken():
     assert infer_dob_from_transcript("January first nineteen ninety two") == "01/01/1992"
     assert infer_dob_from_transcript("First January nineteen ninety two") == "01/01/1992"
     assert infer_dob_from_transcript("first Jan nineteen ninety two") == "01/01/1992"
+    assert infer_dob_from_transcript("My date of birth is 1st Jan 1992") == "01/01/1992"
     assert infer_dob_from_transcript("First ten nineteen ninety two") == "01/01/1992"
     assert infer_dob_from_transcript("") is None
     assert infer_dob_from_transcript("hello") is None
@@ -115,6 +118,7 @@ def test_infer_ownership_garbles():
     assert infer_ownership_from_transcript("two") == "Joint owner"
     assert infer_ownership_from_transcript("2") == "Joint owner"
     assert infer_ownership_from_transcript("I am sole owner") == "Sole owner"
+    assert infer_ownership_from_transcript("Yes I am sole owner of the property") == "Sole owner"
     assert infer_ownership_from_transcript("store owner") == "Sole owner"
     assert infer_ownership_from_transcript("stored owner") == "Sole owner"
     assert infer_ownership_from_transcript("join owner") == "Joint owner"
@@ -150,6 +154,7 @@ def test_infer_occupancy_and_for_sale():
 
     assert infer_occupancy_from_transcript("primary") == "Primary property"
     assert infer_occupancy_from_transcript("it's primary") == "Primary property"
+    assert infer_occupancy_from_transcript("yes this is my primary property") == "Primary property"
     assert infer_occupancy_from_transcript("secondary home") == "Secondary property"
     assert infer_occupancy_from_transcript("investment") == "Investment property"
     assert infer_occupancy_from_transcript("1") == "Primary property"
@@ -206,13 +211,16 @@ def test_infer_phone_email_yesno_and_address():
 
     assert infer_yes_no_from_transcript("Yes.") is True
     assert infer_yes_no_from_transcript("I agree") is True
+    assert infer_yes_no_from_transcript("Yes. I said yes.") is True
+    assert infer_yes_no_from_transcript("Yeah. Yeah.") is True
     assert infer_yes_no_from_transcript("Nope.") is False
 
     assert infer_property_address_from_transcript("325 west adams boulevard los angeles") == "325 West Adams Boulevard Los Angeles"
+    assert infer_property_address_from_transcript("four one three four eleventh avenue northeast, seattle") == "4134 11th Avenue"
     assert infer_property_address_from_transcript("three twenty five.") is None
     assert infer_property_address_from_transcript("three twenty five West Adams Boulevard, Los Angeles") == "325 West Adams Boulevard"
     assert infer_property_address_from_transcript("One, two, one, two, three West Adams Boulevard, Boston, Venice.") == "12123 West Adams Boulevard"
-    assert infer_property_address_from_transcript("it's 123 11th ave northeast new york") == "123 11Th Avenue Northeast New York"
+    assert infer_property_address_from_transcript("it's 123 11th ave northeast new york") == "123 11th Avenue Northeast New York"
     assert infer_property_address_from_transcript("West Adams, Bilibod, Los Angeles") is None
     assert infer_property_address_from_transcript("123 oak street chicago illinois") == (
         "123 Oak Street Chicago Illinois"

@@ -1,5 +1,7 @@
 """Twilio bridge routing, Path2 barge-in / VAD, watchdogs, and state update checks."""
 import asyncio
+import base64
+import json
 import os
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,6 +11,52 @@ import pytest
 # ---------------------------------------------------------------------------
 # Bridge routing integration tests
 # ---------------------------------------------------------------------------
+
+
+def test_decode_twilio_prefill_b64_custom_parameter():
+    from app.twilio_line_bridge import _decode_prefill_b64
+
+    payload = {"first_name": "Jane", "email_address": "jane@example.com"}
+    encoded = (
+        base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    )
+
+    assert _decode_prefill_b64(encoded) == payload
+
+
+async def test_line_session_start_includes_prefill_metadata():
+    from app.line_session_client import LineSessionClient
+
+    sent = {}
+
+    class FakeWebSocket:
+        async def send(self, raw):
+            sent["payload"] = json.loads(raw)
+
+    async def fake_connect(*args, **kwargs):
+        return FakeWebSocket()
+
+    client = LineSessionClient(
+        "ws://example.test/ws",
+        MagicMock(spec=["info", "debug", "warning", "error", "call_sid"]),
+        call_id="CA123",
+        from_number="+12135550100",
+        to_number="+18005550100",
+        metadata={
+            "caller_from": "+12135550100",
+            "customer_prefill": {"first_name": "Jane"},
+            "customer_prefill_fields": ["first_name"],
+        },
+    )
+    client._receive_loop = AsyncMock()
+
+    with patch("app.line_session_client.websockets.connect", new=fake_connect):
+        await client.connect()
+
+    assert sent["payload"]["from"] == "+12135550100"
+    assert sent["payload"]["metadata"]["caller_from"] == "+12135550100"
+    assert sent["payload"]["metadata"]["customer_prefill"] == {"first_name": "Jane"}
+    assert sent["payload"]["metadata"]["customer_prefill_fields"] == ["first_name"]
 
 async def test_bridge_routes_handled_to_deterministic():
     """When heuristic returns handled=True, send_user_transcript must NOT be called."""
@@ -74,6 +122,55 @@ async def test_bridge_routes_not_handled_to_llm():
 
     mock_line.send_user_transcript.assert_called_once_with("some ambiguous text")
     mock_line.mark_deterministic_turn.assert_not_called()
+
+
+async def test_bridge_allows_yes_for_on_file_confirmation_to_deterministic():
+    from agent.schema import HeuristicResult
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+    bridge.call_sid = "CA_test"
+    bridge._deterministic_answer_guard_until = 0.0
+    bridge._line = AsyncMock()
+    bridge._line.mark_deterministic_turn = AsyncMock()
+    bridge._line.enqueue_clarification_for_current_ask = AsyncMock()
+    bridge._line.inject_ask_next_hint = MagicMock()
+    bridge._cancel_caller_response_watchdog = MagicMock()
+    bridge._cancel_deterministic_followup_task = MagicMock()
+    bridge._schedule_deterministic_followup_ask = MagicMock()
+    bridge._send_deterministic_goodbye = AsyncMock()
+    bridge._log_pipeline_debug = MagicMock()
+
+    handled = HeuristicResult(
+        handled=True,
+        ask_next="What is the property type: primary, secondary, or investment?",
+        handled_field="prefill_confirmation",
+        stage="property",
+    )
+    missing = (
+        '[BROWSER STAGE: PROPERTY] Still needed: ownership type. '
+        'Ask next: "Got it, I\'ve saved your address. Regarding ownership, '
+        'I have you down as the sole owner. Is that still correct?"'
+    )
+
+    with (
+        patch("app.twilio_line_bridge.broadcast_stt", new_callable=AsyncMock),
+        patch("app.twilio_line_bridge.path2_set_debug_call", return_value=None),
+        patch("app.twilio_line_bridge.path2_reset_debug_call"),
+        patch("app.twilio_line_bridge.path2_debug_log", new_callable=AsyncMock),
+        patch("app.twilio_line_bridge.log_intake_event"),
+        patch("app.twilio_line_bridge.append_transcript_turn"),
+        patch("app.twilio_line_bridge.get_missing_fields", return_value=missing),
+        patch(
+            "app.twilio_line_bridge.apply_voice_intake_heuristics_before_line",
+            new_callable=AsyncMock,
+            return_value=handled,
+        ),
+    ):
+        await TwilioLineBridge._handle_final_transcript(bridge, "Yes.")
+
+    bridge._line.enqueue_clarification_for_current_ask.assert_not_called()
+    bridge._line.mark_deterministic_turn.assert_called_once_with(handled.ask_next)
 
 
 async def test_bridge_triggers_deterministic_goodbye_on_terminal_deterministic():
@@ -164,6 +261,18 @@ async def test_bridge_schedules_followup_ask_after_navigation():
     bridge._line.mark_deterministic_turn.assert_called_once_with(_for_sale_ask)
 
 
+async def test_bridge_skips_finals_when_deterministic_goodbye_in_progress():
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+    bridge._ending_call = True
+    bridge.call_logger = MagicMock(spec=["info", "debug", "warning", "error", "call_sid"])
+
+    await TwilioLineBridge._handle_final_transcript(bridge, "Yes")
+
+    bridge.call_logger.info.assert_called_once()
+
+
 def test_status_check_utterance_short_circuit_match():
     from app.line_session_client import LineSessionClient
     from app.twilio_line_bridge import _is_status_check_utterance
@@ -196,6 +305,16 @@ def test_status_check_utterance_short_circuit_match():
     assert lsc("sole owner") is False
 
 
+def test_bridge_allows_llm_fallback_for_supported_current_asks():
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    income_missing = (
+        '[BROWSER STAGE: INCOME] Still needed: annual pre-tax income '
+        'Ask next: "What\'s your annual pre-tax income?"'
+    )
+    assert TwilioLineBridge._allow_llm_fallback_for_current_ask(income_missing) is True
+
+
 def test_looks_like_answer_for_current_field_rejects_non_answer():
     from agent.state_manager import looks_like_answer_for_current_field
 
@@ -216,7 +335,7 @@ def test_clarification_for_ownership_is_not_same_question():
 
     ask = "What is the ownership type: sole or joint?"
     clarification = LineSessionClient._clarification_for_ask(ask)
-    assert clarification == "I didn't catch ownership type. You can say sole or joint."
+    assert clarification == "Sorry, I missed that. Are you the sole owner, or is it joint?"
     assert clarification != ask
 
 
@@ -235,7 +354,7 @@ async def test_enqueue_status_check_response_includes_current_ask():
     client.tts_queue = asyncio.Queue()
 
     assert await client.enqueue_status_check_response() is True
-    assert client.tts_queue.get_nowait() == "Yes, I'm here. What is your date of birth?"
+    assert client.tts_queue.get_nowait() == "What is your date of birth?"
 
 
 def test_expanded_consent_prompts():
@@ -277,6 +396,7 @@ def test_barge_in_partial_filter_accepts_real_answers_not_noise():
     fn = TwilioLineBridge._looks_like_meaningful_barge_in
     assert fn("sole owner") is True
     assert fn("yes") is True
+    assert fn("agree") is True
     assert fn("1") is True
     assert fn(".") is False
     assert fn("um") is False
@@ -499,7 +619,7 @@ async def test_pending_low_confidence_no_clears_candidate():
 
     assert state.address_line_1 is None
     assert has_pending_low_confidence_confirmation() is False
-    assert "What is the property address?" in result
+    assert "Can you tell me the property address?" in result
     _clear_pending_low_confidence_confirmation()
 
 
@@ -670,7 +790,7 @@ def test_caller_response_watchdog_queues_repeat(monkeypatch):
 
         queued = bridge._line.tts_queue.get_nowait()
         assert queued == (
-            "I couldn't hear you, can you say that again? "
+            "I may have missed you there. Could you say that one more time? "
             "What is your date of birth?"
         )
         bridge.call_logger.info.assert_called_once()
@@ -702,7 +822,7 @@ def test_repeated_clarification_escalates_to_spelling_prompt():
 
         third = client._enqueue_ask_if_needed.call_args_list[2].args[0]
         assert third == (
-            "I still didn't catch last name. Please spell it slowly, "
+            "I'm still missing the last name. Could you spell it slowly, "
             "letter by letter."
         )
 
