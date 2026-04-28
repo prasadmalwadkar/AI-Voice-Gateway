@@ -71,12 +71,15 @@ class HelocApplicationState(BaseModel):
     # 7. Legal & Consents
     agreed_to_privacy_policy: Optional[bool] = Field(
         None,
-        description="Must be True. User verbally agrees to Privacy Policy, Terms of Service, and soft credit pull (one consent on the form).",
+        description="Must be True. User agrees to Privacy Policy, Terms of Service, and soft credit pull (first checkbox, consent-1).",
     )
-    agreed_to_commerce_communication: Optional[bool] = Field(None, description="Optional. User agrees to marketing/commerce communications.")
+    agreed_to_commerce_communication: Optional[bool] = Field(
+        None,
+        description="Required on form. User agrees to electronic communications (second checkbox, consent-2).",
+    )
     agreed_to_credit_pull: Optional[bool] = Field(
         None,
-        description="Must be True. Same checkbox step as privacy/terms for WCL; set together with agreed_to_privacy_policy when user consents once.",
+        description="Derived with agreed_to_privacy_policy: soft credit is part of the first checkbox (consent-1), not a separate DOM control.",
     )
     
     # 8. Account Security (Auto-generated)

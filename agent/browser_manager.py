@@ -155,13 +155,14 @@ class BrowserManager:
         "email_address": "input[data-test-id='email']",
         "password": "input[data-test-id='password']",
         "confirm_password": "input[data-test-id='confirm-password']",
+        # consent-1: privacy + terms + soft credit (single checkbox).
+        # consent-2: electronic communications only.
         "agreed_to_privacy_policy": "input[data-test-id='consent-1']",
-        "agreed_to_commerce_communication": "input[data-test-id='consent-3']",
-        "agreed_to_credit_pull": "input[data-test-id='consent-2']",
+        "agreed_to_commerce_communication": "input[data-test-id='consent-2']",
     }
 
     # Fields that are visible but not required for navigation ("Continue")
-    OPTIONAL_FIELDS = ["apt_suite", "other_income", "middle_name", "suffix", "agreed_to_commerce_communication"]
+    OPTIONAL_FIELDS = ["apt_suite", "other_income", "middle_name", "suffix"]
 
     # Ordered URL substring → required fields for that step (first match wins).
     # ``register`` must be last — it appears as a substring on several paths.
@@ -171,8 +172,8 @@ class BrowserManager:
         ("legal-name", ["first_name", "last_name"]),
         ("birthdate", ["date_of_birth"]),
         ("phone-and-email", ["mobile_phone_number", "email_address"]),
-        ("set-password", ["agreed_to_privacy_policy", "agreed_to_credit_pull", "password", "confirm_password"]),
-        ("consent", ["agreed_to_privacy_policy", "agreed_to_credit_pull", "password", "confirm_password"]),
+        ("set-password", ["agreed_to_privacy_policy", "agreed_to_commerce_communication", "password", "confirm_password"]),
+        ("consent", ["agreed_to_privacy_policy", "agreed_to_commerce_communication", "password", "confirm_password"]),
         # WCL /register: dropdown address pick fills these inputs in the live browser;
         # we hydrate/verify so Continue enables—user never types them in voice.
         # https://heloc.westcapitallending.com/account/heloc/register
@@ -190,7 +191,7 @@ class BrowserManager:
         "name": ("middle_name", "suffix"),
         "birthday": (),
         "contact": (),
-        "consent": ("agreed_to_commerce_communication",),
+        "consent": (),
     }
 
     def __init__(self) -> None:
