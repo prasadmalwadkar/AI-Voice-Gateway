@@ -41,6 +41,10 @@ Create **`.env`** in the repo root (never commit). Common variables:
 | `DEEPGRAM_STT_KEYTERMS` | Optional comma-separated Deepgram keyterms, e.g. domain words or names |
 | `CARTESIA_TTS_SPEED`, `CARTESIA_TTS_VOLUME` | Sonic tuning ([`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)) |
 | `TWILIO_CALLER_RESPONSE_WATCHDOG_SECS` | Seconds to wait after an agent prompt before repeating it if no user final is handled; default `10.0` |
+| `TWILIO_PREFILL_BY_PHONE_JSON` | Optional JSON string: map **caller phone** (digits, `+1…`, etc.) → object of HELOC field keys (`address_line_1`, `first_name`, …). Used on `GET /voice` / `POST /voice` to prefill before Line starts. |
+| `TWILIO_PREFILL_BY_PHONE_FILE` | Optional filesystem path to the **same** JSON shape when the env var above is empty (e.g. `data/prefill/customers.json` locally; file is gitignored). |
+| `PATH2_WAIT_FOR_ADDRESS_SYNC` | Default `1`: after `address_line_1` updates on the property stage, state may wait for browser sync. Set `0`/`false`/`no` to skip that wait. |
+| `PATH2_DETERMINISTIC_ADDRESS` | Default `0`. Set `1`/`true`/`yes` to use deterministic address parsing in state (see `agent/state_manager.py`). |
 
 Optional observability:
 
@@ -51,6 +55,10 @@ Optional observability:
 | LLM per-turn state snapshot | On by default; optional disable via env — see [`agent/main_agent.py`](agent/main_agent.py) |
 
 [`run.py`](run.py) loads `.env` before the app starts.
+
+### Customer prefill
+
+For **Twilio**, [`app/main.py`](app/main.py) can attach known customer fields to the media-stream `<Stream>` as **base64 JSON** (`prefill_b64`) plus `caller_from` / `caller_to`. Values come from (in order): **phone-keyed** lookup (`TWILIO_PREFILL_BY_PHONE_JSON` or `_FILE`), then **query string** / **form** fields on `/voice` (allowed keys include `address_line_1`, `first_name`, …), then `prefill_json` / `prefill_b64` query parameters for ad-hoc payloads. [`TwilioLineBridge`](app/twilio_line_bridge.py) decodes `prefill_b64` into `customer_prefill` and passes it in **call metadata** to [`LineSessionClient`](app/line_session_client.py); [`agent/main_agent.py`](agent/main_agent.py) calls `set_customer_prefill` so [`agent/state_manager.py`](agent/state_manager.py) can seed state and drive **on-file confirmation** before saving. Tracked example shape: [`data/prefill/customers.example.json`](data/prefill/customers.example.json).
 
 ## Run the server
 
