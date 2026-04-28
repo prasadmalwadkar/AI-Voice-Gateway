@@ -23,6 +23,7 @@ class LineSessionClient:
 
     # Re-ask same pending question without replaying long scripted prompts (watchdogs / status).
     BRIEF_REPEAT_PROMPT = "Can you repeat that?"
+    STATUS_ACK_PREFIX = "Yes, I'm here."
 
     def __init__(
         self,
@@ -255,6 +256,40 @@ class LineSessionClient:
             self._debounce_task.cancel()
         self._debounce_task = asyncio.create_task(self._debounced_flush(), name="line_tts_debounce")
 
+    async def clear_pending_speech(self, *, reason: str) -> None:
+        """Drop buffered/queued agent speech after caller takes the floor."""
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+            try:
+                await self._debounce_task
+            except asyncio.CancelledError:
+                pass
+            self._debounce_task = None
+        if (
+            self._pending_ask_fallback_task
+            and not self._pending_ask_fallback_task.done()
+        ):
+            self._pending_ask_fallback_task.cancel()
+            try:
+                await self._pending_ask_fallback_task
+            except asyncio.CancelledError:
+                pass
+            self._pending_ask_fallback_task = None
+        self._text_buffer = ""
+        self._fallback_spoken_text = ""
+        drained = 0
+        while True:
+            try:
+                self.tts_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained:
+            self._call_logger.info(
+                f"Cleared pending TTS queue | reason={reason} drained={drained}",
+                event="line.session.tts_queue_cleared",
+            )
+
     async def _flush_now(self) -> None:
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
@@ -471,7 +506,7 @@ class LineSessionClient:
                 "tree",
                 "free",
             }
-        if "sole or joint owner" in a:
+        if "sole or joint" in a:
             pu = u.strip().rstrip(".,!?").lower()
             return (
                 any(k in u for k in ("sole", "soul", "joint", "one", "two"))
@@ -654,37 +689,20 @@ class LineSessionClient:
         except asyncio.CancelledError:
             raise
 
-    @staticmethod
-    def _clarify_prompt_for_ask(ask: str) -> str:
-        """Use short disambiguation prompts after no-response/garbled turns."""
-        a = (ask or "").strip()
-        low = a.lower()
-        if "first name" in low:
-            return "Did not catch clearly. Say first name only."
-        if "last name" in low:
-            return "Did not catch clearly. Say last name only."
-        if "date of birth" in low:
-            return "Did not catch clearly. Say date of birth, month day year."
-        if "property address" in low:
-            return "Did not catch clearly. Say street address only."
-        if "email" in low:
-            return "Did not catch clearly. Say email slowly."
-        if "phone" in low:
-            return "Did not catch clearly. Say phone number digit by digit."
-        return a or "Could you repeat that?"
-
     async def send_user_speaking_start(self) -> None:
         """Barge-in: cancel agent generation (ConversationRunner cancel_filter)."""
         if not self._ws or self._closed:
             return
         await self._ws.send(json.dumps({"type": "user_state", "value": "speaking"}))
 
-    def inject_ask_next_hint(self, ask: str) -> None:
+    def inject_ask_next_hint(self, ask: str, *, schedule_fallback: bool = True) -> None:
         """Seed fallback ask from non-Line tool paths (pre-Line heuristics)."""
         q = (ask or "").strip()
         if not q:
             return
         self._last_tool_ask = q
+        if not schedule_fallback:
+            return
         if (
             self._pending_ask_fallback_task
             and not self._pending_ask_fallback_task.done()
@@ -697,6 +715,7 @@ class LineSessionClient:
 
     async def mark_deterministic_turn(self, ask_next: Optional[str]) -> None:
         """Reset turn state and speak ask_next without involving LLM."""
+        await self.clear_pending_speech(reason="deterministic_turn")
         self._fallback_spoken_text = ""
         self._ask_spoken_this_turn = False
         self._last_tool_ask = ""
@@ -719,11 +738,56 @@ class LineSessionClient:
                 ask_next, event="line.session.deterministic_ask"
             )
 
-    async def enqueue_brief_repeat_for_pending_ask(self) -> bool:
-        """TTS only: short repeat line. Does not change ``_last_tool_ask``."""
+    async def enqueue_status_check_response(self) -> bool:
+        """Presence check response: acknowledge audibly, then restate current ask."""
+        ask = (self._last_tool_ask or "").strip()
+        response = f"{self.STATUS_ACK_PREFIX} {ask}" if ask else self.STATUS_ACK_PREFIX
+        self._ask_spoken_this_turn = False
         return await self._enqueue_ask_if_needed(
-            self.BRIEF_REPEAT_PROMPT,
-            event="line.session.brief_repeat_pending_ask",
+            response,
+            event="line.session.status_check_response",
+        )
+
+    @staticmethod
+    def _clarification_for_ask(ask: str) -> str:
+        low = (ask or "").strip().lower()
+        if "property address" in low or "street address" in low:
+            return "I didn't catch that correctly. Please repeat the street address."
+        if "ownership type" in low or "sole or joint" in low:
+            return "I didn't catch ownership type. You can say sole or joint."
+        if "property type" in low or "primary, secondary, or investment" in low:
+            return (
+                "I didn't catch property type. "
+                "You can say primary, secondary, or investment."
+            )
+        if "currently for sale" in low or "for sale" in low:
+            return "I didn't catch that. Is it currently for sale?"
+        if "annual pre-tax income" in low or "annual income" in low:
+            return "I didn't catch annual income. Please say the dollar amount."
+        if "other income" in low:
+            return "I didn't catch other income. You can say an amount or none."
+        if "primary income source" in low or "income source" in low:
+            return "I didn't catch income source. Please say it another way."
+        if "first name" in low:
+            return "I didn't catch first name. Please say first name only."
+        if "last name" in low:
+            return "I didn't catch last name. Please say last name only."
+        if "date of birth" in low:
+            return "I didn't catch date of birth. Please say month, day, and year."
+        if "phone" in low:
+            return "I didn't catch phone number. Please say all ten digits."
+        if "email" in low:
+            return "I didn't catch email. Please say it slowly."
+        return "I didn't catch an answer. Please say it another way."
+
+    async def enqueue_clarification_for_current_ask(self) -> bool:
+        """Clarify invalid/noisy answer without replacing current Ask next."""
+        ask = (self._last_tool_ask or "").strip()
+        response = self._clarification_for_ask(ask)
+        self._ask_spoken_this_turn = False
+        return await self._enqueue_ask_if_needed(
+            response,
+            event="line.session.non_answer_clarification",
         )
 
     async def send_user_transcript(self, transcript: str) -> None:
@@ -742,10 +806,7 @@ class LineSessionClient:
         # Status pings ("you there?", "what's next?") should repeat current ask
         # locally and never reopen LLM context for stale/out-of-stage questions.
         if ask_l and self._is_status_check_utterance(lower_text):
-            await self._enqueue_ask_if_needed(
-                self.BRIEF_REPEAT_PROMPT,
-                event="line.session.status_check_repeat_ask",
-            )
+            await self.enqueue_status_check_response()
             return
         frames = [
             {"type": "user_state", "value": "speaking"},
@@ -789,22 +850,8 @@ class LineSessionClient:
 
     @staticmethod
     def _is_status_check_utterance(text: str) -> bool:
-        t = (text or "").strip().lower()
-        if not t:
-            return False
-        t = re.sub(r"[^\w\s?']", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        patterns = (
-            r"\b(you there|are you there|still there|hello)\b",
-            r"\b(what'?s next|next question|go ahead|continue)\b",
-            r"\b(what'?s the question|what is the question|which question)\b",
-            r"\b(repeat|say that again|say again|come again)\b",
-            r"\b(i didn'?t hear|didn'?t catch|what did you say)\b",
-            r"\b(i'?m lost|i'?m confused|what do you need|what do i do)\b",
-            r"\b(pardon|excuse me|sorry what)\b",
-            r"\b(thank you|thanks)\b",
-        )
-        return any(re.search(p, t) for p in patterns)
+        from agent.state_manager import transcript_is_status_check
+        return transcript_is_status_check(text)
 
     async def close(self) -> None:
         self._closed = True
