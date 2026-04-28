@@ -28,9 +28,14 @@ Implementation:
 """
 
 import atexit
+import base64
+import html
+import json
 import logging
 import os
 import uuid
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -50,6 +55,139 @@ from app.path2_transcript_debug import (
 setup_logging()
 atexit.register(logging.shutdown)
 module_logger = logging.getLogger("voip.main")
+
+_PREFILL_QUERY_FIELDS = frozenset(
+    {
+        "address_line_1",
+        "apt_suite",
+        "city",
+        "state",
+        "zipcode",
+        "ownership_type",
+        "occupancy_type",
+        "property_type",
+        "is_currently_for_sale",
+        "annual_pre_tax_income",
+        "other_income",
+        "primary_source_of_income",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "suffix",
+        "date_of_birth",
+        "mobile_phone_number",
+        "phone",
+        "phone_number",
+        "email_address",
+        "email",
+    }
+)
+
+
+def _normalize_phone_key(phone: str | None) -> list[str]:
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not digits:
+        return []
+    keys = [digits]
+    if len(digits) == 10:
+        keys.extend([f"1{digits}", f"+1{digits}"])
+    elif len(digits) == 11 and digits.startswith("1"):
+        keys.extend([digits[1:], f"+{digits}"])
+    elif phone and phone.startswith("+"):
+        keys.append(phone.strip())
+    return list(dict.fromkeys(keys))
+
+
+def _decode_json_payload(value: str, *, b64: bool = False) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        raw = value
+        if b64:
+            padding = "=" * (-len(value) % 4)
+            raw = base64.urlsafe_b64decode((value + padding).encode()).decode()
+        data = json.loads(raw)
+    except Exception as e:
+        module_logger.warning("Ignoring invalid customer prefill payload: %s", e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_prefill_lookup() -> dict[str, Any]:
+    raw = os.getenv("TWILIO_PREFILL_BY_PHONE_JSON", "").strip()
+    if not raw:
+        path = os.getenv("TWILIO_PREFILL_BY_PHONE_FILE", "").strip()
+        if path:
+            try:
+                raw = Path(path).read_text(encoding="utf-8")
+            except OSError as e:
+                module_logger.warning("Could not read TWILIO_PREFILL_BY_PHONE_FILE: %s", e)
+                raw = ""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        module_logger.warning("Invalid TWILIO_PREFILL_BY_PHONE_JSON: %s", e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _prefill_for_phone(phone: str | None) -> dict[str, Any]:
+    lookup = _load_prefill_lookup()
+    for key in _normalize_phone_key(phone):
+        value = lookup.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
+async def _request_params(request: Request) -> dict[str, str]:
+    params = {str(k): str(v) for k, v in request.query_params.items()}
+    if request.method.upper() == "POST":
+        try:
+            form = await request.form()
+            params.update({str(k): str(v) for k, v in form.items()})
+        except Exception as e:
+            module_logger.debug("No parseable /voice form body: %s", e)
+    return params
+
+
+def _query_prefill(params: dict[str, str]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    payload.update(_decode_json_payload(params.get("prefill_json", "")))
+    payload.update(_decode_json_payload(params.get("prefill_b64", ""), b64=True))
+    for key, value in params.items():
+        if key in _PREFILL_QUERY_FIELDS and value != "":
+            payload[key] = value
+    return payload
+
+
+def _stream_parameter(name: str, value: str) -> str:
+    return (
+        f'<Parameter name="{html.escape(name, quote=True)}" '
+        f'value="{html.escape(value, quote=True)}" />'
+    )
+
+
+def _build_stream_parameters(params: dict[str, str]) -> tuple[str, list[str]]:
+    caller_from = params.get("From") or params.get("caller_from") or ""
+    caller_to = params.get("To") or params.get("caller_to") or ""
+    payload = _prefill_for_phone(caller_from)
+    payload.update(_query_prefill(params))
+    field_names = sorted(payload.keys())
+
+    stream_params = []
+    if caller_from:
+        stream_params.append(_stream_parameter("caller_from", caller_from))
+    if caller_to:
+        stream_params.append(_stream_parameter("caller_to", caller_to))
+    if payload:
+        raw_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        encoded = base64.urlsafe_b64encode(raw_json.encode()).decode().rstrip("=")
+        stream_params.append(_stream_parameter("prefill_b64", encoded))
+        stream_params.append(_stream_parameter("prefill_fields", ",".join(field_names)))
+    return "".join(stream_params), field_names
 
 
 # =============================================================================
@@ -90,6 +228,7 @@ except AttributeError:
 # =============================================================================
 
 @app.get("/voice", response_class=Response)
+@app.post("/voice", response_class=Response)
 async def voice_twiml(request: Request):
     """
     Return TwiML instructions that tell Twilio to open a bidirectional
@@ -116,17 +255,25 @@ async def voice_twiml(request: Request):
     # Always use wss:// — Twilio requires TLS for media streams.
     # Even in local dev with ngrok, the tunnel provides TLS.
     ws_url = f"wss://{host}/media-stream"
+    params = await _request_params(request)
+    stream_parameters, prefill_fields = _build_stream_parameters(params)
 
     twiml_response = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Connect>"
-        f'<Stream url="{ws_url}" />'
+        f'<Stream url="{html.escape(ws_url, quote=True)}">'
+        f"{stream_parameters}"
+        "</Stream>"
         "</Connect>"
         "</Response>"
     )
 
-    module_logger.info(f"Serving TwiML — stream URL: {ws_url}")
+    module_logger.info(
+        "Serving TwiML — stream URL: %s | prefill_fields=%s",
+        ws_url,
+        prefill_fields,
+    )
 
     return Response(
         content=twiml_response,
