@@ -10,7 +10,7 @@ import json
 import os
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import websockets
 from websockets.client import WebSocketClientProtocol
@@ -21,9 +21,11 @@ from app.path2_transcript_debug import broadcast_stt
 class LineSessionClient:
     """Async client for the Line VoiceAgentApp websocket protocol."""
 
-    # Re-ask same pending question without replaying long scripted prompts (watchdogs / status).
-    BRIEF_REPEAT_PROMPT = "Can you repeat that?"
-    STATUS_ACK_PREFIX = "Yes, I'm here."
+    # Re-ask same pending question without replaying long scripted prompts.
+    BRIEF_REPEAT_PROMPT = "Could you say that one more time?"
+    # Short hold line when model/tool work is still in-flight; avoid false "missed that".
+    BUSY_HOLD_PROMPT = "One sec while I process that."
+    STATUS_ACK_PREFIX = "I'm here. Let's keep going."
 
     def __init__(
         self,
@@ -33,6 +35,7 @@ class LineSessionClient:
         call_id: str,
         from_number: str,
         to_number: str,
+        metadata: Optional[dict[str, Any]] = None,
         debounce_ms: Optional[float] = None,
     ) -> None:
         self._ws_url = ws_url
@@ -40,6 +43,7 @@ class LineSessionClient:
         self._call_id = call_id
         self._from_number = from_number
         self._to_number = to_number
+        self._metadata = dict(metadata or {})
         # Slightly longer debounce = fewer TTS utterances on streamed tokens (Sonic per call).
         self._debounce_ms = (
             debounce_ms
@@ -100,6 +104,7 @@ class LineSessionClient:
             ping_timeout=20,
             max_size=2**20,
         )
+        metadata = {"source": "twilio-path2-bridge", **self._metadata}
         start = {
             "type": "start",
             "call_id": self._call_id,
@@ -107,7 +112,7 @@ class LineSessionClient:
             "from": self._from_number,
             "to": self._to_number,
             "agent": {},
-            "metadata": {"source": "twilio-path2-bridge"},
+            "metadata": metadata,
         }
         await self._ws.send(json.dumps(start))
         self._recv_task = asyncio.create_task(self._receive_loop(), name="line_session_recv")
@@ -680,7 +685,7 @@ class LineSessionClient:
             ask = (self._last_tool_ask or "").strip()
             if not ask:
                 return
-            to_speak = self.BRIEF_REPEAT_PROMPT
+            to_speak = self.BUSY_HOLD_PROMPT
             emitted = await self._enqueue_ask_if_needed(
                 to_speak,
                 event="line.session.turn_watchdog",
@@ -688,7 +693,7 @@ class LineSessionClient:
             if not emitted:
                 return
             self._call_logger.info(
-                f"Line watchdog brief repeat (pending ask was): {ask[:80]}",
+                f"Line watchdog busy-hold emitted (pending ask was): {ask[:80]}",
                 event="line.session.turn_watchdog",
             )
         except asyncio.CancelledError:
@@ -702,7 +707,7 @@ class LineSessionClient:
         try:
             await asyncio.sleep(self._no_response_watchdog_sec)
             pending = (self._last_tool_ask or "").strip()
-            to_speak = self.BRIEF_REPEAT_PROMPT
+            to_speak = pending or self.BRIEF_REPEAT_PROMPT
             emitted = await self._enqueue_ask_if_needed(
                 to_speak,
                 event="line.session.no_response_watchdog",
@@ -771,9 +776,9 @@ class LineSessionClient:
             )
 
     async def enqueue_status_check_response(self) -> bool:
-        """Presence check response: acknowledge audibly, then restate current ask."""
+        """Repeat current ask directly for 'repeat/you there' intents."""
         ask = (self._last_tool_ask or "").strip()
-        response = f"{self.STATUS_ACK_PREFIX} {ask}" if ask else self.STATUS_ACK_PREFIX
+        response = ask if ask else self.BRIEF_REPEAT_PROMPT
         self._ask_spoken_this_turn = False
         return await self._enqueue_ask_if_needed(
             response,
@@ -784,56 +789,55 @@ class LineSessionClient:
     def _clarification_for_ask(ask: str) -> str:
         low = (ask or "").strip().lower()
         if "property address" in low or "street address" in low:
-            return "I didn't catch that correctly. Please repeat the street address."
+            return "Sorry, I missed part of that. Could you repeat the property address?"
         if "ownership type" in low or "sole or joint" in low:
-            return "I didn't catch ownership type. You can say sole or joint."
+            return "Sorry, I missed that. Are you the sole owner, or is it joint?"
         if "property type" in low or "primary, secondary, or investment" in low:
             return (
-                "I didn't catch property type. "
-                "You can say primary, secondary, or investment."
+                "Sorry, I didn't catch that. Is this primary, secondary, or investment?"
             )
         if "currently for sale" in low or "for sale" in low:
-            return "I didn't catch that. Is it currently for sale?"
+            return "Sorry, I missed that. Is the property currently listed for sale?"
         if "annual pre-tax income" in low or "annual income" in low:
-            return "I didn't catch annual income. Please say the dollar amount."
+            return "Could you say the annual income amount one more time?"
         if "other income" in low:
-            return "I didn't catch other income. You can say an amount or none."
+            return "Could you repeat that? You can say an amount or none."
         if "primary income source" in low or "income source" in low:
-            return "I didn't catch income source. Please say it another way."
+            return "Could you say the income source another way?"
         if "first name" in low:
-            return "I didn't catch first name. Please say first name only."
+            return "Could you say your first name one more time?"
         if "last name" in low:
-            return "I didn't catch last name. Please say last name only."
+            return "Could you say your last name one more time?"
         if "date of birth" in low:
-            return "I didn't catch date of birth. Please say month, day, and year."
+            return "Could you say your date of birth again: month, day, and year?"
         if "phone" in low:
-            return "I didn't catch phone number. Please say all ten digits."
+            return "Could you say the mobile number one more time, all ten digits?"
         if "email" in low:
-            return "I didn't catch email. Please say it slowly."
-        return "I didn't catch an answer. Please say it another way."
+            return "Could you say the email slowly one more time?"
+        return "Sorry, I missed that. Could you say it another way?"
 
     @staticmethod
     def _spelling_clarification_for_ask(ask: str) -> str:
         low = (ask or "").strip().lower()
         if "first name" in low:
             return (
-                "I still didn't catch first name. Please spell it slowly, "
+                "I'm still missing the first name. Could you spell it slowly, "
                 "letter by letter."
             )
         if "last name" in low:
             return (
-                "I still didn't catch last name. Please spell it slowly, "
+                "I'm still missing the last name. Could you spell it slowly, "
                 "letter by letter."
             )
         if "property address" in low or "street address" in low:
-            return "Please spell the street address slowly, one word at a time."
+            return "Could you spell the street address slowly, one word at a time?"
         if "email" in low:
-            return "Please spell the email slowly, letter by letter."
+            return "Could you spell the email slowly, letter by letter?"
         if "date of birth" in low:
-            return "Please say date of birth slowly, one word at a time."
+            return "Could you say the date of birth slowly, one part at a time?"
         if "annual pre-tax income" in low or "annual income" in low:
-            return "Please say the income slowly, one word at a time."
-        return "Please say it slowly again, or spell it if needed."
+            return "Could you say the income slowly, one part at a time?"
+        return "Could you say it slowly again, or spell it if needed?"
 
     async def enqueue_clarification_for_current_ask(self) -> bool:
         """Clarify invalid/noisy answer without replacing current Ask next."""

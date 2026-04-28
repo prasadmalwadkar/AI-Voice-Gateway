@@ -27,6 +27,7 @@ from agent.state_manager import (
     infer_email_from_transcript,
     infer_phone_from_transcript,
     infer_property_address_from_transcript,
+    infer_yes_no_from_transcript,
     looks_like_answer_for_current_field,
     reset_state,
     transcript_is_status_check,
@@ -92,7 +93,7 @@ CALLER_RESPONSE_WATCHDOG_SECS = max(
 )
 CALLER_RESPONSE_WATCHDOG_PREFIX = os.getenv(
     "TWILIO_CALLER_RESPONSE_WATCHDOG_PREFIX",
-    "I couldn't hear you, can you say that again?",
+    "I may have missed you there. Could you say that one more time?",
 ).strip()
 PIPELINE_DEBUG_ENABLED = os.getenv("TWILIO_PIPELINE_DEBUG", "1").strip().lower() in (
     "1",
@@ -151,6 +152,18 @@ def _is_status_check_utterance(text: str) -> bool:
     return transcript_is_status_check(text)
 
 
+def _decode_prefill_b64(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        padding = "=" * (-len(value) % 4)
+        raw = base64.urlsafe_b64decode((value + padding).encode()).decode()
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class TwilioLineBridge:
     """Bridge one Twilio call through STT + Line LlmAgent + Sonic TTS."""
 
@@ -164,6 +177,9 @@ class TwilioLineBridge:
 
         self.stream_sid: Optional[str] = None
         self.call_sid: Optional[str] = None
+        self.caller_from: Optional[str] = None
+        self.caller_to: Optional[str] = None
+        self.customer_prefill: dict[str, Any] = {}
 
         self._running = False
         self._session_ready = False
@@ -196,6 +212,7 @@ class TwilioLineBridge:
         self._last_barge_at = 0.0
         self._barge_in_accept_final_until = 0.0
         self._deterministic_answer_guard_until = 0.0
+        self._ending_call = False
         self._current_tts_text = ""
         self._caller_response_prompt = ""
         self._caller_response_watchdog_seq = 0
@@ -230,10 +247,24 @@ class TwilioLineBridge:
                     start_data = message.get("start", {})
                     self.stream_sid = start_data.get("streamSid")
                     self.call_sid = start_data.get("callSid", self.call_sid)
+                    custom_parameters = (
+                        start_data.get("customParameters")
+                        or start_data.get("custom_parameters")
+                        or {}
+                    )
+                    if isinstance(custom_parameters, dict):
+                        self.caller_from = custom_parameters.get("caller_from")
+                        self.caller_to = custom_parameters.get("caller_to")
+                        self.customer_prefill = _decode_prefill_b64(
+                            custom_parameters.get("prefill_b64")
+                        )
                     if self.call_sid:
                         self.call_logger.call_sid = self.call_sid
                     self.call_logger.info(
-                        f"Media stream started | stream_sid={self.stream_sid}",
+                        (
+                            f"Media stream started | stream_sid={self.stream_sid} "
+                            f"prefill_fields={sorted(self.customer_prefill.keys())}"
+                        ),
                         event="twilio.stream.start",
                         stream_sid=self.stream_sid,
                     )
@@ -297,8 +328,15 @@ class TwilioLineBridge:
         line_url = f"ws://127.0.0.1:{port}/ws"
 
         call_id = self.call_sid or str(uuid.uuid4())
-        from_num = self.call_sid or "unknown"
-        to_num = os.getenv("TWILIO_PATH2_TO_NUMBER", "west-capital")
+        from_num = self.caller_from or self.call_sid or "unknown"
+        to_num = self.caller_to or os.getenv("TWILIO_PATH2_TO_NUMBER", "west-capital")
+        metadata = {
+            "source": "twilio-path2-bridge",
+            "caller_from": self.caller_from,
+            "caller_to": self.caller_to,
+            "customer_prefill": self.customer_prefill,
+            "customer_prefill_fields": sorted(self.customer_prefill.keys()),
+        }
 
         stt_provider = _configured_stt_provider()
         self._stt = _create_stt_session(self.call_logger)
@@ -310,6 +348,7 @@ class TwilioLineBridge:
             call_id=call_id,
             from_number=from_num,
             to_number=to_num,
+            metadata=metadata,
         )
         await self._line.connect()
 
@@ -455,6 +494,8 @@ class TwilioLineBridge:
             return False
         if re.fullmatch(r"[-.,?!]+", t):
             return False
+        if infer_yes_no_from_transcript(t) is not None:
+            return True
         if path2_stt_final_is_drop_noise(
             t,
             preserve_so_for_ownership_ask=preserve_so_for_ownership_ask,
@@ -901,7 +942,15 @@ class TwilioLineBridge:
                             event="path2.stt.echo_bypass_after_barge",
                         )
 
-                    if path2_stt_final_is_drop_noise(
+                    missing_for_noise_gate = get_missing_fields() or ""
+                    preserve_yes_no = (
+                        infer_yes_no_from_transcript(text) is not None
+                        and looks_like_answer_for_current_field(
+                            text,
+                            missing_for_noise_gate,
+                        )
+                    )
+                    if not preserve_yes_no and path2_stt_final_is_drop_noise(
                         text,
                         preserve_so_for_ownership_ask=self._ownership_ask_active(),
                     ):
@@ -951,6 +1000,12 @@ class TwilioLineBridge:
                 )
 
     async def _handle_final_transcript(self, text: str) -> None:
+        if getattr(self, "_ending_call", False):
+            self.call_logger.info(
+                "Skipping STT final while deterministic goodbye is in progress",
+                event="path2.stt.skip_ending_call",
+            )
+            return
         now = time.monotonic()
         if now < self._deterministic_answer_guard_until:
             self.call_logger.debug(
@@ -992,7 +1047,7 @@ class TwilioLineBridge:
             append_transcript_turn(self.call_sid or "", "user", text)
             missing_snapshot = get_missing_fields() or ""
             ask_from_missing = self._extract_ask_next(missing_snapshot)
-            if ask_from_missing and _is_status_check_utterance(text) and self._line:
+            if _is_status_check_utterance(text) and self._line:
                 self._log_pipeline_debug(
                     (
                         "Status-check short-circuit before deterministic parsing "
@@ -1000,25 +1055,11 @@ class TwilioLineBridge:
                     ),
                     event="path2.status_check.shortcircuit",
                 )
-                self._line.inject_ask_next_hint(ask_from_missing, schedule_fallback=False)
+                if ask_from_missing:
+                    self._line.inject_ask_next_hint(
+                        ask_from_missing, schedule_fallback=False
+                    )
                 await self._line.enqueue_status_check_response()
-                return
-            if (
-                ask_from_missing
-                and self._line
-                and not has_pending_low_confidence_confirmation()
-                and not transcript_requests_intake_default(text)
-                and not looks_like_answer_for_current_field(text, missing_snapshot)
-            ):
-                self._log_pipeline_debug(
-                    (
-                        "Non-answer clarification before Line/LLM "
-                        f"| text='{text[:120]}' ask='{ask_from_missing}'"
-                    ),
-                    event="path2.non_answer.clarify",
-                )
-                self._line.inject_ask_next_hint(ask_from_missing, schedule_fallback=False)
-                await self._line.enqueue_clarification_for_current_ask()
                 return
             result = await apply_voice_intake_heuristics_before_line(text)
             if result.handled and self._line:
@@ -1063,12 +1104,35 @@ class TwilioLineBridge:
                     total_ms=round((time.perf_counter() - t0) * 1000, 2),
                 )
             else:
+                if (
+                    ask_from_missing
+                    and self._line
+                    and not has_pending_low_confidence_confirmation()
+                    and not transcript_requests_intake_default(text)
+                    and not looks_like_answer_for_current_field(text, missing_snapshot)
+                    and not self._allow_llm_fallback_for_current_ask(missing_snapshot)
+                ):
+                    self._log_pipeline_debug(
+                        (
+                            "Non-answer clarification before Line/LLM "
+                            f"| text='{text[:120]}' ask='{ask_from_missing}'"
+                        ),
+                        event="path2.non_answer.clarify",
+                    )
+                    self._line.inject_ask_next_hint(ask_from_missing, schedule_fallback=False)
+                    await self._line.enqueue_clarification_for_current_ask()
+                    return
                 self._log_pipeline_debug(
                     "Deterministic did not handle final; forwarding to Line/LLM",
                     event="path2.stt.final_to_llm",
                 )
-                if result.ask_next and self._line:
-                    self._line.inject_ask_next_hint(result.ask_next)
+                if self._line:
+                    if ask_from_missing:
+                        self._line.inject_ask_next_hint(
+                            ask_from_missing, schedule_fallback=False
+                        )
+                    elif result.ask_next:
+                        self._line.inject_ask_next_hint(result.ask_next)
                 t0_line = time.perf_counter()
                 if self._line:
                     await self._line.send_user_transcript(text)
@@ -1098,6 +1162,7 @@ class TwilioLineBridge:
     async def _send_deterministic_goodbye(self) -> None:
         if not self._line:
             return
+        self._ending_call = True
         await self._line.tts_queue.put(DETERMINISTIC_GOODBYE_TEXT)
         self.call_logger.info(
             "Deterministic goodbye enqueued",
@@ -1110,6 +1175,35 @@ class TwilioLineBridge:
     @staticmethod
     def _extract_ask_next(text: str) -> Optional[str]:
         return _ask_from_missing_line(text) or None
+
+    @staticmethod
+    def _allow_llm_fallback_for_current_ask(missing: str) -> bool:
+        ask = (TwilioLineBridge._extract_ask_next(missing) or "").lower()
+        if not ask:
+            return True
+        markers = (
+            "property address",
+            "ownership type",
+            "sole owner",
+            "joint",
+            "primary, secondary, or investment",
+            "currently listed for sale",
+            "annual pre-tax income",
+            "other income",
+            "income source",
+            "first name",
+            "last name",
+            "date of birth",
+            "mobile",
+            "phone",
+            "email",
+            "agree",
+            "consent",
+            "on file",
+            "is that correct",
+            "is that still correct",
+        )
+        return any(m in ask for m in markers)
 
     def _cancel_deterministic_followup_task(self) -> None:
         t = self._deterministic_followup_task
