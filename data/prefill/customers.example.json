@@ -1,0 +1,14 @@
+{
+  "+12135550100": {
+    "first_name": "Jane",
+    "last_name": "Doe",
+    "mobile_phone_number": "2135550100",
+    "email_address": "jane@example.com",
+    "address_line_1": "325 West Adams Boulevard",
+    "city": "Los Angeles",
+    "state": "CA",
+    "zipcode": "90007",
+    "ownership_type": "Sole owner",
+    "occupancy_type": "Primary property"
+  }
+}

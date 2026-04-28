@@ -31,6 +31,9 @@ logs/
 # Conversation transcripts (NDJSON per call)
 data/conversations/
 
+# Local customer prefill payloads (can contain PII)
+data/prefill/customers.json
+
 # Local orchestrator session dumps only (replay JSON stays tracked)
 scripts/fixtures/voice_replays/orchestrator_runs/
 
