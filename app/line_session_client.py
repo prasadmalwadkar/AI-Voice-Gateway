@@ -75,12 +75,12 @@ class LineSessionClient:
         self._turn_watchdog_task: Optional[asyncio.Task[None]] = None
         self._turn_watchdog_sec = max(
             0.8,
-            float(os.getenv("LINE_TURN_WATCHDOG_SEC", "1.4")),
+            float(os.getenv("LINE_TURN_WATCHDOG_SEC", "2")),
         )
         # Hard guard for empty LLM turns (no tool_call + no message).
         self._no_response_watchdog_sec = max(
             1.2,
-            float(os.getenv("LINE_NO_RESPONSE_WATCHDOG_SEC", "2.4")),
+            float(os.getenv("LINE_NO_RESPONSE_WATCHDOG_SEC", "3.4")),
         )
         self._ask_dedup_window_sec = max(
             0.8,

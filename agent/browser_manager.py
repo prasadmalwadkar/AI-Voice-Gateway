@@ -27,10 +27,12 @@ Usage::
     await manager.shutdown()
 """
 
+import difflib
 import logging
 import asyncio
 import os
 import re
+import time
 from typing import Any, ClassVar, Optional
 
 from playwright.async_api import (
@@ -79,6 +81,51 @@ OCCUPANCY_ENUM_TO_WCL: dict[str, str] = {
 }
 
 
+async def _poll_autocomplete_option_count(page: Page) -> int:
+    """Wait until listbox is visible and at least one real row has text (API may lag list shell)."""
+    try:
+        max_wait_ms = int(os.getenv("WCL_ADDRESS_OPTIONS_WAIT_MS", "12000").strip() or "12000")
+    except ValueError:
+        max_wait_ms = 12000
+    max_wait_ms = max(2000, min(max_wait_ms, 45000))
+    try:
+        poll_sec = float(os.getenv("WCL_ADDRESS_OPTIONS_POLL_SEC", "0.18").strip() or "0.18")
+    except ValueError:
+        poll_sec = 0.18
+    poll_sec = max(0.08, min(poll_sec, 0.75))
+
+    deadline = time.monotonic() + max_wait_ms / 1000.0
+    opts = page.locator(SEL_FIRST_SUGGESTION)
+
+    while time.monotonic() < deadline:
+        remaining_ms = max(150, int((deadline - time.monotonic()) * 1000))
+        try:
+            await page.wait_for_selector(
+                SEL_AUTOCOMPLETE_LIST,
+                state="visible",
+                timeout=min(1800, remaining_ms),
+            )
+        except Exception:
+            await asyncio.sleep(poll_sec)
+            continue
+        try:
+            n = await opts.count()
+        except Exception:
+            n = 0
+        if n <= 0:
+            await asyncio.sleep(poll_sec)
+            continue
+        try:
+            txt = (await opts.first.text_content(timeout=2500) or "").strip()
+        except Exception:
+            txt = ""
+        if txt:
+            return n
+        await asyncio.sleep(poll_sec)
+
+    return 0
+
+
 def _format_full_address_for_autocomplete(state: HelocApplicationState) -> str:
     parts: list[str] = []
     if state.address_line_1:
@@ -102,6 +149,46 @@ def _street_city_state_key(state: HelocApplicationState) -> str:
     if state.state:
         parts.append(state.state.strip().upper())
     return "|".join(parts)
+
+
+def _normalize_address_match(s: str) -> str:
+    """Uppercase alphanumerics + spaces for fuzzy compare."""
+    s = re.sub(r"[^\w\s]", " ", (s or "").upper())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _first_street_number(s: str) -> Optional[str]:
+    m = re.search(r"\b(\d{1,7})\b", (s or "").strip())
+    return m.group(1) if m else None
+
+
+def _score_address_suggestion(
+    suggestion: str,
+    typed_full: str,
+    ranking_hints: list[str],
+) -> float:
+    """Higher = better match; combines fuzzy ratio + street-number agreement."""
+    sug_n = _normalize_address_match(suggestion)
+    if not sug_n:
+        return 0.0
+    probes: list[str] = [_normalize_address_match(typed_full)]
+    for h in ranking_hints:
+        h = (h or "").strip()
+        if h:
+            probes.append(_normalize_address_match(h))
+    probes = [p for p in probes if p]
+    base = max((difflib.SequenceMatcher(None, sug_n, p).ratio() for p in probes), default=0.0)
+    bonus = 0.0
+    sn = _first_street_number(suggestion)
+    if sn:
+        for probe in [typed_full] + ranking_hints:
+            if not probe:
+                continue
+            pn = _first_street_number(str(probe))
+            if pn and sn == pn:
+                bonus = 0.22
+                break
+    return min(1.0, base + bonus)
 
 
 def _zip_from_autocomplete_suggestion(text: str) -> Optional[str]:
@@ -202,6 +289,7 @@ class BrowserManager:
         self._is_running: bool = False
         # Dedupe autocomplete on street+city+state only (not zip — site fills zip from suggestion).
         self._last_address_street_city_state_key: Optional[str] = None
+        self.address_not_found: bool = False
 
     # ------------------------------------------------------------------
     # Properties — safe accessors for the active page
@@ -432,6 +520,7 @@ class BrowserManager:
         state: HelocApplicationState,
         *,
         user_updated_address: bool,
+        address_ranking_hints: Optional[list[str]] = None,
     ) -> None:
         """
         Run address autocomplete when street/city/state change — not when only zip is added
@@ -460,7 +549,21 @@ class BrowserManager:
         )
 
         if should_search:
-            suggestion = await self.select_address(full)
+            suggestion = await self.select_address(
+                full,
+                ranking_hints=address_ranking_hints or [],
+            )
+            if suggestion == "":
+                # Autocomplete had no valid match — clear address so caller can retry.
+                state.address_line_1 = None
+                state.city = None
+                state.state = None
+                state.zipcode = None
+                self._last_address_street_city_state_key = ""
+                self.address_not_found = True
+                logger.warning("Address not found in autocomplete — cleared state for re-ask.")
+                return
+            self.address_not_found = False
             self._last_address_street_city_state_key = dedupe_key
             z_from_line = _zip_from_autocomplete_suggestion(suggestion or "")
             if z_from_line and not state.zipcode:
@@ -490,9 +593,22 @@ class BrowserManager:
     # Form Interaction — address autocomplete
     # ------------------------------------------------------------------
 
-    async def select_address(self, address: str) -> Optional[str]:
-        """Type address, pick first suggestion, wait for fields. Returns suggestion line text or None."""
+    async def select_address(
+        self,
+        address: str,
+        *,
+        ranking_hints: Optional[list[str]] = None,
+    ) -> Optional[str]:
+        """Type address, pick best-ranked suggestion (or first if ranking off), wait for fields."""
         page = self.page  # will raise if not running
+
+        hints = list(ranking_hints or [])
+        use_rank = os.getenv("WCL_ADDRESS_RANK_SUGGESTIONS", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
 
         logger.info("Selecting address — typing '%s' into autocomplete field.", address)
 
@@ -508,25 +624,52 @@ class BrowserManager:
             await page.type(SEL_ADDRESS_INPUT, address, delay=_td)
             logger.debug("Typed '%s' into address field (delay_ms=%s).", address, _td)
 
-            # 2. Wait for the autocomplete dropdown to appear (3s timeout)
             try:
-                await page.wait_for_selector(
-                    SEL_AUTOCOMPLETE_LIST,
-                    state="visible",
-                    timeout=3_000,
-                )
-                logger.debug("Autocomplete dropdown visible.")
+                try:
+                    _after = float(os.getenv("WCL_ADDRESS_AFTER_TYPE_SEC", "0.35").strip() or "0.35")
+                except ValueError:
+                    _after = 0.35
+                await asyncio.sleep(max(0.0, min(_after, 2.5)))
 
-                # 3. Click the first real suggestion
-                first_option = page.locator(SEL_FIRST_SUGGESTION).first
-                suggestion_text = (await first_option.text_content() or "").strip()
-                await first_option.click()
-                logger.info(
-                    "Selected autocomplete suggestion — '%s'",
-                    suggestion_text,
-                )
+                # Listbox shell can appear before React paints rows — poll until real options exist.
+                n = await _poll_autocomplete_option_count(page)
+                if n <= 0:
+                    raise RuntimeError("no autocomplete rows populated")
 
-                # 4. City/state/zip update after pick (do not use networkidle — can take 10s+ on SPAs)
+                opts = page.locator(SEL_FIRST_SUGGESTION)
+
+                if use_rank:
+                    best_i = -1
+                    suggestion_text = ""
+                    best_score = -1.0
+                    for i in range(n):
+                        raw_t = (await opts.nth(i).text_content(timeout=2_000) or "").strip()
+                        if not raw_t:
+                            continue
+                        sc = _score_address_suggestion(raw_t, address, hints)
+                        if sc > best_score:
+                            best_score = sc
+                            best_i = i
+                            suggestion_text = raw_t
+                    if best_i < 0:
+                        raise RuntimeError("no scored suggestion rows")
+                    pick = opts.nth(best_i)
+                    logger.info(
+                        "Autocomplete ranked %s options (best score %.3f) — picking '%s'",
+                        n,
+                        best_score,
+                        suggestion_text[:120],
+                    )
+                    await pick.click(timeout=5_000)
+                else:
+                    first_option = opts.first
+                    suggestion_text = (await first_option.text_content(timeout=5_000) or "").strip()
+                    await first_option.click(timeout=5_000)
+                    logger.info(
+                        "Selected autocomplete suggestion — '%s'",
+                        suggestion_text,
+                    )
+
                 await self._wait_for_city_populated(page, timeout_ms=4_000)
                 await asyncio.sleep(0.1)
                 logger.info(
@@ -535,16 +678,14 @@ class BrowserManager:
                 )
                 return suggestion_text
 
-            except Exception:
-                # ---------- SAFETY FALLBACK ----------
-                # Dropdown never appeared — fill the field directly.
+            except Exception as exc:
                 logger.warning(
-                    "Autocomplete dropdown did not appear within 3s for '%s'. "
-                    "Falling back to direct fill — City/State/Zip may need manual entry.",
+                    "No valid autocomplete suggestion for %r (%s). Clearing field for re-entry.",
                     address,
+                    exc,
                 )
-                await page.fill(SEL_ADDRESS_INPUT, address)
-                return None
+                await page.fill(SEL_ADDRESS_INPUT, "")
+                return ""
 
         except Exception:
             logger.exception("Failed during address selection for '%s'.", address)
@@ -1367,3 +1508,4 @@ class BrowserManager:
 
         self._is_running = False
         self._last_address_street_city_state_key = None
+        self.address_not_found = False

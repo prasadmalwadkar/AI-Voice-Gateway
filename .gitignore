@@ -33,6 +33,8 @@ data/conversations/
 
 # Local customer prefill payloads (can contain PII)
 data/prefill/customers.json
+data/intake_audit/
+data/intake_snapshots/
 
 # Local orchestrator session dumps only (replay JSON stays tracked)
 scripts/fixtures/voice_replays/orchestrator_runs/
