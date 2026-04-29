@@ -319,6 +319,52 @@ async def test_preline_heuristic_handled(stage, transcript, field, expected_ask,
     assert result.ask_next and result.ask_next.endswith(expected_ask)
 
 
+async def test_consent_decline_privacy_explains_then_terminal():
+    """First 'No' on required consent explains mandate + re-asks; second declines closes."""
+    from agent.schema import HeuristicResult, HelocApplicationState
+
+    rounds: dict[str, int] = {}
+    mock_state = HelocApplicationState(
+        address_line_1="123 Main Street",
+        ownership_type="Sole owner",
+        occupancy_type="Primary property",
+        is_currently_for_sale=False,
+        annual_pre_tax_income=100_000,
+        other_income=0,
+        primary_source_of_income="Employed full-time",
+        first_name="Alex",
+        last_name="Rivera",
+        date_of_birth="01/05/1990",
+        mobile_phone_number="2135550101",
+        email_address="alex@example.com",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "consent"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager._consent_decline_round", rounds),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(return_value="unexpected")
+        from agent.state_manager import apply_voice_intake_heuristics_before_line
+
+        r1 = await apply_voice_intake_heuristics_before_line("No.")
+        mock_tool.func.assert_not_called()
+        assert isinstance(r1, HeuristicResult)
+        assert r1.handled is True
+        assert r1.terminate_after_tts is False
+        assert "required" in r1.ask_next.lower()
+
+        r2 = await apply_voice_intake_heuristics_before_line("No.")
+        mock_tool.func.assert_not_called()
+        assert r2.handled is True
+        assert r2.terminate_after_tts is True
+        assert "goodbye" in r2.ask_next.lower()
+
+
 async def test_preline_heuristic_not_handled_ambiguous():
     """Ambiguous input returns handled=False."""
     from agent.schema import HeuristicResult, HelocApplicationState

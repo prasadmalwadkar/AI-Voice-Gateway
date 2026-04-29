@@ -17,6 +17,8 @@ class HeuristicResult:
     handled_field: Optional[str] = None
     stage: Optional[str] = None
     normalization_source: str = "deterministic"
+    #: After ask_next is spoken, hang up (e.g. caller declined required consent twice).
+    terminate_after_tts: bool = False
 
 # Enum types based on the specific dropdowns in the West Capital UI
 OccupancyType = Literal["Primary property", "Secondary property", "Investment property"]

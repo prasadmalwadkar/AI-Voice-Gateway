@@ -206,6 +206,12 @@ def test_infer_phone_email_yesno_and_address():
     assert infer_email_from_transcript("john_doe@gmail.com") == "john_doe@gmail.com"
     assert infer_email_from_transcript("john at gmail dot com.") == "john@gmail.com"
     assert infer_email_from_transcript("john at gmail dot com!") == "john@gmail.com"
+    assert infer_email_from_transcript(
+        "prasad mahavat kar eighty four at g mail dot com"
+    ) == "prasadmahavatkar84@gmail.com"
+    assert infer_email_from_transcript(
+        "jane smith eight four eight at gmail dot com"
+    ) == "janesmith848@gmail.com"
     # Missing local part before @ is invalid by design.
     assert infer_email_from_transcript("@gmail.com") is None
 

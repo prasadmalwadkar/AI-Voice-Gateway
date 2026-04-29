@@ -497,6 +497,29 @@ def test_final_stt_barge_in_respects_cooldown_and_agent_playing():
     ) is False
 
 
+def test_playback_tail_keeps_barge_in_armed_after_cartesia_finishes():
+    """Twilio may still play buffered audio after streaming stops — treat as agent-active."""
+    import time
+
+    from unittest.mock import patch
+
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+    bridge._agent_playing = False
+    bridge._playback_tail_until = time.monotonic() + 10.0
+    bridge._last_barge_at = 0.0
+    bridge._current_tts_text = ""
+
+    missing = 'Ask next: "Do you agree to the Privacy Policy?"'
+    with patch("app.twilio_line_bridge.get_missing_fields", return_value=missing):
+        assert bridge._should_trigger_barge_in(
+            "yes",
+            in_echo=False,
+            now=time.monotonic(),
+        )
+
+
 async def test_low_confidence_update_requires_single_confirmation():
     from agent.schema import HelocApplicationState
     from agent.state_manager import (
@@ -621,6 +644,31 @@ async def test_pending_low_confidence_no_clears_candidate():
     assert has_pending_low_confidence_confirmation() is False
     assert "Can you tell me the property address?" in result
     _clear_pending_low_confidence_confirmation()
+
+
+async def test_update_application_state_rejects_guessed_email_without_spoken_evidence():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import update_application_state
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+    mock_browser._page = None
+
+    state = HelocApplicationState(mobile_phone_number="2135550101")
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
+    ):
+        result = await update_application_state.func(
+            None,
+            email_address="guess@gmail.com",
+            confidence_score=1.0,
+            raw_user_input="Yes.",
+        )
+
+    assert state.email_address is None
+    assert "email_address rejected" in result
 
 
 def test_strong_pin_normalize_agent_text():
@@ -790,8 +838,7 @@ def test_caller_response_watchdog_queues_repeat(monkeypatch):
 
         queued = bridge._line.tts_queue.get_nowait()
         assert queued == (
-            "I may have missed you there. Could you say that one more time? "
-            "What is your date of birth?"
+            "I may have missed you there. Could you say that one more time?"
         )
         bridge.call_logger.info.assert_called_once()
 

@@ -148,10 +148,10 @@ def _should_wait_for_address_sync(sync_updates: dict) -> bool:
 
 
 def _use_deterministic_address_parsing() -> bool:
-    return os.getenv("PATH2_DETERMINISTIC_ADDRESS", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
+    return os.getenv("PATH2_DETERMINISTIC_ADDRESS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
     )
 
 
@@ -487,9 +487,140 @@ def _clear_pending_low_confidence_confirmation() -> None:
     _pending_low_conf_confirmation = None
 
 
+# Fields shown on one browser step — transcript ``ui`` lines use only these per ``current_stage``.
+_HELOC_UI_PAGE_FIELDS_BY_STAGE: dict[str, frozenset[str]] = {
+    "unknown": frozenset(
+        {
+            "address_line_1",
+            "city",
+            "state",
+            "zipcode",
+            "ownership_type",
+            "occupancy_type",
+        }
+    ),
+    "property": frozenset(
+        {
+            "address_line_1",
+            "city",
+            "state",
+            "zipcode",
+            "ownership_type",
+            "occupancy_type",
+        }
+    ),
+    "for-sale": frozenset({"is_currently_for_sale"}),
+    "income": frozenset(
+        {
+            "annual_pre_tax_income",
+            "other_income",
+            "primary_source_of_income",
+        }
+    ),
+    "name": frozenset({"first_name", "middle_name", "last_name", "suffix"}),
+    "birthday": frozenset({"date_of_birth"}),
+    "contact": frozenset({"mobile_phone_number", "email_address"}),
+    "consent": frozenset(
+        {
+            "agreed_to_privacy_policy",
+            "agreed_to_commerce_communication",
+            "agreed_to_credit_pull",
+        }
+    ),
+}
+
+# End-of-call snapshot: all captured applicant-facing fields (passwords never exported).
+_HELOC_UI_FULL_EXPORT_KEYS: tuple[str, ...] = (
+    "address_line_1",
+    "apt_suite",
+    "city",
+    "state",
+    "zipcode",
+    "ownership_type",
+    "occupancy_type",
+    "is_currently_for_sale",
+    "annual_pre_tax_income",
+    "other_income",
+    "primary_source_of_income",
+    "first_name",
+    "middle_name",
+    "last_name",
+    "suffix",
+    "date_of_birth",
+    "mobile_phone_number",
+    "email_address",
+    "agreed_to_privacy_policy",
+    "agreed_to_commerce_communication",
+    "agreed_to_credit_pull",
+)
+
+
+def _heloc_ui_snap_string_values(keys: frozenset[str]) -> dict[str, str]:
+    """Build string map for transcript; omit None / empty strings; booleans as True/False."""
+    st = application_state
+    snap: dict[str, str] = {}
+    for key in keys:
+        if key in _SENSITIVE_FIELDS:
+            continue
+        v = getattr(st, key, None)
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            snap[key] = "True" if v else "False"
+        elif isinstance(v, str):
+            t = v.strip()
+            if t:
+                snap[key] = t
+        elif isinstance(v, int):
+            snap[key] = str(v)
+        else:
+            t = str(v).strip()
+            if t:
+                snap[key] = t
+    return snap
+
+
+def _append_heloc_ui_transcript_snapshot() -> None:
+    """Append one NDJSON line: fields visible on the current browser stage only."""
+    try:
+        from app.conversation_transcript import append_transcript_ui_fields
+    except ImportError:
+        return
+    stage = browser_manager.get_current_stage()
+    keys = _HELOC_UI_PAGE_FIELDS_BY_STAGE.get(stage) or _HELOC_UI_PAGE_FIELDS_BY_STAGE[
+        "unknown"
+    ]
+    snap = _heloc_ui_snap_string_values(keys)
+    if not snap:
+        return
+    try:
+        append_transcript_ui_fields(
+            None, snap, scope="page", browser_stage=stage
+        )
+    except Exception:
+        logger.debug("append_transcript_ui_fields failed", exc_info=True)
+
+
+def append_heloc_ui_transcript_final_snapshot(call_sid: str | None = None) -> None:
+    """Append full captured state at end of call (before reset). Passwords omitted."""
+    try:
+        from app.conversation_transcript import append_transcript_ui_fields
+    except ImportError:
+        return
+    snap = _heloc_ui_snap_string_values(frozenset(_HELOC_UI_FULL_EXPORT_KEYS))
+    if not snap:
+        return
+    try:
+        append_transcript_ui_fields(call_sid, snap, scope="full")
+    except Exception:
+        logger.debug("append_transcript_ui_fields final failed", exc_info=True)
+
+
 async def _run_browser_sync(
     sync_updates: dict,
     out_errors: Optional[List[str]] = None,
+    *,
+    spoken_transcript_hint: Optional[str] = None,
 ) -> None:
     def _ve(msg: str) -> None:
         if out_errors is not None:
@@ -504,7 +635,13 @@ async def _run_browser_sync(
         await ensure_browser_ready()
         phases["ensure_browser_ms"] = round((time.perf_counter() - t0) * 1000, 2)
         u = sync_updates
-        # application_state (hydration) must win over the tool copy u: after
+        address_ranking_hints: list[str] = []
+        if spoken_transcript_hint and spoken_transcript_hint.strip():
+            sh = spoken_transcript_hint.strip()
+            address_ranking_hints.append(sh)
+            inferred_addr = infer_property_address_from_transcript(sh)
+            if inferred_addr:
+                address_ranking_hints.append(inferred_addr)
         # select_address + pull, state has the USPS line but u can still have the
         # short STT street — re-filling the combobox with the short value breaks autocomplete.
         hydration = browser_manager.build_hydration_payload(application_state)
@@ -528,10 +665,16 @@ async def _run_browser_sync(
                     user_updated_address=any(
                         k in u for k in ("address_line_1", "city", "state")
                     ),
+                    address_ranking_hints=address_ranking_hints or None,
                 )
                 phases["address_autocomplete_ms"] = round(
                     (time.perf_counter() - t0) * 1000, 2
                 )
+                # sync_updates may still hold address_line_* while hydration dropped them after a
+                # failed autocomplete clear — {**u, **hydration} would otherwise leave u's stale keys.
+                if browser_manager.address_not_found:
+                    for _k in ("address_line_1", "city", "state", "zipcode"):
+                        u.pop(_k, None)
                 merged = {**u, **browser_manager.build_hydration_payload(application_state)}
 
             if browser_manager.get_current_stage() == "consent":
@@ -628,6 +771,7 @@ async def _run_browser_sync(
                 total_ms=round((time.perf_counter() - run_t0) * 1000, 2),
             )
             break
+        _append_heloc_ui_transcript_snapshot()
     except Exception as e:
         logger.error("Browser sync failed: %s", str(e), exc_info=True)
         await path2_debug_log("path2.browser_sync_error", err=str(e)[:300])
@@ -641,11 +785,16 @@ async def ensure_browser_ready() -> None:
         await browser_manager.navigate_to_start()
 
 
+# Tracks repeated "no" on required consent checkboxes (privacy vs commerce), per call.
+_consent_decline_round: dict[str, int] = {}
+
+
 async def reset_state() -> None:
     """Reset the application state and browser for a new call."""
     await _await_inflight_browser_sync()
-    global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields
+    global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields, _consent_decline_round
     application_state = HelocApplicationState()
+    _consent_decline_round = {}
     _clear_pending_low_confidence_confirmation()
     _customer_prefill = {}
     _prefill_confirm_pending = None
@@ -1915,6 +2064,114 @@ def get_contact_buffer_mode() -> Optional[Literal["phone", "email"]]:
     return None
 
 
+_SPOKEN_EMAIL_NUM_AUX = frozenset({"hundred", "thousand", "million", "and"})
+# Tokens handled by ``_spoken_digit_sequence_to_digits`` (single-digit spell-out only).
+_SPOKEN_EMAIL_SPELL_DIGIT_WORDS = frozenset(
+    {
+        "zero",
+        "oh",
+        "o",
+        "one",
+        "won",
+        "two",
+        "too",
+        "to",
+        "three",
+        "four",
+        "for",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "ate",
+        "nine",
+    }
+)
+
+
+def _chunk_is_digit_spell_only(tokens: list[str]) -> bool:
+    """True when every token is a single-digit spoken word (not eighty, twelve, …)."""
+    if not tokens:
+        return False
+    for t in tokens:
+        tok = re.sub(r"[^a-z0-9]", "", (t or "").lower())
+        if not tok:
+            return False
+        if tok.isdigit():
+            if len(tok) != 1:
+                return False
+            continue
+        if tok not in _SPOKEN_EMAIL_SPELL_DIGIT_WORDS:
+            return False
+    return True
+
+
+def _token_is_spoken_email_number_piece(t: str) -> bool:
+    tok = re.sub(r"[^a-z0-9]", "", (t or "").lower())
+    if not tok:
+        return False
+    if tok.isdigit():
+        return True
+    return tok in _WORD_NUMS or tok in _SPOKEN_EMAIL_NUM_AUX
+
+
+def _expand_spoken_numbers_in_email_segment(segment: str) -> str:
+    """
+    Turn spoken numbers in an email local-part into digits before '@' / space stripping.
+
+    Examples: ``eighty four`` → ``84``; digit-by-digit ``eight four`` → ``84``.
+    """
+    segment = (segment or "").strip().replace("-", " ")
+    if not segment:
+        return segment
+    tokens = re.findall(r"\S+", segment)
+    out: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        if not _token_is_spoken_email_number_piece(tokens[i]):
+            out.append(tokens[i])
+            i += 1
+            continue
+        max_span = min(14, n - i)
+        replaced = False
+        for length in range(max_span, 0, -1):
+            chunk = tokens[i : i + length]
+            if not all(_token_is_spoken_email_number_piece(t) for t in chunk):
+                continue
+            phrase = " ".join(chunk)
+            num_val: Optional[int] = None
+            digit_run = ""
+
+            if _chunk_is_digit_spell_only(chunk):
+                digit_run = _spoken_digit_sequence_to_digits(phrase)
+                if digit_run:
+                    out.append(digit_run)
+                    i += length
+                    replaced = True
+                    break
+                num_val = _spoken_number_to_int(phrase)
+            else:
+                num_val = _spoken_number_to_int(phrase)
+                if num_val is None:
+                    digit_run = _spoken_digit_sequence_to_digits(phrase)
+
+            if num_val is not None:
+                out.append(str(num_val))
+                i += length
+                replaced = True
+                break
+            if digit_run:
+                out.append(digit_run)
+                i += length
+                replaced = True
+                break
+        if not replaced:
+            out.append(tokens[i])
+            i += 1
+    return " ".join(out)
+
+
 def infer_email_from_transcript(text: str) -> Optional[str]:
     """Parse email from typed form or spoken 'at'/'dot' variants."""
     if not text or not str(text).strip():
@@ -1923,6 +2180,15 @@ def infer_email_from_transcript(text: str) -> Optional[str]:
     if not text:
         return None
     raw = text.strip().lower()
+    if " at " in raw:
+        left, right = raw.split(" at ", 1)
+        left = _expand_spoken_numbers_in_email_segment(left)
+        raw = f"{left} at {right}"
+    elif "@" in raw:
+        lp, rp = raw.split("@", 1)
+        lp = _expand_spoken_numbers_in_email_segment(lp)
+        raw = f"{lp}@{rp}"
+
     normalized = (
         raw.replace(" at ", "@")
         .replace(" dot ", ".")
@@ -1936,6 +2202,20 @@ def infer_email_from_transcript(text: str) -> Optional[str]:
     if STRICT_EMAIL_REGEX.match(normalized):
         return normalized
     return None
+
+
+def _spoken_email_evidence(raw_user_input: Optional[str]) -> bool:
+    """True when caller speech plausibly contained an email — blocks LLM-invented addresses."""
+    if not raw_user_input or not str(raw_user_input).strip():
+        return False
+    low = str(raw_user_input).strip().lower()
+    if "@" in low:
+        return True
+    if " at " in low:
+        return True
+    if re.search(r"\bat\s+[\w.+-]+\s+dot\s+", low):
+        return True
+    return False
 
 
 def infer_property_address_from_transcript(text: str) -> Optional[str]:
@@ -1988,6 +2268,8 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
             number = _spoken_number_to_int(merged_phrase.replace("-", " "))
         if number is not None:
             low = f"{number} {tail}".strip()
+    low = re.sub(r"\s+", " ", low).strip()
+    low = re.sub(r"\b(uh|um|ah|er|like)\b", " ", low)
     low = re.sub(r"\s+", " ", low).strip()
     if re.search(r"\b(lost|list|students|items|below|where)\b", low):
         return None
@@ -2557,10 +2839,6 @@ async def update_application_state(
             inferred_addr = infer_property_address_from_transcript(raw_user_input)
             if inferred_addr:
                 local_vars["address_line_1"] = inferred_addr
-        if local_vars.get("address_line_1") is not None:
-            for key, value in infer_property_city_state_from_transcript(raw_user_input).items():
-                if local_vars.get(key) is None and getattr(application_state, key, None) is None:
-                    local_vars[key] = value
         # Same utterance must not fill both: "one"/"1" is sole owner, not primary occupancy.
         # If this call already sets occupancy, do not infer ownership (e.g. "two" for
         # secondary must not become joint owner).
@@ -2646,6 +2924,18 @@ async def update_application_state(
                         field_name, score, value,
                     )
                     continue  # Do NOT save vague consent
+            if field_name == "email_address" and value is not None:
+                if not _spoken_email_evidence(raw_user_input):
+                    validation_errors.append(
+                        "email_address rejected: caller speech did not contain an email "
+                        "(need '@' or spoken 'at … dot …'). Do not guess from name or context; "
+                        "ask them to give the address slowly."
+                    )
+                    logger.warning(
+                        "email_address rejected — no spoken evidence | raw=%r",
+                        (raw_user_input or "")[:200],
+                    )
+                    continue
             field_threshold = (
                 ADDRESS_CONFIDENCE_THRESHOLD
                 if field_name in ADDRESS_CONFIDENCE_FIELDS
@@ -2736,12 +3026,16 @@ async def update_application_state(
         )
         if inline_sync:
             try:
-                await _run_browser_sync(ucopy, validation_errors)
+                await _run_browser_sync(
+                    ucopy, validation_errors, spoken_transcript_hint=raw_user_input
+                )
             except Exception as e:
                 logger.error("Browser sync failed: %s", str(e), exc_info=True)
         else:
             global _browser_sync_inflight
-            task = asyncio.create_task(_run_browser_sync(ucopy, None))
+            task = asyncio.create_task(
+                _run_browser_sync(ucopy, None, spoken_transcript_hint=raw_user_input)
+            )
 
             def _on_done(t: asyncio.Task) -> None:
                 global _browser_sync_inflight
@@ -2870,6 +3164,7 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         if low.startswith(
             (
                 "i didn't",
+                "i couldn't",
                 "please",
                 "to continue",
                 "do you agree",
@@ -2878,12 +3173,19 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         ):
             return ask
         if field == "address_line_1":
-            prefix = "Got it, I'll pull that up."
-        else:
-            return ask
-        return f"{prefix} {ask}"
+            # Next question often already opens with "Got it, I've saved your address." — don't double-prefix.
+            if low.startswith("got it,") or "i've saved your address" in low:
+                return ask
+            return f"Got it, I'll pull that up. {ask}"
+        return ask
 
-    def _ok(ask: Optional[str], field: str, stage: str) -> HeuristicResult:
+    def _ok(
+        ask: Optional[str],
+        field: str,
+        stage: str,
+        *,
+        terminate_after_tts: bool = False,
+    ) -> HeuristicResult:
         logger.info(
             "deterministic_handled field=%s stage=%s",
             field,
@@ -2895,6 +3197,7 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             ask_next=_with_save_ack(field, ask),
             handled_field=field,
             stage=stage,
+            terminate_after_tts=terminate_after_tts,
         )
 
     def _fail(stage: str) -> HeuristicResult:
@@ -2985,6 +3288,13 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         raw_user_input=text,
                         deterministic_call=True,
                     )
+                    if browser_manager.address_not_found:
+                        browser_manager.address_not_found = False
+                        return _ok(
+                            "I couldn't find that address. Could you please repeat it?",
+                            "address_line_1",
+                            stage,
+                        )
                     return _ok(_extract_ask_next(tool_result), "address_line_1", stage)
                 except Exception as e:
                     logger.warning(
@@ -3096,37 +3406,109 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         yn = infer_yes_no_from_transcript(text)
         if yn is None:
             return _fail(stage)
-        try:
-            if application_state.agreed_to_privacy_policy is None:
-                tool_result = await update_application_state.func(
-                    None,
-                    agreed_to_privacy_policy=yn,
-                    confidence_score=0.95 if yn else 1.0,
-                    raw_user_input=text,
-                    deterministic_call=True,
-                )
-                return _ok(
-                    _extract_ask_next(tool_result), "agreed_to_privacy_policy", stage
-                )
-            if application_state.agreed_to_commerce_communication is None:
-                tool_result = await update_application_state.func(
-                    None,
-                    agreed_to_commerce_communication=yn,
-                    confidence_score=0.95 if yn else 1.0,
-                    raw_user_input=text,
-                    deterministic_call=True,
-                )
-                return _ok(
-                    _extract_ask_next(tool_result),
-                    "agreed_to_commerce_communication",
-                    stage,
-                )
-        except Exception as e:
-            logger.warning(
-                "apply_voice_intake_heuristics_before_line consent failed: %s",
-                e,
-                exc_info=True,
+
+        def _privacy_retry_ask() -> str:
+            missing = get_missing_fields() or ""
+            line = (_ask_from_missing_line(missing) or "").strip()
+            return line or (
+                "Do you agree to our Privacy Policy, Terms of Service, and soft credit pull? "
+                'Please say \"I agree\" clearly if you do.'
             )
+
+        def _commerce_retry_ask() -> str:
+            missing = get_missing_fields() or ""
+            line = (_ask_from_missing_line(missing) or "").strip()
+            return line or (
+                "Do you agree to receive electronic communications about this application? "
+                'Please say \"I agree\" if you do.'
+            )
+
+        if application_state.agreed_to_privacy_policy is None:
+            if yn is True:
+                _consent_decline_round.pop("privacy", None)
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        agreed_to_privacy_policy=True,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(
+                        _extract_ask_next(tool_result),
+                        "agreed_to_privacy_policy",
+                        stage,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line consent privacy yes failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+            # Declined privacy/terms — do not call tool with False (would loop validation).
+            _consent_decline_round["privacy"] = _consent_decline_round.get("privacy", 0) + 1
+            rnd = _consent_decline_round["privacy"]
+            if rnd == 1:
+                retry = _privacy_retry_ask()
+                msg = (
+                    "For regulatory reasons, agreeing to our Privacy Policy, Terms of Service, "
+                    "and soft credit check is required to continue—we can't move forward without "
+                    "that consent. "
+                    + retry
+                )
+                return _ok(msg, "consent_decline_explained_privacy", stage)
+            _consent_decline_round.pop("privacy", None)
+            return _ok(
+                "Okay—without that agreement we can't continue your application today. "
+                "You're welcome to call back when you're ready. Goodbye for now.",
+                "consent_declined_terminal_privacy",
+                stage,
+                terminate_after_tts=True,
+            )
+
+        if application_state.agreed_to_commerce_communication is None:
+            if yn is True:
+                _consent_decline_round.pop("commerce", None)
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        agreed_to_commerce_communication=True,
+                        confidence_score=0.95,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(
+                        _extract_ask_next(tool_result),
+                        "agreed_to_commerce_communication",
+                        stage,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line consent commerce yes failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
+            _consent_decline_round["commerce"] = _consent_decline_round.get("commerce", 0) + 1
+            rnd = _consent_decline_round["commerce"]
+            if rnd == 1:
+                retry = _commerce_retry_ask()
+                msg = (
+                    "We need your agreement on electronic communications to proceed—that "
+                    "step is mandatory for this application. "
+                    + retry
+                )
+                return _ok(msg, "consent_decline_explained_commerce", stage)
+            _consent_decline_round.pop("commerce", None)
+            return _ok(
+                "Understood—without that consent we can't finish your application. "
+                "Thanks for your time; goodbye for now.",
+                "consent_declined_terminal_commerce",
+                stage,
+                terminate_after_tts=True,
+            )
+
         return _fail(stage)
 
     if stage == "name":
