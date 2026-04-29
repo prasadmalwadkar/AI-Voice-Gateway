@@ -21,7 +21,7 @@ three reasons:
 Usage:
     from app.logging_config import setup_logging, CallLogger
 
-    setup_logging()
+    setup_logging()  # stderr: human lines if TTY, else JSON; file: JSON
     logger = CallLogger(call_sid="CA123...")
     logger.mark_connected()
     # ... audio processing ...
@@ -31,9 +31,74 @@ Usage:
 import json
 import logging
 import os
+import sys
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Optional
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _voip_console_use_human() -> bool:
+    """
+    VOIP_LOG_FORMAT: json | human | auto (default auto: human if stderr is a TTY).
+    """
+    raw = os.getenv("VOIP_LOG_FORMAT", "").strip().lower()
+    if raw == "json":
+        return False
+    if raw == "human":
+        return True
+    return sys.stderr.isatty()
+
+
+class HumanConsoleFormatter(logging.Formatter):
+    """
+    Single-line console layout for local debugging (grep-friendly, not JSON).
+    Example:
+        2026-04-29 12:51:42  INFO   state            CAc32ae…  browser_sync_start | Browser hydration...
+    """
+
+    def __init__(self) -> None:
+        super().__init__(datefmt="%Y-%m-%d %H:%M:%S")
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = self.formatTime(record, self.datefmt)
+        lev = f"{record.levelname:<5}"
+        name = record.name
+        if name.startswith("voip."):
+            name = name[5:]
+        if len(name) > 18:
+            name = name[:17] + "…"
+        call = getattr(record, "call_sid", None) or ""
+        if call and len(call) > 12:
+            call = call[:11] + "…"
+        call_s = f" {call}" if call else ""
+        ev = getattr(record, "event", None)
+        ev_s = f" [{ev}]" if ev else ""
+        msg = record.getMessage()
+        if len(msg) > 280:
+            msg = msg[:277] + "…"
+        line = f"{ts}  {lev}  {name:<18}{call_s}{ev_s} | {msg}"
+        if record.exc_info and record.exc_info[0] is not None:
+            line += "\n" + self.formatException(record.exc_info)
+        return line
+
+
+class VoipConsoleNoiseFilter(logging.Filter):
+    """Drop very chatty INFO lines on the console when using human format."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _truthy_env("VOIP_CONSOLE_SHOW_INGRESS"):
+            return True
+        if getattr(record, "event", None) == "twilio.media.ingress":
+            return False
+        if _truthy_env("VOIP_CONSOLE_SHOW_PATH2_DEBUG"):
+            return True
+        if record.name == "voip.path2_debug":
+            return False
+        return True
 
 
 class JSONFormatter(logging.Formatter):
@@ -184,10 +249,20 @@ class CallLogger:
 
 def setup_logging(level: int = logging.INFO) -> None:
     """
-    Configure the root 'voip' logger with JSON formatting.
+    Configure the root 'voip' logger.
 
     Call this once at application startup (in app/main.py or run.py).
     All loggers under the 'voip.*' namespace will inherit this config.
+
+    Console:
+      - ``VOIP_LOG_FORMAT`` = ``json`` | ``human`` | ``auto`` (default ``auto``:
+        human lines when stderr is a TTY, else JSON).
+      - ``VOIP_CONSOLE_SHOW_INGRESS=1`` — log every Twilio media ingress sample
+        on the console (default: hidden in human mode; always in JSON file).
+      - ``VOIP_CONSOLE_SHOW_PATH2_DEBUG=1`` — include ``voip.path2_debug`` lines
+        on the console (default: hidden in human mode).
+
+    File (unless ``LOG_FILE_DISABLE``): always JSON for aggregation tools.
 
     Args:
         level: Minimum log level. Default INFO. Use DEBUG for local dev.
@@ -197,10 +272,15 @@ def setup_logging(level: int = logging.INFO) -> None:
         root_logger.setLevel(level)
         return
 
-    fmt = JSONFormatter()
+    json_fmt = JSONFormatter()
+    use_human = _voip_console_use_human()
 
     stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
+    if use_human:
+        stream_handler.setFormatter(HumanConsoleFormatter())
+        stream_handler.addFilter(VoipConsoleNoiseFilter())
+    else:
+        stream_handler.setFormatter(json_fmt)
     root_logger.addHandler(stream_handler)
 
     if os.getenv("LOG_FILE_DISABLE", "").strip().lower() not in ("1", "true", "yes"):
@@ -209,7 +289,7 @@ def setup_logging(level: int = logging.INFO) -> None:
         file_handler = RotatingFileHandler(
             log_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
         )
-        file_handler.setFormatter(fmt)
+        file_handler.setFormatter(json_fmt)
         root_logger.addHandler(file_handler)
 
     root_logger.setLevel(level)
