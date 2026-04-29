@@ -10,6 +10,16 @@ Default stack (Twilio or orchestrator → same `/media-stream` bridge). **`Line 
 
 The bridge may run **pre-line heuristics** that update application state before sending a user turn to Line ([`apply_voice_intake_heuristics_before_line`](agent/state_manager.py)). **Alternate `TWILIO_VOICE_MODE`:** [`TwilioBridge`](app/twilio_bridge.py) sends µ-law to Cartesia’s hosted agent only.
 
+### High-level architecture
+
+![Voice-driven HELOC intake — high level](docs/architecture/hld-voice-heloc.png)
+
+### Low-level architecture
+
+[Open low-level architecture diagram (PNG)](docs/architecture/lld-voice-heloc.png)
+
+Diagrams are versioned under [`docs/architecture/`](docs/architecture/); replace the PNGs with exports from your source when the pipeline changes.
+
 ## Prerequisites
 
 - Python **3.11+** (3.13: see `requirements.txt` for `audioop-lts` where needed)
@@ -45,6 +55,7 @@ Create **`.env`** in the repo root (never commit). Common variables:
 | `TWILIO_PREFILL_BY_PHONE_FILE` | Optional filesystem path to the **same** JSON shape when the env var above is empty (e.g. `data/prefill/customers.json` locally; file is gitignored). |
 | `PATH2_WAIT_FOR_ADDRESS_SYNC` | Default `1`: after `address_line_1` updates on the property stage, state may wait for browser sync. Set `0`/`false`/`no` to skip that wait. |
 | `PATH2_DETERMINISTIC_ADDRESS` | Default `0`. Set `1`/`true`/`yes` to use deterministic address parsing in state (see `agent/state_manager.py`). |
+| `LINE_POST_FALLBACK_MUTE_SEC` | After tool-ask **fallback** TTS, seconds to drop late LLM text (default **6**; see [`app/line_session_client.py`](app/line_session_client.py)). |
 
 Optional observability:
 
@@ -52,6 +63,9 @@ Optional observability:
 | --- | --- |
 | `CONVERSATION_TRANSCRIPT_DIR` | NDJSON per call (`data/conversations` if unset; empty = off) |
 | `INTAKE_AUDIT_NDJSON_DIR` | Optional intake audit `.jsonl` per `call_sid` |
+| `VOIP_LOG_FORMAT` | `json`, `human`, or `auto` (default): stderr log shape for `voip.*`; `auto` uses human lines on a TTY. Log file stays JSON. |
+| `VOIP_CONSOLE_SHOW_INGRESS` | Set `1` to print every Twilio media ingress sample on the console in human mode (noisy). |
+| `VOIP_CONSOLE_SHOW_PATH2_DEBUG` | Set `1` to print `voip.path2_debug` lines on the console in human mode. |
 | LLM per-turn state snapshot | On by default; optional disable via env — see [`agent/main_agent.py`](agent/main_agent.py) |
 
 [`run.py`](run.py) loads `.env` before the app starts.
@@ -98,8 +112,8 @@ If audio fails, check keys, `TWILIO_VOICE_MODE`, and Twilio [Debugger](https://c
 
 ## Logs and transcripts
 
-- **JSON logs:** `voip` logger; optional file `logs/voip.log` (disable with `LOG_FILE_DISABLE=1`). See [`app/logging_config.py`](app/logging_config.py).
-- **Transcripts:** with default settings, append-only **`data/conversations/{call_sid}.jsonl`** (`role` + `user` / `agent`, `ts`). Directory is gitignored.
+- **`voip` logs:** optional rotating file **`logs/voip.log`** (JSON; disable with `LOG_FILE_DISABLE=1`). **Stderr** uses `VOIP_LOG_FORMAT`: `auto` (default) prints human-readable lines on a TTY and JSON otherwise; `human` / `json` force one shape. See [`app/logging_config.py`](app/logging_config.py).
+- **Transcripts:** with default settings, append-only **`data/conversations/*.jsonl`** (`role`: `user`, `agent`, or `ui`, plus `ts`). Directory is gitignored. Agent lines match **TTS text** sent to the caller (not necessarily every raw Line `Agent said` token).
 
 ## Tests
 
