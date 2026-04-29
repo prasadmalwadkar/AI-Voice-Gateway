@@ -65,9 +65,11 @@ class LineSessionClient:
             0.25,
             float(os.getenv("LINE_TOOL_ASK_FALLBACK_SEC", "0.35")),
         )
+        # Long enough that slow LLM tails (e.g. ~2.5s TTFT) do not replay the
+        # previous question after tool-ask fallback TTS already spoke the next ask.
         self._post_fallback_mute_model_sec = max(
             0.5,
-            float(os.getenv("LINE_POST_FALLBACK_MUTE_SEC", "1.8")),
+            float(os.getenv("LINE_POST_FALLBACK_MUTE_SEC", "6.0")),
         )
         self._mute_model_text_until = 0.0
         self._last_tool_ask: str = ""
@@ -216,6 +218,8 @@ class LineSessionClient:
     _CHOICE_ASK_MARKERS = (
         "sole or joint",
         "primary, secondary, or investment",
+        "primary residence",
+        "where you live most",
         "for sale",
         "primary income",
         "income source",
@@ -550,6 +554,24 @@ class LineSessionClient:
                 or u in {"1", "2"}
                 or pu in {"when", "won", "one", "two", "to", "too"}
             )
+        if "primary residence" in a or "where you live most" in a:
+            if any(ch.isdigit() for ch in u):
+                return True
+            return any(
+                k in u
+                for k in (
+                    "street",
+                    "avenue",
+                    "road",
+                    "drive",
+                    "lane",
+                    "blvd",
+                    "boulevard",
+                    "court",
+                    "way",
+                    "circle",
+                )
+            )
         if "for sale" in a and "?" in a:
             pu = u.strip().rstrip(".,!?").lower()
             return any(k in u for k in ("yes", "no", "yep", "nope")) or pu in {
@@ -608,7 +630,36 @@ class LineSessionClient:
                 return True
             return False
         if "other income" in a:
-            return any(ch.isdigit() for ch in u) or u in {"none", "no", "nope"}
+            if any(ch.isdigit() for ch in u):
+                return True
+            pu = u.strip().rstrip(".,!?").lower()
+            if pu in {"none", "no", "nope", "nope.", "no.", "none."}:
+                return True
+            low = u.lower()
+            if any(
+                p in low
+                for p in (
+                    "not at this moment",
+                    "not at the moment",
+                    "not right now",
+                    "not currently",
+                    "nothing right now",
+                    "no additional",
+                    "no other",
+                    "don't have any other",
+                    "dont have any other",
+                    "do not have any other",
+                )
+            ):
+                return True
+            compact = re.sub(r"[^\w\s]", " ", low)
+            compact = re.sub(r"\s+", " ", compact).strip()
+            if re.fullmatch(
+                r"(no|nope|none|nothing)(\s+(no|nope|none|nothing))*",
+                compact,
+            ):
+                return True
+            return False
         if "primary income" in a or (
             "income source" in a and "other income" not in a and "annual" not in a
         ):
@@ -788,6 +839,10 @@ class LineSessionClient:
     @staticmethod
     def _clarification_for_ask(ask: str) -> str:
         low = (ask or "").strip().lower()
+        if "primary residence" in low or "where you live most" in low:
+            return (
+                "Sorry, I missed that. Could you repeat your primary home street address?"
+            )
         if "property address" in low or "street address" in low:
             return "Sorry, I missed part of that. Could you repeat the property address?"
         if "ownership type" in low or "sole or joint" in low:

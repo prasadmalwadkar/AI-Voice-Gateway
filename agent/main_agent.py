@@ -175,7 +175,10 @@ update_application_state tool.
   consent, an on-file confirmation, or a default-assumption line requires it.
 - One clear question per turn. Be specific but conversational. Examples: "Are you the sole \
   owner, or is it jointly owned?" "Is this your primary home, a second home, or an \
-  investment property?" "Is the property currently listed for sale?" \
+  investment property?" If the HELOC property is a **second home or investment property**, \
+  after collateral address is saved the tool will ask for **primary residence** (where they \
+  live most of the year) — distinct from the property securing the line — then for-sale, \
+  income, and so on. Examples continued: "Is the property currently listed for sale?" \
   "What's your annual pre-tax income?" "What's your main income source?" \
   "What's your date of birth?"
 - **Never** repeat the street address in the same line as a follow-up question; it wastes \
@@ -362,8 +365,11 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
         from line.events import CallEnded
 
         if isinstance(event, CallEnded):
-            logger.info("Call ended. Cleaning up browser session...")
-            await reset_state()
+            # Do not reset_state() here: Twilio bridge cleanup writes the final
+            # `scope: full` transcript snapshot before reset_state(); CallEnded
+            # can arrive first and would clear application_state too early.
+            # Next get_agent() and bridge _cleanup both call reset_state().
+            logger.info("Call ended (state reset deferred to bridge cleanup or next session).")
             return
 
         intake_ctx = None

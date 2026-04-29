@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from typing import Optional, Literal
+from typing import ClassVar, Literal, Optional
 
 STRICT_EMAIL_REGEX = re.compile(
     r"^[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"
@@ -48,6 +48,18 @@ class HelocApplicationState(BaseModel):
     zipcode: Optional[str] = Field(None, description="5-digit zipcode of the property.")
     ownership_type: Optional[OwnershipType] = Field(None, description="Whether they are the sole owner or a joint owner.")
     occupancy_type: Optional[OccupancyType] = Field(None, description="How the property is used (Primary, Secondary, or Investment).")
+    # WCL /register/home-address — only when collateral is secondary or investment.
+    primary_home_address_line_1: Optional[str] = Field(
+        None, description="Street address of the borrower's primary residence (not the HELOC collateral property)."
+    )
+    primary_home_apt_suite: Optional[str] = Field(
+        None, description="Apartment or suite for primary residence, if applicable. Optional."
+    )
+    primary_home_city: Optional[str] = Field(None, description="City of the primary residence.")
+    primary_home_state: Optional[str] = Field(
+        None, description="2-letter state abbreviation for the primary residence."
+    )
+    primary_home_zipcode: Optional[str] = Field(None, description="5-digit zipcode of the primary residence.")
     
     # 2. For Sale Status
     is_currently_for_sale: Optional[bool] = Field(None, description="True if the property is currently listed for sale, False otherwise.")
@@ -156,6 +168,15 @@ class HelocApplicationState(BaseModel):
             )
         return v
 
+    _US_STATE_ABBREVS: ClassVar[frozenset[str]] = frozenset({
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+        "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+        "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+        "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+        "DC",
+    })
+
     @field_validator("state", mode="before")
     @classmethod
     def validate_state(cls, v: Optional[str]) -> Optional[str]:
@@ -163,19 +184,35 @@ class HelocApplicationState(BaseModel):
         if v is None:
             return v
         v = v.strip().upper()
-        valid_states = {
-            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-            "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-            "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-            "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-            "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-            "DC",
-        }
-        if v not in valid_states:
+        if v not in cls._US_STATE_ABBREVS:
             raise ValueError(
                 f"'{v}' is not a valid US state abbreviation."
             )
         return v
+
+    @field_validator("primary_home_state", mode="before")
+    @classmethod
+    def validate_primary_home_state(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if v not in cls._US_STATE_ABBREVS:
+            raise ValueError(
+                f"'{v}' is not a valid US state abbreviation."
+            )
+        return v
+
+    @field_validator("primary_home_zipcode", mode="before")
+    @classmethod
+    def validate_primary_home_zipcode(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        digits = re.sub(r"[^\d]", "", v)
+        if len(digits) != 5:
+            raise ValueError(
+                f"Zipcode must be exactly 5 digits, got {len(digits)} digits from '{v}'."
+            )
+        return digits
 
     def generate_password(self, zipcode: str) -> str:
         """Build a 12+ character password from name + zip for the consent step."""

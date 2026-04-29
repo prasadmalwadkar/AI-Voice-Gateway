@@ -70,6 +70,15 @@ SEL_AUTOCOMPLETE_LIST = "ul[role='listbox']"
 # Skips the "Address not listed" option at the top of the dropdown.
 SEL_FIRST_SUGGESTION = "li[role='option']:not([id*='not-listed'])"
 
+# WCL /register/home-address — primary residence combobox (secondary / investment HELOC).
+SEL_HOME_ADDRESS_STREET1 = "input[data-test-id='home-address-street1']"
+SEL_HOME_STREET_LINE = (
+    f"{SEL_HOME_ADDRESS_STREET1}, input[name='address_line_1']"
+)
+SEL_HOME_ADDRESS_INPUT = (
+    f"{SEL_HOME_ADDRESS_STREET1}, input[placeholder='Search for your address']"
+)
+
 # WCL /register: occupancy is a radio group name=occupancyType; cards are <label
 # class="...card-select"> wrapping <input type="radio" name="occupancyType" value="HOME">…
 SEL_OCCUPANCY_RADIOS = 'input[type="radio"][name="occupancyType"]'
@@ -148,6 +157,30 @@ def _street_city_state_key(state: HelocApplicationState) -> str:
         parts.append(state.city.strip().lower())
     if state.state:
         parts.append(state.state.strip().upper())
+    return "|".join(parts)
+
+
+def _format_full_address_primary_home(state: HelocApplicationState) -> str:
+    parts: list[str] = []
+    if state.primary_home_address_line_1:
+        parts.append(state.primary_home_address_line_1.strip())
+    if state.primary_home_city:
+        parts.append(state.primary_home_city.strip())
+    if state.primary_home_state:
+        parts.append(state.primary_home_state.strip())
+    if state.primary_home_zipcode:
+        parts.append(str(state.primary_home_zipcode).strip())
+    return " ".join(parts)
+
+
+def _street_city_state_key_primary_home(state: HelocApplicationState) -> str:
+    parts: list[str] = []
+    if state.primary_home_address_line_1:
+        parts.append(state.primary_home_address_line_1.strip().lower())
+    if state.primary_home_city:
+        parts.append(state.primary_home_city.strip().lower())
+    if state.primary_home_state:
+        parts.append(state.primary_home_state.strip().upper())
     return "|".join(parts)
 
 
@@ -246,10 +279,23 @@ class BrowserManager:
         # consent-2: electronic communications only.
         "agreed_to_privacy_policy": "input[data-test-id='consent-1']",
         "agreed_to_commerce_communication": "input[data-test-id='consent-2']",
+        "primary_home_address_line_1": (
+            f"{SEL_HOME_ADDRESS_STREET1}, input[name='address_line_1']"
+        ),
+        "primary_home_apt_suite": "input[data-test-id='home-address-street2']",
+        "primary_home_city": "input[name='city']",
+        "primary_home_state": "input[name='state']",
+        "primary_home_zipcode": "input[name='zipcode']",
     }
 
     # Fields that are visible but not required for navigation ("Continue")
-    OPTIONAL_FIELDS = ["apt_suite", "other_income", "middle_name", "suffix"]
+    OPTIONAL_FIELDS = [
+        "apt_suite",
+        "primary_home_apt_suite",
+        "other_income",
+        "middle_name",
+        "suffix",
+    ]
 
     # Ordered URL substring → required fields for that step (first match wins).
     # ``register`` must be last — it appears as a substring on several paths.
@@ -261,6 +307,13 @@ class BrowserManager:
         ("phone-and-email", ["mobile_phone_number", "email_address"]),
         ("set-password", ["agreed_to_privacy_policy", "agreed_to_commerce_communication", "password", "confirm_password"]),
         ("consent", ["agreed_to_privacy_policy", "agreed_to_commerce_communication", "password", "confirm_password"]),
+        # Must match before bare ``register`` (substring) on …/register/home-address.
+        ("home-address", [
+            "primary_home_address_line_1",
+            "primary_home_city",
+            "primary_home_state",
+            "primary_home_zipcode",
+        ]),
         # WCL /register: dropdown address pick fills these inputs in the live browser;
         # we hydrate/verify so Continue enables—user never types them in voice.
         # https://heloc.westcapitallending.com/account/heloc/register
@@ -273,6 +326,7 @@ class BrowserManager:
     # Optional fields to hydrate when syncing DOM from state (stage from get_current_stage()).
     _OPTIONAL_HYDRATION_BY_STAGE: ClassVar[dict[str, tuple[str, ...]]] = {
         "property": ("apt_suite",),
+        "primary-home": ("primary_home_apt_suite",),
         "for-sale": (),
         "income": ("other_income",),
         "name": ("middle_name", "suffix"),
@@ -290,6 +344,8 @@ class BrowserManager:
         # Dedupe autocomplete on street+city+state only (not zip — site fills zip from suggestion).
         self._last_address_street_city_state_key: Optional[str] = None
         self.address_not_found: bool = False
+        self._last_primary_home_street_city_state_key: Optional[str] = None
+        self.address_not_found_primary_home: bool = False
 
     # ------------------------------------------------------------------
     # Properties — safe accessors for the active page
@@ -572,6 +628,102 @@ class BrowserManager:
 
         await self.pull_property_fields_from_dom_into_state(state)
 
+    async def pull_primary_home_fields_from_dom_into_state(
+        self, state: HelocApplicationState
+    ) -> list[str]:
+        """Copy primary-home street/city/state/zip from /register/home-address into state."""
+        if self.get_current_stage() != "primary-home":
+            return []
+        page = self.page
+        await asyncio.sleep(0.25)
+        changed: list[str] = []
+        mapping = [
+            ("primary_home_address_line_1", SEL_HOME_STREET_LINE),
+            ("primary_home_city", "input[name='city']"),
+            ("primary_home_state", "input[name='state']"),
+        ]
+        for field, css in mapping:
+            try:
+                loc = page.locator(css).first
+                if await loc.count() == 0:
+                    continue
+                raw = (await loc.input_value() or "").strip()
+                if not raw:
+                    continue
+                if field == "primary_home_state" and len(raw) == 2:
+                    raw = raw.upper()
+                cur = getattr(state, field, None)
+                if cur is not None and str(cur).strip() == str(raw).strip():
+                    continue
+                setattr(state, field, raw)
+                changed.append(field)
+            except Exception as e:
+                logger.debug("pull_primary_home_fields_from_dom_into_state: %s: %s", field, e)
+
+        z = await self._read_zip_from_dom(page)
+        if z:
+            cur_z = getattr(state, "primary_home_zipcode", None)
+            if cur_z is None or str(cur_z).strip() != z:
+                state.primary_home_zipcode = z
+                changed.append("primary_home_zipcode")
+        if changed:
+            logger.info("Synced primary home fields from DOM into state: %s", changed)
+        return changed
+
+    async def sync_primary_home_address_from_state(
+        self,
+        state: HelocApplicationState,
+        *,
+        user_updated_address: bool,
+        address_ranking_hints: Optional[list[str]] = None,
+    ) -> None:
+        if self.get_current_stage() != "primary-home":
+            return
+        if not state.primary_home_address_line_1:
+            return
+
+        if not user_updated_address:
+            await self.pull_primary_home_fields_from_dom_into_state(state)
+            return
+
+        full = _format_full_address_primary_home(state)
+        if not full.strip():
+            return
+
+        dedupe_key = _street_city_state_key_primary_home(state)
+        should_search = bool(dedupe_key) and (
+            user_updated_address
+            or dedupe_key != self._last_primary_home_street_city_state_key
+        )
+
+        if should_search:
+            suggestion = await self.select_address(
+                full,
+                ranking_hints=address_ranking_hints or [],
+                address_input_selector=SEL_HOME_ADDRESS_INPUT,
+            )
+            if suggestion == "":
+                state.primary_home_address_line_1 = None
+                state.primary_home_city = None
+                state.primary_home_state = None
+                state.primary_home_zipcode = None
+                self._last_primary_home_street_city_state_key = ""
+                self.address_not_found_primary_home = True
+                logger.warning(
+                    "Primary home address not found in autocomplete — cleared state for re-ask."
+                )
+                return
+            self.address_not_found_primary_home = False
+            self._last_primary_home_street_city_state_key = dedupe_key
+            z_from_line = _zip_from_autocomplete_suggestion(suggestion or "")
+            if z_from_line and not state.primary_home_zipcode:
+                state.primary_home_zipcode = z_from_line
+                logger.info(
+                    "Set primary_home_zipcode from autocomplete suggestion text: %s", z_from_line
+                )
+
+        await self.pull_primary_home_fields_from_dom_into_state(state)
+
     async def _wait_for_city_populated(self, page: Page, timeout_ms: int = 4000) -> None:
         """After picking a listbox row, city/state/zip fill async. Avoid ``networkidle`` (SPA)."""
         steps = max(1, timeout_ms // 50)
@@ -598,9 +750,11 @@ class BrowserManager:
         address: str,
         *,
         ranking_hints: Optional[list[str]] = None,
+        address_input_selector: Optional[str] = None,
     ) -> Optional[str]:
         """Type address, pick best-ranked suggestion (or first if ranking off), wait for fields."""
         page = self.page  # will raise if not running
+        input_sel = address_input_selector or SEL_ADDRESS_INPUT
 
         hints = list(ranking_hints or [])
         use_rank = os.getenv("WCL_ADDRESS_RANK_SUGGESTIONS", "1").strip().lower() not in (
@@ -619,9 +773,9 @@ class BrowserManager:
                 _td = 35
             _td = max(0, min(_td, 150))
             # 1. Clear any previous value and type to trigger autocomplete (lower delay = faster)
-            await page.click(SEL_ADDRESS_INPUT)
-            await page.fill(SEL_ADDRESS_INPUT, "")  # clear existing text
-            await page.type(SEL_ADDRESS_INPUT, address, delay=_td)
+            await page.click(input_sel)
+            await page.fill(input_sel, "")  # clear existing text
+            await page.type(input_sel, address, delay=_td)
             logger.debug("Typed '%s' into address field (delay_ms=%s).", address, _td)
 
             try:
@@ -684,7 +838,7 @@ class BrowserManager:
                     address,
                     exc,
                 )
-                await page.fill(SEL_ADDRESS_INPUT, "")
+                await page.fill(input_sel, "")
                 return ""
 
         except Exception:
@@ -883,6 +1037,7 @@ class BrowserManager:
 
         # WCL: filling address/ownership after occupancy clears the card radio in React.
         on_property = self.get_current_stage() == "property"
+        on_primary_home = self.get_current_stage() == "primary-home"
         occ_value = data.get("occupancy_type") if on_property else None
 
         for key, value in data.items():
@@ -890,6 +1045,12 @@ class BrowserManager:
                 continue
             if on_property and key in ("city", "state", "zipcode"):
                 # Filled by WCL after address dropdown pick; never overwrite from hydration.
+                continue
+            if on_primary_home and key in (
+                "primary_home_city",
+                "primary_home_state",
+                "primary_home_zipcode",
+            ):
                 continue
             selector = self.FIELD_MAP.get(key)
             if not selector or value is None:
@@ -944,6 +1105,22 @@ class BrowserManager:
                             # with a shorter Pydantic street and DOM mismatch on verify.
                             logger.info(
                                 "Skip fill for address_line_1 (combobox already has resolved line)."
+                            )
+                            continue
+                if key == "primary_home_address_line_1" and on_primary_home:
+                    if await locator.count() > 0:
+                        try:
+                            cur = (await locator.input_value() or "").strip()
+                        except Exception:
+                            cur = ""
+                        if (
+                            len(cur) >= 28
+                            and re.search(r"\b\d{5}\b", cur)
+                            and ("," in cur)
+                        ):
+                            logger.info(
+                                "Skip fill for primary_home_address_line_1 "
+                                "(combobox already has resolved line)."
                             )
                             continue
                 # FIRST: check if it's even on the page right now.
@@ -1148,11 +1325,24 @@ class BrowserManager:
                     return s
 
                 # Determine if this is a numeric/phone field for better comparison
-                is_num = any(x in key for x in ["income", "phone", "zipcode", "amount", "monthly"])
+                is_num = any(
+                    x in key for x in ["income", "phone", "zipcode", "amount", "monthly"]
+                ) or "primary_home_zip" in key
 
                 if (
                     key == "address_line_1"
                     and self.get_current_stage() == "property"
+                    and actual_value is not None
+                    and expected_value is not None
+                ):
+                    a = re.sub(r"\W+", "", str(actual_value).lower())[:200]
+                    e = re.sub(r"\W+", "", str(expected_value).lower())[:200]
+                    if e in a or a in e or (len(e) > 4 and e[:6] in a):
+                        continue
+
+                if (
+                    key == "primary_home_address_line_1"
+                    and self.get_current_stage() == "primary-home"
                     and actual_value is not None
                     and expected_value is not None
                 ):
@@ -1248,6 +1438,25 @@ class BrowserManager:
         zd = re.sub(r"\D", "", await self._read_zip_from_dom(page) or "")
         return bool(cval and stval and len(zd) >= 5)
 
+    async def _wcl_primary_home_street_satisfied(self, page: Page) -> bool:
+        """WCL /register/home-address: same completion pattern as property street combobox."""
+        line = page.locator(SEL_HOME_STREET_LINE).first
+        if await line.count() > 0 and (await line.input_value() or "").strip():
+            return True
+        search = page.locator(SEL_HOME_ADDRESS_INPUT).first
+        if await search.count() > 0 and len(
+            (await search.input_value() or "").strip()
+        ) >= 4:
+            return True
+        c = page.locator("input[name='city']").first
+        st = page.locator("input[name='state']").first
+        if await c.count() == 0 or await st.count() == 0:
+            return False
+        cval = (await c.input_value() or "").strip()
+        stval = (await st.input_value() or "").strip()
+        zd = re.sub(r"\D", "", await self._read_zip_from_dom(page) or "")
+        return bool(cval and stval and len(zd) >= 5)
+
     async def is_page_complete(self) -> bool:
         """True only when every required field for this URL is filled (including card-based occupancy)."""
         page = self.page
@@ -1277,10 +1486,25 @@ class BrowserManager:
                             return False
                     continue
 
-                if key in ("city", "state"):
-                    # Same as address: WCL can keep values in inputs that are not
-                    # considered "visible" to Playwright's strict is_visible.
-                    loc = page.locator(f"input[name='{key}']").first
+                if key == "primary_home_address_line_1":
+                    if self.get_current_stage() == "primary-home":
+                        if not await self._wcl_primary_home_street_satisfied(page):
+                            return False
+                    else:
+                        loc = page.locator(SEL_HOME_STREET_LINE).first
+                        if await loc.count() == 0:
+                            return False
+                        if not (await loc.input_value() or "").strip():
+                            return False
+                    continue
+
+                if key in ("city", "state", "primary_home_city", "primary_home_state"):
+                    dom_name = (
+                        "city"
+                        if key in ("city", "primary_home_city")
+                        else "state"
+                    )
+                    loc = page.locator(f"input[name='{dom_name}']").first
                     if await loc.count() == 0:
                         logger.debug("is_page_complete: no input for %s", key)
                         return False
@@ -1290,7 +1514,7 @@ class BrowserManager:
                         return False
                     continue
 
-                if key == "zipcode":
+                if key in ("zipcode", "primary_home_zipcode"):
                     z = await self._read_zip_from_dom(page)
                     digits = re.sub(r"\D", "", z or "")
                     if len(digits) >= 5:
@@ -1367,13 +1591,43 @@ class BrowserManager:
             "url": page.url,
             "stage": self.get_current_stage(),
         }
-        if self.get_current_stage() != "property":
-            out["note"] = "not on /register"
+        st = self.get_current_stage()
+        if st not in ("property", "primary-home"):
+            out["note"] = "not on property or primary-home register step"
             return out
         try:
             out["loading_spinnerish"] = await page.locator(
                 ".loading-spinner, .progress-bar-animated"
             ).count()
+            if st == "primary-home":
+                for name in (
+                    "primary_home_address_line_1",
+                    "primary_home_city",
+                    "primary_home_state",
+                    "primary_home_zipcode",
+                ):
+                    if name == "primary_home_zipcode":
+                        out["zip_raw"] = await self._read_zip_from_dom(page)
+                        z = re.sub(r"\D", "", out.get("zip_raw") or "")
+                        out["zip_digits"] = len(z)
+                        continue
+                    if name == "primary_home_address_line_1":
+                        loc = page.locator(SEL_HOME_STREET_LINE).first
+                    else:
+                        dom = "city" if name == "primary_home_city" else "state"
+                        loc = page.locator(f"input[name='{dom}']").first
+                    c = await loc.count()
+                    if c:
+                        v = (await loc.input_value() or "").strip()
+                        out[name] = {"count": 1, "len": len(v), "set": bool(v)}
+                    else:
+                        out[name] = {"count": 0, "set": False}
+                out["wcl_primary_home_street_satisfied"] = (
+                    await self._wcl_primary_home_street_satisfied(page)
+                )
+                out["is_page_complete"] = await self.is_page_complete()
+                return out
+
             for name in ("address_line_1", "city", "state", "zipcode"):
                 if name == "zipcode":
                     out["zip_raw"] = await self._read_zip_from_dom(page)
@@ -1434,6 +1688,7 @@ class BrowserManager:
         url = self._page.url
         
         if "for-sale" in url: return "for-sale"
+        if "home-address" in url: return "primary-home"
         if "annual-income" in url: return "income"
         if "legal-name" in url: return "name"
         if "birthdate" in url: return "birthday"
@@ -1509,3 +1764,5 @@ class BrowserManager:
         self._is_running = False
         self._last_address_street_city_state_key = None
         self.address_not_found = False
+        self._last_primary_home_street_city_state_key = None
+        self.address_not_found_primary_home = False

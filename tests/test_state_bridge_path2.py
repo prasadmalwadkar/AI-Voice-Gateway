@@ -750,6 +750,17 @@ def test_looks_like_answer_to_ownership_numeric_shortcuts():
     assert fn(ask, "um") is False
 
 
+def test_looks_like_answer_to_other_income_natural_negatives():
+    from app.line_session_client import LineSessionClient
+
+    fn = LineSessionClient._looks_like_answer_to_ask
+    ask = "Do you have any other income to include?"
+    assert fn(ask, "Not at this moment.") is True
+    assert fn(ask, "not right now") is True
+    assert fn(ask, "No. No.") is True
+    assert fn(ask, "none") is True
+
+
 def test_compute_mulaw_rms_silence_vs_speech():
     """_compute_mulaw_rms returns ~0 for silence, high for speech-like bytes."""
     from app.twilio_line_bridge import TwilioLineBridge

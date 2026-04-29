@@ -1052,6 +1052,8 @@ class TwilioLineBridge:
             "sole owner",
             "joint",
             "primary, secondary, or investment",
+            "primary home",
+            "primary residence",
             "currently listed for sale",
             "annual pre-tax income",
             "other income",

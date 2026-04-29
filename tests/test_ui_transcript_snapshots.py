@@ -71,3 +71,10 @@ def test_heloc_ui_final_snapshot_export_keys(transcript_dir):
     assert line["fields"]["agreed_to_privacy_policy"] == "True"
     assert line["fields"]["agreed_to_commerce_communication"] == "False"
     assert "password" not in line["fields"]
+    # Full row lists every export key (unset → empty string).
+    from agent.state_manager import _HELOC_UI_FULL_EXPORT_KEYS, _SENSITIVE_FIELDS
+
+    expected_keys = frozenset(_HELOC_UI_FULL_EXPORT_KEYS) - _SENSITIVE_FIELDS
+    assert frozenset(line["fields"].keys()) == expected_keys
+    assert line["fields"].get("first_name", "") == ""
+    assert line["fields"].get("primary_home_address_line_1", "") == ""

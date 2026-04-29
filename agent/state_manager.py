@@ -78,6 +78,9 @@ _PREFILL_FIELD_ALIASES = {
     "email": "email_address",
     "for_sale": "is_currently_for_sale",
     "currently_for_sale": "is_currently_for_sale",
+    "primary_home_address": "primary_home_address_line_1",
+    "primary_residence_address": "primary_home_address_line_1",
+    "primary_home_street": "primary_home_address_line_1",
 }
 _PREFILL_ALLOWED_FIELDS = frozenset(
     {
@@ -88,6 +91,11 @@ _PREFILL_ALLOWED_FIELDS = frozenset(
         "zipcode",
         "ownership_type",
         "occupancy_type",
+        "primary_home_address_line_1",
+        "primary_home_apt_suite",
+        "primary_home_city",
+        "primary_home_state",
+        "primary_home_zipcode",
         "is_currently_for_sale",
         "annual_pre_tax_income",
         "other_income",
@@ -123,6 +131,10 @@ def _use_inline_browser_sync() -> bool:
     return os.getenv("SYNC_BROWSER_INLINE", "").lower() in ("1", "true", "yes")
 
 
+def _occupancy_requires_primary_home_intake(occ: Optional[str]) -> bool:
+    return occ in ("Secondary property", "Investment property")
+
+
 def _should_force_inline_browser_sync(sync_updates: dict) -> bool:
     """
     Force inline sync on stage-boundary answers so tool response can include
@@ -131,6 +143,8 @@ def _should_force_inline_browser_sync(sync_updates: dict) -> bool:
     stage = browser_manager.get_current_stage()
     if stage == "property":
         return "occupancy_type" in sync_updates
+    if stage == "primary-home":
+        return "primary_home_address_line_1" in sync_updates
     if stage == "for-sale":
         # This answer completes for-sale page and can trigger next navigation.
         return "is_currently_for_sale" in sync_updates
@@ -144,7 +158,12 @@ def _should_wait_for_address_sync(sync_updates: dict) -> bool:
         "no",
     ):
         return False
-    return browser_manager.get_current_stage() == "property" and "address_line_1" in sync_updates
+    st = browser_manager.get_current_stage()
+    if st == "property" and "address_line_1" in sync_updates:
+        return True
+    if st == "primary-home" and "primary_home_address_line_1" in sync_updates:
+        return True
+    return False
 
 
 def _use_deterministic_address_parsing() -> bool:
@@ -350,6 +369,16 @@ def _prefill_prompt_for_values(values: dict[str, Any]) -> str:
         return f"I have your email as {value}. Is that correct?"
     if field_name == "is_currently_for_sale":
         return f"I have the property as {_format_prefill_value(field_name, value)}. Is that still correct?"
+    if field_name == "primary_home_address_line_1":
+        parts = [str(value)]
+        for ek in ("primary_home_city", "primary_home_state", "primary_home_zipcode"):
+            ev = values.get(ek)
+            if ev:
+                parts.append(str(ev))
+        return (
+            "I have your primary home address on file as "
+            f"{', '.join(parts)}. Is that correct?"
+        )
     return (
         f"I have your {label} as "
         f"{_format_prefill_value(field_name, value)}. Is that still correct?"
@@ -370,7 +399,20 @@ def _prefill_values_for_field(field_name: str, stage_num: int) -> dict[str, Any]
                 and getattr(application_state, extra_field, None) in (None, "")
             ):
                 values[extra_field] = _customer_prefill[extra_field]
-    if stage_num == 4 and field_name == "first_name":
+    if field_name == "primary_home_address_line_1":
+        for extra_field in (
+            "primary_home_apt_suite",
+            "primary_home_city",
+            "primary_home_state",
+            "primary_home_zipcode",
+        ):
+            if (
+                extra_field in _customer_prefill
+                and extra_field not in _prefill_rejected_fields
+                and getattr(application_state, extra_field, None) in (None, "")
+            ):
+                values[extra_field] = _customer_prefill[extra_field]
+    if stage_num == 5 and field_name == "first_name":
         if (
             "last_name" in _customer_prefill
             and "last_name" not in _prefill_rejected_fields
@@ -434,6 +476,7 @@ def has_pending_low_confidence_confirmation() -> bool:
 def _field_display_name(field_name: str) -> str:
     names = {
         "address_line_1": "property address (street)",
+        "primary_home_address_line_1": "primary home address (street)",
         "ownership_type": "ownership type",
         "occupancy_type": "property type",
         "is_currently_for_sale": "for-sale answer",
@@ -461,6 +504,10 @@ def _pending_low_conf_ask() -> str:
         if attempts >= 2:
             return "Please spell the street address slowly; there may be background noise."
         return "I didn't catch that correctly. Please repeat the street address."
+    if "primary_home_address_line_1" in values:
+        if attempts >= 2:
+            return "Please spell your primary home street slowly; there may be background noise."
+        return "I didn't catch that correctly. Please repeat your primary home street address."
     if attempts >= 2:
         return "Please say it slowly again, or spell it if needed."
     return "I didn't catch that correctly. Can you repeat?"
@@ -509,6 +556,14 @@ _HELOC_UI_PAGE_FIELDS_BY_STAGE: dict[str, frozenset[str]] = {
             "occupancy_type",
         }
     ),
+    "primary-home": frozenset(
+        {
+            "primary_home_address_line_1",
+            "primary_home_city",
+            "primary_home_state",
+            "primary_home_zipcode",
+        }
+    ),
     "for-sale": frozenset({"is_currently_for_sale"}),
     "income": frozenset(
         {
@@ -538,6 +593,11 @@ _HELOC_UI_FULL_EXPORT_KEYS: tuple[str, ...] = (
     "zipcode",
     "ownership_type",
     "occupancy_type",
+    "primary_home_address_line_1",
+    "primary_home_apt_suite",
+    "primary_home_city",
+    "primary_home_state",
+    "primary_home_zipcode",
     "is_currently_for_sale",
     "annual_pre_tax_income",
     "other_income",
@@ -580,6 +640,27 @@ def _heloc_ui_snap_string_values(keys: frozenset[str]) -> dict[str, str]:
     return snap
 
 
+def _heloc_ui_full_transcript_snapshot() -> dict[str, str]:
+    """End-of-call NDJSON: every export key (empty string if unset). Passwords omitted."""
+    st = application_state
+    out: dict[str, str] = {}
+    for key in _HELOC_UI_FULL_EXPORT_KEYS:
+        if key in _SENSITIVE_FIELDS:
+            continue
+        v = getattr(st, key, None)
+        if v is None:
+            out[key] = ""
+        elif isinstance(v, bool):
+            out[key] = "True" if v else "False"
+        elif isinstance(v, int):
+            out[key] = str(v)
+        elif isinstance(v, str):
+            out[key] = v.strip()
+        else:
+            out[key] = str(v).strip() if v is not None else ""
+    return out
+
+
 def _append_heloc_ui_transcript_snapshot() -> None:
     """Append one NDJSON line: fields visible on the current browser stage only."""
     try:
@@ -602,12 +683,16 @@ def _append_heloc_ui_transcript_snapshot() -> None:
 
 
 def append_heloc_ui_transcript_final_snapshot(call_sid: str | None = None) -> None:
-    """Append full captured state at end of call (before reset). Passwords omitted."""
+    """Append full captured state at end of call (before reset). Passwords omitted.
+
+    Writes one ``scope: full`` line with **all** ``_HELOC_UI_FULL_EXPORT_KEYS`` present
+    (empty string when a field was never collected) so NDJSON always has a complete row.
+    """
     try:
         from app.conversation_transcript import append_transcript_ui_fields
     except ImportError:
         return
-    snap = _heloc_ui_snap_string_values(frozenset(_HELOC_UI_FULL_EXPORT_KEYS))
+    snap = _heloc_ui_full_transcript_snapshot()
     if not snap:
         return
     try:
@@ -677,6 +762,36 @@ async def _run_browser_sync(
                         u.pop(_k, None)
                 merged = {**u, **browser_manager.build_hydration_payload(application_state)}
 
+            if application_state.primary_home_address_line_1 or any(
+                k.startswith("primary_home") for k in u
+            ):
+                t0 = time.perf_counter()
+                await browser_manager.sync_primary_home_address_from_state(
+                    application_state,
+                    user_updated_address=any(
+                        k in u
+                        for k in (
+                            "primary_home_address_line_1",
+                            "primary_home_city",
+                            "primary_home_state",
+                        )
+                    ),
+                    address_ranking_hints=address_ranking_hints or None,
+                )
+                phases["primary_home_autocomplete_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
+                if browser_manager.address_not_found_primary_home:
+                    for _k in (
+                        "primary_home_address_line_1",
+                        "primary_home_city",
+                        "primary_home_state",
+                        "primary_home_zipcode",
+                    ):
+                        u.pop(_k, None)
+                if browser_manager.get_current_stage() == "primary-home":
+                    merged = {**u, **browser_manager.build_hydration_payload(application_state)}
+
             if browser_manager.get_current_stage() == "consent":
                 if not application_state.password:
                     auto_pass = "WCL!2026!Agent"
@@ -694,6 +809,10 @@ async def _run_browser_sync(
             t0 = time.perf_counter()
             if browser_manager.get_current_stage() == "property":
                 await browser_manager.pull_property_fields_from_dom_into_state(
+                    application_state
+                )
+            elif browser_manager.get_current_stage() == "primary-home":
+                await browser_manager.pull_primary_home_fields_from_dom_into_state(
                     application_state
                 )
             phases["pull_property_dom_ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -788,9 +907,18 @@ async def ensure_browser_ready() -> None:
 # Tracks repeated "no" on required consent checkboxes (privacy vs commerce), per call.
 _consent_decline_round: dict[str, int] = {}
 
+# Serialize reset so overlapping cleanup paths cannot run two browser shutdowns
+# concurrently (duplicate "Closing stale browser" / double drain).
+_reset_state_lock = asyncio.Lock()
+
 
 async def reset_state() -> None:
     """Reset the application state and browser for a new call."""
+    async with _reset_state_lock:
+        await _reset_state_impl()
+
+
+async def _reset_state_impl() -> None:
     await _await_inflight_browser_sync()
     global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields, _consent_decline_round
     application_state = HelocApplicationState()
@@ -849,20 +977,38 @@ def get_missing_fields() -> str:
     # the search, then ownership and occupancy. (Browser still hydrates/validates those fields
     # separately in BrowserManager.)
     FIELD_STAGES = {
-        "address_line_1": 1, "ownership_type": 1, "occupancy_type": 1,
-        "is_currently_for_sale": 2,
-        "annual_pre_tax_income": 3, "other_income": 3, "primary_source_of_income": 3,
-        "first_name": 4, "last_name": 4, "middle_name": 4, "suffix": 4,
-        "date_of_birth": 5,
-        "mobile_phone_number": 6, "email_address": 6,
-        "agreed_to_privacy_policy": 7,
-        "agreed_to_commerce_communication": 7,
-        "password": 7, "confirm_password": 7
+        "address_line_1": 1,
+        "ownership_type": 1,
+        "occupancy_type": 1,
+        "primary_home_address_line_1": 2,
+        "is_currently_for_sale": 3,
+        "annual_pre_tax_income": 4,
+        "other_income": 4,
+        "primary_source_of_income": 4,
+        "first_name": 5,
+        "last_name": 5,
+        "middle_name": 5,
+        "suffix": 5,
+        "date_of_birth": 6,
+        "mobile_phone_number": 7,
+        "email_address": 7,
+        "agreed_to_privacy_policy": 8,
+        "agreed_to_commerce_communication": 8,
+        "password": 8,
+        "confirm_password": 8,
     }
 
     # Stage name to number mapping derived from browser_manager.get_current_stage()
     STAGE_NUMS = {
-        "property": 1, "for-sale": 2, "income": 3, "name": 4, "birthday": 5, "contact": 6, "consent": 7, "unknown": 0
+        "property": 1,
+        "primary-home": 2,
+        "for-sale": 3,
+        "income": 4,
+        "name": 5,
+        "birthday": 6,
+        "contact": 7,
+        "consent": 8,
+        "unknown": 0,
     }
 
     current_stage_name = browser_manager.get_current_stage()
@@ -870,10 +1016,12 @@ def get_missing_fields() -> str:
     if current_stage_num is None or current_stage_num == 0:
         current_stage_num = 1  # property intake until URL resolves
 
+    need_primary_home = _occupancy_requires_primary_home_intake(state.occupancy_type)
+
     # FILTERING LOGIC: If we are at a later stage, ignore MISSING fields from past stages
     # unless they are 'required' (unfilled required fields usually block the browser anyway).
     # For simplicity, we just filter out optional fields from past stages.
-    
+
     final_missing = []
     # These internal keys match the HelocApplicationState model fields
     model_field_to_display = {
@@ -883,6 +1031,10 @@ def get_missing_fields() -> str:
         "zipcode": "zipcode",
         "ownership_type": "ownership type (sole or joint owner)",
         "occupancy_type": "occupancy type (primary, secondary, or investment)",
+        "primary_home_address_line_1": "primary home address (street)",
+        "primary_home_city": "primary home city",
+        "primary_home_state": "primary home state",
+        "primary_home_zipcode": "primary home zipcode",
         "is_currently_for_sale": "whether property is currently for sale",
         "annual_pre_tax_income": "annual pre-tax income",
         "other_income": "any additional income (optional)",
@@ -899,7 +1051,7 @@ def get_missing_fields() -> str:
         ),
         "agreed_to_commerce_communication": "electronic communications consent",
         "password": "account password",
-        "confirm_password": "password confirmation"
+        "confirm_password": "password confirmation",
     }
     # Short scripted asks per field. Keep deterministic to avoid drift.
     field_to_question = {
@@ -907,6 +1059,9 @@ def get_missing_fields() -> str:
         "ownership_type": "Are you the sole owner, or is it jointly owned?",
         "occupancy_type": (
             "Is this your primary home, a second home, or an investment property?"
+        ),
+        "primary_home_address_line_1": (
+            "What is the street address of your primary residence — where you live most of the year?"
         ),
         "is_currently_for_sale": (
             "Is the property currently listed for sale?"
@@ -931,15 +1086,22 @@ def get_missing_fields() -> str:
         "password": "Create password.",
         "confirm_password": "Confirm password.",
     }
-    
+
     # STAGE-LOCKING LOGIC:
-    # We only report fields for the CURRENT stage. 
+    # We only report fields for the CURRENT stage.
     # If the current stage is complete, we report fields for the NEXT stage only.
     # This keeps the agent and browser in perfect lockstep.
-    
+
     current_stage_fields = [f for f, s in FIELD_STAGES.items() if s == current_stage_num]
-    next_stage_fields = [f for f, s in FIELD_STAGES.items() if s == current_stage_num + 1]
-    
+
+    def _next_intake_stage_num(from_num: int) -> int:
+        if from_num == 1:
+            return 2 if need_primary_home else 3
+        return from_num + 1
+
+    next_stage_num = _next_intake_stage_num(current_stage_num)
+    next_stage_fields = [f for f, s in FIELD_STAGES.items() if s == next_stage_num]
+
     # Get optional fields list for classifications
     optional_fields = BrowserManager.OPTIONAL_FIELDS
 
@@ -948,11 +1110,21 @@ def get_missing_fields() -> str:
     # Use stage number 1, not URL name "property": at call start get_current_stage() is often
     # "unknown" while FIELD_STAGES still maps to register intake.
     dom_filled_at_property = frozenset({"city", "state", "zipcode"})
+    dom_filled_primary_home = frozenset(
+        {"primary_home_city", "primary_home_state", "primary_home_zipcode"}
+    )
+
+    def _dom_skip_field(fnm: str) -> bool:
+        if current_stage_num == 1 and fnm in dom_filled_at_property:
+            return True
+        if current_stage_num == 2 and fnm in dom_filled_primary_home:
+            return True
+        return False
 
     # Check if current stage is "complete" (no required missing fields)
     current_stage_is_done = True
     for f in current_stage_fields:
-        if current_stage_num == 1 and f in dom_filled_at_property:
+        if _dom_skip_field(f):
             continue
         if not hasattr(state, f):
             continue
@@ -962,11 +1134,9 @@ def get_missing_fields() -> str:
             break
 
     target_fields = current_stage_fields if not current_stage_is_done else next_stage_fields
-    
-    final_missing = []
-    
+
     for field_name in target_fields:
-        if current_stage_num == 1 and field_name in dom_filled_at_property:
+        if _dom_skip_field(field_name):
             continue
         if not hasattr(state, field_name):
             continue
@@ -976,8 +1146,7 @@ def get_missing_fields() -> str:
             if display_name:
                 final_missing.append(display_name)
 
-    # Do not ask for stage-2 fields while the browser is still on the property URL —
-    # those inputs are not in the DOM yet (avoids failed radio fill + duplicate questions).
+    # Do not ask for for-sale while the browser is not on that URL yet.
     sale_label = model_field_to_display.get("is_currently_for_sale")
     if (
         sale_label
@@ -991,10 +1160,20 @@ def get_missing_fields() -> str:
         if "for-sale" not in page_url:
             final_missing = [x for x in final_missing if x != sale_label]
 
+    # Primary home only appears on /register/home-address — do not prompt until DOM exists.
+    ph_label = model_field_to_display.get("primary_home_address_line_1")
+    if ph_label and ph_label in final_missing and browser_manager._page is not None:
+        try:
+            page_url = browser_manager._page.url or ""
+        except Exception:
+            page_url = ""
+        if "home-address" not in page_url:
+            final_missing = [x for x in final_missing if x != ph_label]
+
     # Prepend stage context for the LLM
     stage_header = f"[BROWSER STAGE: {current_stage_name.upper()}]"
     if not final_missing:
-        if current_stage_is_done and current_stage_num >= 7:
+        if current_stage_is_done and current_stage_num >= 8:
             return ""
         return (
             f"{stage_header} All current fields filled. Waiting for navigation. "
@@ -1005,7 +1184,7 @@ def get_missing_fields() -> str:
 
     first_missing_field: Optional[str] = None
     for field_name in target_fields:
-        if current_stage_num == 1 and field_name in dom_filled_at_property:
+        if _dom_skip_field(field_name):
             continue
         if not hasattr(state, field_name):
             continue
@@ -1073,6 +1252,10 @@ ADDRESS_CONFIDENCE_FIELDS = {
     "city",
     "state",
     "zipcode",
+    "primary_home_address_line_1",
+    "primary_home_city",
+    "primary_home_state",
+    "primary_home_zipcode",
 }
 
 # Fields that require explicit high-confidence consent (legal compliance).
@@ -1837,6 +2020,36 @@ def infer_other_income_from_transcript(text: str) -> Optional[int]:
         "0",
         "nothing",
     }:
+        return 0
+    # Spoken negatives that omit bare "no" (STT / natural phrasing).
+    _other_income_negative_phrases = (
+        "not at this moment",
+        "not at the moment",
+        "not right now",
+        "not currently",
+        "nothing right now",
+        "nothing else right now",
+        "no additional income",
+        "dont have any other",
+        "don't have any other",
+        "do not have any other",
+        "dont have other",
+        "don't have other",
+        "no other",
+        "not any other",
+    )
+    if any(p in normalized for p in _other_income_negative_phrases):
+        return 0
+    # Fold apostrophes so "don't" / "I'm" style STT matches phrase list entries.
+    apostrophe_fold = re.sub(r"[''`]", "", normalized)
+    if any(p in apostrophe_fold for p in _other_income_negative_phrases):
+        return 0
+    if "dont have any other" in apostrophe_fold or "do not have any other" in apostrophe_fold:
+        return 0
+    # Punctuation strip splits "don't" → "don t" before apostrophe removal.
+    contraction_fold = re.sub(r"\bdon\s+t\b", "dont", normalized, flags=re.IGNORECASE)
+    contraction_fold = re.sub(r"\bdo\s+not\b", "donot", contraction_fold, flags=re.IGNORECASE)
+    if "dont have any other" in contraction_fold or "donot have any other" in contraction_fold:
         return 0
     return infer_annual_income_from_transcript(text)
 
@@ -2720,6 +2933,19 @@ async def update_application_state(
     zipcode: Annotated[Optional[str], "5-digit zipcode"] = None,
     ownership_type: Annotated[Optional[OwnershipType], "Sole owner or Joint owner"] = None,
     occupancy_type: Annotated[Optional[OccupancyType], "Primary, Secondary, or Investment property"] = None,
+    primary_home_address_line_1: Annotated[
+        Optional[str],
+        "Street address of borrower's primary residence where they live most of the year; "
+        "only when the HELOC property is a second home or investment property.",
+    ] = None,
+    primary_home_apt_suite: Annotated[
+        Optional[str], "Apartment or suite for primary residence, if applicable"
+    ] = None,
+    primary_home_city: Annotated[Optional[str], "City of primary residence"] = None,
+    primary_home_state: Annotated[
+        Optional[str], "State of primary residence (2-letter abbreviation)"
+    ] = None,
+    primary_home_zipcode: Annotated[Optional[str], "5-digit zipcode of primary residence"] = None,
     is_currently_for_sale: Annotated[Optional[bool], "Whether the property is currently listed for sale"] = None,
     annual_pre_tax_income: Annotated[Optional[int], "Total annual pre-tax income in whole dollars (must be greater than 0)"] = None,
     other_income: Annotated[Optional[int], "Additional income (rental, investment, etc.)"] = None,
@@ -2764,6 +2990,11 @@ async def update_application_state(
         "zipcode": zipcode,
         "ownership_type": ownership_type,
         "occupancy_type": occupancy_type,
+        "primary_home_address_line_1": primary_home_address_line_1,
+        "primary_home_apt_suite": primary_home_apt_suite,
+        "primary_home_city": primary_home_city,
+        "primary_home_state": primary_home_state,
+        "primary_home_zipcode": primary_home_zipcode,
         "is_currently_for_sale": is_currently_for_sale,
         "annual_pre_tax_income": annual_pre_tax_income,
         "other_income": other_income,
@@ -2790,6 +3021,13 @@ async def update_application_state(
             "zipcode",
             "ownership_type",
             "occupancy_type",
+        },
+        "primary-home": {
+            "primary_home_address_line_1",
+            "primary_home_apt_suite",
+            "primary_home_city",
+            "primary_home_state",
+            "primary_home_zipcode",
         },
         "for-sale": {"is_currently_for_sale"},
         "income": {"annual_pre_tax_income", "other_income", "primary_source_of_income"},
@@ -2853,6 +3091,15 @@ async def update_application_state(
                 inferred_occ = infer_occupancy_from_transcript(raw_user_input)
                 if inferred_occ:
                     local_vars["occupancy_type"] = inferred_occ
+    if raw_user_input and browser_manager.get_current_stage() == "primary-home":
+        if (
+            _use_deterministic_address_parsing()
+            and local_vars.get("primary_home_address_line_1") is None
+            and application_state.primary_home_address_line_1 is None
+        ):
+            inferred_ph = infer_property_address_from_transcript(raw_user_input)
+            if inferred_ph:
+                local_vars["primary_home_address_line_1"] = inferred_ph
     if raw_user_input and browser_manager.get_current_stage() == "for-sale":
         if local_vars.get("is_currently_for_sale") is None:
             inferred_fs = infer_for_sale_from_transcript(raw_user_input)
@@ -3177,6 +3424,10 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             if low.startswith("got it,") or "i've saved your address" in low:
                 return ask
             return f"Got it, I'll pull that up. {ask}"
+        if field == "primary_home_address_line_1":
+            if "primary home" in low or "saved" in low:
+                return ask
+            return f"Got it, I'll pull that up. {ask}"
         return ask
 
     def _ok(
@@ -3400,6 +3651,42 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                     )
                 return _fail(stage)
             return _fail(stage)
+        return _fail(stage)
+
+    if stage == "primary-home":
+        if (
+            _use_deterministic_address_parsing()
+            and application_state.primary_home_address_line_1 is None
+        ):
+            addr = infer_property_address_from_transcript(text)
+            if addr is not None:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        primary_home_address_line_1=addr,
+                        confidence_score=0.92,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    if browser_manager.address_not_found_primary_home:
+                        browser_manager.address_not_found_primary_home = False
+                        return _ok(
+                            "I couldn't find that address. Could you please repeat your primary home street?",
+                            "primary_home_address_line_1",
+                            stage,
+                        )
+                    return _ok(
+                        _extract_ask_next(tool_result),
+                        "primary_home_address_line_1",
+                        stage,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "apply_voice_intake_heuristics_before_line primary home address failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                return _fail(stage)
         return _fail(stage)
 
     if stage == "consent":

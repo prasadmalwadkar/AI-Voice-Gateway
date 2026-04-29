@@ -72,6 +72,9 @@ def test_infer_other_income():
     assert infer_other_income_from_transcript("zero zero") == 0
     assert infer_other_income_from_transcript("no other income") == 0
     assert infer_other_income_from_transcript("no any other income") == 0
+    assert infer_other_income_from_transcript("Not at this moment.") == 0
+    assert infer_other_income_from_transcript("not right now") == 0
+    assert infer_other_income_from_transcript("I don't have any other income") == 0
     assert infer_other_income_from_transcript("50K") == 50_000
 
 
