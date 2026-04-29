@@ -86,9 +86,13 @@ def append_transcript_ui_fields(
     clean: dict[str, str] = {}
     for k, v in (fields or {}).items():
         if v is None:
+            if scope == "full":
+                clean[k] = ""
             continue
         s = str(v).strip()
         if not s:
+            if scope == "full":
+                clean[k] = ""
             continue
         clean[k] = s
     if not clean:
