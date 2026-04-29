@@ -26,7 +26,6 @@ from agent.state_manager import (
     has_pending_low_confidence_confirmation,
     infer_email_from_transcript,
     infer_phone_from_transcript,
-    infer_property_address_from_transcript,
     infer_yes_no_from_transcript,
     looks_like_answer_for_current_field,
     reset_state,
@@ -56,11 +55,10 @@ BARGE_IN_FINAL_GRACE_SECS = max(
 ANSWER_GUARD_SECS = float(os.getenv("TWILIO_PATH2_ANSWER_GUARD_SECS", "2.0"))
 TTS_STARTUP_DELAY_SECS = max(0.0, float(os.getenv("TWILIO_TTS_STARTUP_DELAY_SECS", "0.3")))
 TTS_DRAIN_SECS = max(0.0, float(os.getenv("TWILIO_TTS_DRAIN_SECS", "0.25")))
-ADDRESS_FINAL_BUFFER_WINDOW_SECS = max(
-    0.0, float(os.getenv("TWILIO_ADDRESS_FINAL_BUFFER_WINDOW_SECS", "1.0"))
-)
-ADDRESS_FINAL_BUFFER_MAX_FRAGMENTS = max(
-    1, int(os.getenv("TWILIO_ADDRESS_FINAL_BUFFER_MAX_FRAGMENTS", "3"))
+# After Cartesia stops streaming, Twilio may still play queued µ-law for a while — keep
+# barge-in + VAD armed until this tail after the last chunk we sent (fixes interrupt during long consent / trailing playback).
+TWILIO_PLAYBACK_TAIL_SECS = max(
+    0.0, float(os.getenv("TWILIO_PLAYBACK_TAIL_SECS", "3.0"))
 )
 CONTACT_PHONE_BUFFER_SECS = max(
     0.0, float(os.getenv("TWILIO_CONTACT_PHONE_BUFFER_SECS", "2.0"))
@@ -89,7 +87,7 @@ DETERMINISTIC_GOODBYE_DRAIN_SEC = float(
 DETERMINISTIC_FOLLOWUP_POLL_SEC = 0.25
 DETERMINISTIC_FOLLOWUP_MAX_WAIT_SEC = 8.0
 CALLER_RESPONSE_WATCHDOG_SECS = max(
-    1.0, float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_SECS", "10.0"))
+    1.0, float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_SECS", "15.0"))
 )
 CALLER_RESPONSE_WATCHDOG_PREFIX = os.getenv(
     "TWILIO_CALLER_RESPONSE_WATCHDOG_PREFIX",
@@ -100,9 +98,6 @@ PIPELINE_DEBUG_ENABLED = os.getenv("TWILIO_PIPELINE_DEBUG", "1").strip().lower()
     "true",
     "yes",
     "on",
-)
-STT_PARTIAL_CACHE_MAX_AGE_SECS = max(
-    0.2, float(os.getenv("TWILIO_STT_PARTIAL_CACHE_MAX_AGE_SECS", "1.8"))
 )
 MEDIA_DEBUG_INTERVAL_FRAMES = max(
     20, int(os.getenv("TWILIO_MEDIA_DEBUG_INTERVAL_FRAMES", "100"))
@@ -194,13 +189,9 @@ class TwilioLineBridge:
         self._end_watch_task: Optional[asyncio.Task[None]] = None
         self._caller_response_watchdog_task: Optional[asyncio.Task[None]] = None
         self._deterministic_followup_task: Optional[asyncio.Task[None]] = None
-        self._address_buffer_task: Optional[asyncio.Task[None]] = None
-        self._address_final_buffer: list[str] = []
         self._contact_buffer_task: Optional[asyncio.Task[None]] = None
         self._contact_final_buffer: list[str] = []
         self._contact_buffer_kind: Optional[str] = None
-        self._last_stt_partial_text: str = ""
-        self._last_stt_partial_ts: float = 0.0
         self._rx_media_frames = 0
         self._rx_media_bytes = 0
         self._last_stt_event_ts = time.monotonic()
@@ -209,6 +200,7 @@ class TwilioLineBridge:
         self._agent_playing = False
         self._agent_playing_started_at = 0.0
         self._last_agent_audio_time = 0.0
+        self._playback_tail_until = 0.0
         self._last_barge_at = 0.0
         self._barge_in_accept_final_until = 0.0
         self._deterministic_answer_guard_until = 0.0
@@ -463,7 +455,7 @@ class TwilioLineBridge:
             prompt = self._caller_response_prompt.strip()
             if not prompt:
                 return
-            repeat = f"{CALLER_RESPONSE_WATCHDOG_PREFIX} {prompt}".strip()
+            repeat = f"{CALLER_RESPONSE_WATCHDOG_PREFIX}".strip()
             await self._line.tts_queue.put(repeat)
             await broadcast_stt(
                 kind="agent_caller_response_watchdog",
@@ -477,9 +469,12 @@ class TwilioLineBridge:
         except asyncio.CancelledError:
             raise
 
-    @staticmethod
-    def _is_number_only_fragment(text: str) -> bool:
-        return re.fullmatch(r"\d{1,6}[.]?", (text or "").strip()) is not None
+    def _playback_audio_active(self) -> bool:
+        """True while TTS is streaming or Twilio may still be playing buffered outbound audio."""
+        if self._agent_playing:
+            return True
+        tail_until = getattr(self, "_playback_tail_until", 0.0) or 0.0
+        return time.monotonic() < tail_until
 
     @staticmethod
     def _looks_like_meaningful_barge_in(
@@ -548,7 +543,7 @@ class TwilioLineBridge:
 
     async def _vad_check_barge_in(self, data: bytes, now: float) -> None:
         """Fire barge-in when consecutive high-energy frames detected during TTS."""
-        if not VAD_BARGE_IN_ENABLED or not self._agent_playing:
+        if not VAD_BARGE_IN_ENABLED or not self._playback_audio_active():
             self._vad_consec_high = 0
             return
         if (now - self._agent_playing_started_at) < VAD_ECHO_GRACE_SECS:
@@ -575,7 +570,7 @@ class TwilioLineBridge:
         in_echo: bool,
         now: float,
     ) -> bool:
-        if not self._agent_playing:
+        if not self._playback_audio_active():
             return False
         if (now - self._last_barge_at) < BARGE_IN_COOLDOWN_SECS:
             return False
@@ -591,91 +586,6 @@ class TwilioLineBridge:
             if not looks_like_answer_for_current_field(text.strip(), missing):
                 return False
         return True
-
-    def _property_address_still_missing(self) -> bool:
-        missing_now = (get_missing_fields() or "").lower()
-        return "property address (street)" in missing_now
-
-    def _cancel_address_buffer_task(self) -> None:
-        t = self._address_buffer_task
-        self._address_buffer_task = None
-        if t and not t.done() and t is not asyncio.current_task():
-            t.cancel()
-
-    async def _flush_address_buffer(self, *, reason: str) -> None:
-        parts = [p.strip() for p in self._address_final_buffer if (p or "").strip()]
-        self._address_final_buffer = []
-        self._cancel_address_buffer_task()
-        if not parts:
-            return
-        merged = re.sub(r"\s+", " ", " ".join(parts)).strip()
-        if not merged:
-            return
-        self._log_pipeline_debug(
-            (
-                f"Address buffer flush | reason={reason} fragments={len(parts)} "
-                f"merged='{merged[:120]}'"
-            ),
-            event="path2.address_buffer.flush_debug",
-        )
-        if self._property_address_still_missing() and self._is_number_only_fragment(merged):
-            self.call_logger.info(
-                "Dropping buffered number-only STT final while property address still missing",
-                event="path2.stt.number_only_drop",
-            )
-            await broadcast_stt(
-                kind="user_final_number_only_drop",
-                text=merged,
-                call_sid=self.call_sid,
-            )
-            return
-        await broadcast_stt(
-            kind="user_final_merged",
-            text=merged,
-            call_sid=self.call_sid,
-        )
-        await self._handle_final_transcript(merged)
-        await path2_debug_log(
-            "path2.address_buffer.flush",
-            reason=reason,
-            merged_preview=merged[:160],
-            fragments=len(parts),
-        )
-
-    def _should_buffer_address_fragment(self, text: str) -> bool:
-        if not self._property_address_still_missing():
-            return False
-        t = (text or "").strip().lower()
-        if not t:
-            return False
-        if self._address_final_buffer:
-            return True
-        if any(ch.isdigit() for ch in t):
-            return True
-        address_tokens = (
-            "street",
-            "st",
-            "avenue",
-            "ave",
-            "boulevard",
-            "blvd",
-            "road",
-            "rd",
-            "drive",
-            "dr",
-            "lane",
-            "ln",
-            "court",
-            "ct",
-            "parkway",
-            "pkwy",
-            "place",
-            "pl",
-            "los angeles",
-            "california",
-            " ca",
-        )
-        return any(tok in t for tok in address_tokens)
 
     def _cancel_contact_buffer_task(self) -> None:
         t = self._contact_buffer_task
@@ -789,66 +699,6 @@ class TwilioLineBridge:
         self._contact_final_buffer = []
         self._contact_buffer_kind = None
 
-    def _schedule_address_buffer_flush(self) -> None:
-        self._cancel_address_buffer_task()
-        self._address_buffer_task = asyncio.create_task(
-            self._wait_and_flush_address_buffer(),
-            name="path2_address_final_buffer",
-        )
-
-    async def _wait_and_flush_address_buffer(self) -> None:
-        try:
-            await asyncio.sleep(ADDRESS_FINAL_BUFFER_WINDOW_SECS)
-            if not self._running:
-                return
-            await self._flush_address_buffer(reason="timer")
-        except asyncio.CancelledError:
-            raise
-
-    async def _buffer_property_address_fragment(self, text: str) -> bool:
-        if not self._should_buffer_address_fragment(text):
-            if self._address_final_buffer:
-                await self._flush_address_buffer(reason="non_address_fragment")
-            return False
-        self._address_final_buffer.append(text.strip())
-        self._log_pipeline_debug(
-            (
-                f"Address buffer append | size={len(self._address_final_buffer)} "
-                f"fragment='{text[:120]}'"
-            ),
-            event="path2.address_buffer.append",
-        )
-        if len(self._address_final_buffer) >= ADDRESS_FINAL_BUFFER_MAX_FRAGMENTS:
-            await self._flush_address_buffer(reason="max_fragments")
-        else:
-            self._schedule_address_buffer_flush()
-        return True
-
-    def _maybe_use_partial_cache_for_address(self, final_text: str) -> str:
-        if not self._property_address_still_missing():
-            return final_text
-        if infer_property_address_from_transcript(final_text):
-            return final_text
-        age = time.monotonic() - self._last_stt_partial_ts
-        cached = (self._last_stt_partial_text or "").strip()
-        if not cached or age > STT_PARTIAL_CACHE_MAX_AGE_SECS:
-            return final_text
-        if infer_property_address_from_transcript(cached):
-            if self._current_tts_text.strip() and self._looks_like_current_agent_echo(
-                cached
-            ):
-                return final_text
-            self._log_pipeline_debug(
-                (
-                    "Substituting STT final with recent partial cache | "
-                    f"age_ms={round(age * 1000, 2)} final='{final_text[:120]}' "
-                    f"partial='{cached[:120]}'"
-                ),
-                event="path2.stt.final_substitute_partial",
-            )
-            return cached
-        return final_text
-
     async def _consume_stt(self) -> None:
         if not self._stt or not self._line:
             return
@@ -876,7 +726,8 @@ class TwilioLineBridge:
                     self._log_pipeline_debug(
                         (
                             f"STT transcript | final={is_final} echo={in_echo} "
-                            f"agent_playing={self._agent_playing} len={len(text)} "
+                            f"agent_playing={self._agent_playing} playback_active="
+                            f"{self._playback_audio_active()} len={len(text)} "
                             f"since_last_agent_audio_ms={delta_ms} confidence={confidence} "
                             f"text='{text[:160]}'"
                         ),
@@ -884,8 +735,6 @@ class TwilioLineBridge:
                     )
 
                     if not is_final:
-                        self._last_stt_partial_text = text
-                        self._last_stt_partial_ts = now
                         self._log_pipeline_debug(
                             f"STT partial | len={len(text)} text='{text[:160]}'",
                             event="path2.stt.partial",
@@ -970,13 +819,6 @@ class TwilioLineBridge:
                             f"Dropped symbol-only STT final | text='{text}'",
                             event="path2.stt.symbol_only_drop",
                         )
-                        continue
-
-                    text = self._maybe_use_partial_cache_for_address(text)
-                    self._last_stt_partial_text = ""
-                    self._last_stt_partial_ts = 0.0
-
-                    if await self._buffer_property_address_fragment(text):
                         continue
 
                     if await self._buffer_contact_fragment(text):
@@ -1085,7 +927,13 @@ class TwilioLineBridge:
                 )
                 self._cancel_deterministic_followup_task()
                 await self._line.mark_deterministic_turn(result.ask_next)
-                if result.ask_next is None:
+                if getattr(result, "terminate_after_tts", False):
+                    self._ending_call = True
+                    asyncio.create_task(
+                        self._hang_up_after_terminal_deterministic_speech(),
+                        name="path2_terminal_deterministic_hangup",
+                    )
+                elif result.ask_next is None:
                     missing_now = get_missing_fields() or ""
                     if not missing_now.strip():
                         await self._send_deterministic_goodbye()
@@ -1149,6 +997,7 @@ class TwilioLineBridge:
     async def _barge_in(self) -> None:
         self.call_logger.info("Barge-in: cancel TTS + Line + Twilio clear", event="path2.barge_in")
         self._discard_contact_buffer()
+        self._playback_tail_until = 0.0
         self._barge_in_accept_final_until = time.monotonic() + BARGE_IN_FINAL_GRACE_SECS
         if self._tts:
             await self._tts.cancel_current()
@@ -1170,6 +1019,22 @@ class TwilioLineBridge:
         )
         await asyncio.sleep(DETERMINISTIC_GOODBYE_DRAIN_SEC)
         if self._line:
+            self._line.end_call_event.set()
+
+    async def _hang_up_after_terminal_deterministic_speech(self) -> None:
+        """After a closing line (e.g. consent declined), wait for TTS then end the call."""
+        drain = float(
+            os.getenv(
+                "CONSENT_DECLINE_DRAIN_SEC",
+                str(DETERMINISTIC_GOODBYE_DRAIN_SEC),
+            )
+        )
+        await asyncio.sleep(max(2.0, drain))
+        if self._line:
+            self.call_logger.info(
+                "Terminal deterministic speech drain complete — ending call",
+                event="path2.terminal_deterministic_hangup",
+            )
             self._line.end_call_event.set()
 
     @staticmethod
@@ -1269,6 +1134,9 @@ class TwilioLineBridge:
                 f"TTS dequeue | chars={len(text)} text='{text[:160]}'",
                 event="path2.tts.dequeue",
             )
+            self._playback_tail_until = 0.0
+            utterance_t0_mono = time.monotonic()
+            self._last_agent_audio_time = 0.0
             self._agent_playing = True
             self._agent_playing_started_at = time.monotonic()
             self._current_tts_text = text
@@ -1291,6 +1159,20 @@ class TwilioLineBridge:
                 if TTS_DRAIN_SECS > 0:
                     # Let Twilio finish buffered playback before opening mic turn.
                     await asyncio.sleep(TTS_DRAIN_SECS)
+                lat = self._last_agent_audio_time
+                if TWILIO_PLAYBACK_TAIL_SECS > 0 and lat >= utterance_t0_mono - 1.0:
+                    self._playback_tail_until = lat + TWILIO_PLAYBACK_TAIL_SECS
+                    self._log_pipeline_debug(
+                        (
+                            f"Playback tail armed | until_mono={self._playback_tail_until:.3f} "
+                            f"after_last_chunk_mono={lat:.3f} tail_s={TWILIO_PLAYBACK_TAIL_SECS}"
+                        ),
+                        event="path2.tts.playback_tail",
+                    )
+                elif TWILIO_PLAYBACK_TAIL_SECS > 0:
+                    self._playback_tail_until = time.monotonic() + min(
+                        TWILIO_PLAYBACK_TAIL_SECS, 1.0
+                    )
                 self._agent_playing = False
                 self._agent_playing_started_at = 0.0
                 self._current_tts_text = ""
@@ -1357,8 +1239,6 @@ class TwilioLineBridge:
 
         self._cancel_deterministic_followup_task()
         self._cancel_caller_response_watchdog()
-        self._cancel_address_buffer_task()
-        self._address_final_buffer = []
         self._discard_contact_buffer()
         for t in (
             self._stt_task,
@@ -1398,6 +1278,13 @@ class TwilioLineBridge:
             except Exception:
                 pass
             self._stt = None
+
+        try:
+            from agent.state_manager import append_heloc_ui_transcript_final_snapshot
+
+            append_heloc_ui_transcript_final_snapshot(self.call_sid)
+        except Exception:
+            pass
 
         try:
             await reset_state()
