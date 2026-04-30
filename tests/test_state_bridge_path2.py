@@ -910,6 +910,7 @@ def test_vad_barge_in_uses_playback_start_grace_not_last_audio_time():
 
     async def _run() -> None:
         bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+        bridge._current_tts_text = ""
         bridge._agent_playing = True
         bridge._agent_playing_started_at = 10.0
         bridge._last_agent_audio_time = 10.99
