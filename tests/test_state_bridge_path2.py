@@ -301,6 +301,7 @@ def test_status_check_utterance_short_circuit_match():
     assert lsc("excuse me") is True
     assert lsc("which question?") is True
     assert lsc("what do you need?") is True
+    assert lsc("what info do you need from me") is True
     assert lsc("325 West Adams Boulevard") is False
     assert lsc("sole owner") is False
 
@@ -330,6 +331,18 @@ def test_looks_like_answer_for_current_field_rejects_non_answer():
     assert looks_like_answer_for_current_field("store owner", missing) is True
 
 
+def test_clarification_for_wcl_occupancy_prompt():
+    from app.line_session_client import LineSessionClient
+
+    ask = (
+        "Is this your primary home, a second home, "
+        "or an investment property?"
+    )
+    clarification = LineSessionClient._clarification_for_ask(ask)
+    assert clarification.startswith("I'm here.")
+    assert clarification != ask
+
+
 def test_clarification_for_ownership_is_not_same_question():
     from app.line_session_client import LineSessionClient
 
@@ -354,7 +367,70 @@ async def test_enqueue_status_check_response_includes_current_ask():
     client.tts_queue = asyncio.Queue()
 
     assert await client.enqueue_status_check_response() is True
-    assert client.tts_queue.get_nowait() == "What is your date of birth?"
+    assert (
+        client.tts_queue.get_nowait()
+        == "Could you say your date of birth again: month, day, and year?"
+    )
+
+
+def test_transcript_seeks_question_repeat():
+    from agent.state_manager import transcript_seeks_question_repeat as seeks
+
+    assert seeks("What's the question?") is True
+    assert seeks("what info do you need") is True
+    assert seeks("repeat") is True
+    assert seeks("pardon?") is True
+    assert seeks("Are you there?") is False
+    assert seeks("thanks") is False
+
+
+async def test_enqueue_status_check_response_verbatim_when_meta_question():
+    from app.line_session_client import LineSessionClient
+
+    ask = "What's the best mobile number for this application?"
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._last_tool_ask = ask
+    client._ask_spoken_this_turn = True
+    client._last_spoken_ask_text = ""
+    client._last_spoken_ask_ts = 0.0
+    client._ask_dedup_window_sec = 3.0
+    client._post_fallback_mute_model_sec = 1.8
+    client._mute_model_text_until = 0.0
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client.tts_queue = asyncio.Queue()
+
+    assert (
+        await client.enqueue_status_check_response(
+            user_transcript="What's the question?",
+        )
+        is True
+    )
+    assert client.tts_queue.get_nowait() == ask
+
+
+async def test_enqueue_status_check_presence_keeps_short_clarification():
+    from app.line_session_client import LineSessionClient
+
+    ask = "What's the best mobile number for this application?"
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._last_tool_ask = ask
+    client._ask_spoken_this_turn = True
+    client._last_spoken_ask_text = ""
+    client._last_spoken_ask_ts = 0.0
+    client._ask_dedup_window_sec = 3.0
+    client._post_fallback_mute_model_sec = 1.8
+    client._mute_model_text_until = 0.0
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client.tts_queue = asyncio.Queue()
+
+    assert (
+        await client.enqueue_status_check_response(user_transcript="Are you there?")
+        is True
+    )
+    assert (
+        client.tts_queue.get_nowait()
+        == "Could you say the mobile number one more time, all ten digits?"
+    )
 
 
 def test_expanded_consent_prompts():
@@ -671,6 +747,47 @@ async def test_update_application_state_rejects_guessed_email_without_spoken_evi
     assert "email_address rejected" in result
 
 
+async def test_update_application_state_rejects_email_when_transcript_parse_differs():
+    """Evidence can pass via glued turns ('Prasad. at … dot …'); LLM guess must still match parse."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import update_application_state
+
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+    mock_browser._page = None
+
+    state = HelocApplicationState(mobile_phone_number="2135550101")
+    raw = "Prasad. at direct g mail dot com."
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
+    ):
+        result = await update_application_state.func(
+            None,
+            email_address="prasad.malwadkar@example.com",
+            confidence_score=1.0,
+            raw_user_input=raw,
+        )
+
+    assert state.email_address is None
+    assert "transcript does not parse" in result
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", state),
+        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
+    ):
+        await update_application_state.func(
+            None,
+            email_address="prasad@directgmail.com",
+            confidence_score=1.0,
+            raw_user_input=raw,
+        )
+
+    assert state.email_address == "prasad@directgmail.com"
+
+
 def test_strong_pin_normalize_agent_text():
     from app.line_session_client import LineSessionClient
 
@@ -747,6 +864,18 @@ def test_looks_like_answer_to_ownership_numeric_shortcuts():
     assert fn(ask, "one") is True
     assert fn(ask, "two") is True
     assert fn(ask, "sad") is False
+    assert fn(ask, "um") is False
+
+
+def test_looks_like_answer_to_wcl_occupancy_ask():
+    from app.line_session_client import LineSessionClient
+
+    fn = LineSessionClient._looks_like_answer_to_ask
+    ask = (
+        "Is this your primary home, a second home, or an investment property?"
+    )
+    assert fn(ask, "primary.") is True
+    assert fn(ask, "investment property") is True
     assert fn(ask, "um") is False
 
 

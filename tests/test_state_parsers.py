@@ -152,6 +152,36 @@ def test_infer_income_source_employed():
     assert infer_income_source_from_transcript("5") == "Unemployed / furloughed"
 
 
+def test_infer_occupancy_with_optional_recovery_partial():
+    from agent.state_manager import infer_occupancy_with_optional_recovery
+
+    eff, occ = infer_occupancy_with_optional_recovery("Henry Home.", "Primary.")
+    assert occ == "Primary property"
+    assert eff == "Primary."
+
+
+def test_stt_confidence_reprompt_gate_unit_interval():
+    from agent.state_manager import _stt_confidence_triggers_reprompt
+
+    assert _stt_confidence_triggers_reprompt(None) is False
+    assert _stt_confidence_triggers_reprompt(-0.1) is False
+    assert _stt_confidence_triggers_reprompt(1.5) is False
+    assert _stt_confidence_triggers_reprompt(-2.5) is False
+    assert _stt_confidence_triggers_reprompt(0.51) is True
+    assert _stt_confidence_triggers_reprompt(0.52) is False
+
+
+def test_looks_like_answer_wcl_occupancy_ask():
+    from agent.state_manager import looks_like_answer_for_current_field
+
+    missing = (
+        'Ask next: "Is this your primary home, a second home, '
+        'or an investment property?"'
+    )
+    assert looks_like_answer_for_current_field("Primary.", missing) is True
+    assert looks_like_answer_for_current_field("Investment.", missing) is True
+
+
 def test_infer_occupancy_and_for_sale():
     from agent.state_manager import infer_occupancy_from_transcript, infer_for_sale_from_transcript
 
@@ -215,6 +245,10 @@ def test_infer_phone_email_yesno_and_address():
     assert infer_email_from_transcript(
         "jane smith eight four eight at gmail dot com"
     ) == "janesmith848@gmail.com"
+    assert infer_email_from_transcript("m n five six at g mail dot") == "mn56@gmail.com"
+    assert infer_email_from_transcript(
+        "Prasad. at direct g mail dot com."
+    ) == "prasad@directgmail.com"
     # Missing local part before @ is invalid by design.
     assert infer_email_from_transcript("@gmail.com") is None
 
@@ -400,3 +434,201 @@ def test_infer_property_address_plain_street():
     assert r.startswith("456 ")
     assert "Maple" in r
     assert "Avenue" in r
+
+
+def test_infer_property_city_state_from_transcript():
+    from agent.state_manager import infer_property_city_state_from_transcript
+
+    raw = (
+        "Yeah. Um, it's five one zero zero South Rolling Green Avenue, Sioux Falls, SD."
+    )
+    assert infer_property_city_state_from_transcript(raw) == {
+        "city": "Sioux Falls",
+        "state": "SD",
+    }
+    assert infer_property_city_state_from_transcript("123 Main St") == {}
+
+
+def test_build_address_autocomplete_type_query_appends_city_state():
+    from agent.state_manager import build_address_autocomplete_type_query
+
+    street = "5100 South Rolling Green Avenue"
+    raw = (
+        "Yeah. Um, it's five one zero zero South Rolling Green Avenue, Sioux Falls, SD."
+    )
+    assert (
+        build_address_autocomplete_type_query(street, raw)
+        == "5100 South Rolling Green Avenue Sioux Falls SD"
+    )
+
+
+def test_build_address_autocomplete_type_query_no_commas_returns_street_only():
+    from agent.state_manager import build_address_autocomplete_type_query
+
+    assert (
+        build_address_autocomplete_type_query("123 Main St", "some transcript without commas")
+        == "123 Main St"
+    )
+
+
+def test_build_address_autocomplete_type_query_empty_street():
+    from agent.state_manager import build_address_autocomplete_type_query
+
+    assert build_address_autocomplete_type_query("", "Boston, MA") is None
+
+
+def test_normalize_scaffold_strips_fillers():
+    from agent.state_manager import normalize_answer_scaffold
+
+    assert normalize_answer_scaffold("Yeah. Um, five one zero zero Main St") == "five one zero zero Main St"
+    assert normalize_answer_scaffold("Uh, four one three") == "four one three"
+    assert normalize_answer_scaffold("Okay, sure, 600K") == "600K"
+
+def test_normalize_scaffold_preserves_bare_yes_no():
+    from agent.state_manager import normalize_answer_scaffold
+
+    assert normalize_answer_scaffold("Yes.") == "Yes."
+    assert normalize_answer_scaffold("No.") == "No."
+    assert normalize_answer_scaffold("Yeah.") == "Yeah."
+    assert normalize_answer_scaffold("Uh, no.") == "no."
+
+def test_normalize_scaffold_chains():
+    from agent.state_manager import normalize_answer_scaffold
+
+    assert normalize_answer_scaffold("Yeah. Um, well, 123 Main St") == "123 Main St"
+
+
+def test_address_parse_with_filler_lead_in():
+    from agent.state_manager import infer_property_address_from_transcript
+
+    r = infer_property_address_from_transcript(
+        "Yeah. Um, it's five one zero zero South Rolling Green Avenue, Sioux Falls."
+    )
+    assert r is not None
+    assert r.startswith("5100")
+
+def test_address_parse_uh_its():
+    from agent.state_manager import infer_property_address_from_transcript
+
+    r = infer_property_address_from_transcript(
+        "Uh, it's one two three four Elm Street."
+    )
+    assert r is not None
+    assert r.startswith("1234")
+
+
+def test_income_parse_with_uncertainty_words():
+    from agent.state_manager import infer_annual_income_meta
+
+    val, fragile = infer_annual_income_meta(
+        "I think it could be around six hundred thousand dollars."
+    )
+    assert val == 600_000
+
+def test_income_parse_per_annum():
+    from agent.state_manager import infer_annual_income_meta
+
+    val, fragile = infer_annual_income_meta(
+        "It's six hundred thousand dollars per annum."
+    )
+    assert val == 600_000
+
+def test_income_parse_might_be():
+    from agent.state_manager import infer_annual_income_meta
+
+    val, _ = infer_annual_income_meta("It might be about 80K a year.")
+    assert val == 80_000
+
+
+def test_partial_dob_month_day_only():
+    from agent.state_manager import infer_partial_dob_month_day
+
+    assert infer_partial_dob_month_day("April seventh.") is True
+    assert infer_partial_dob_month_day("January 15") is True
+    assert infer_partial_dob_month_day("7th April") is True
+    assert infer_partial_dob_month_day("twenty first of March") is True
+
+def test_partial_dob_full_date_not_partial():
+    from agent.state_manager import infer_partial_dob_month_day
+
+    assert infer_partial_dob_month_day("April 7th 1990") is False
+    assert infer_partial_dob_month_day("01/05/1990") is False
+
+def test_partial_dob_nonsense():
+    from agent.state_manager import infer_partial_dob_month_day
+
+    assert infer_partial_dob_month_day("hello there") is False
+    assert infer_partial_dob_month_day("") is False
+
+
+def test_partial_dob_cardinal_month_or_month_only():
+    from agent.state_manager import infer_partial_dob_month_day
+
+    assert infer_partial_dob_month_day("Nine February.") is True
+    assert infer_partial_dob_month_day("In February.") is True
+    assert infer_partial_dob_month_day("February.") is True
+    assert infer_partial_dob_month_day("nine february nineteen ninety") is False
+
+
+def test_transcript_supports_saved_dob_blocks_llm_guess():
+    from agent.state_manager import _transcript_supports_saved_dob
+
+    assert _transcript_supports_saved_dob("First gen.", "02/09/1990") is False
+    assert _transcript_supports_saved_dob("Nine February.", "02/09/1990") is False
+    assert _transcript_supports_saved_dob("February 9th 1990.", "02/09/1990") is True
+
+
+def test_normalize_scaffold_strips_i_think_for_uncertainty_rescan():
+    from agent.state_manager import detect_uncertainty, normalize_answer_scaffold
+
+    cleaned = normalize_answer_scaffold("I think it's one million.")
+    assert detect_uncertainty(cleaned) == []
+
+
+def test_other_income_yes_is_not_zero():
+    from agent.state_manager import infer_other_income_from_transcript
+
+    assert infer_other_income_from_transcript("Yes.") is None
+    assert infer_other_income_from_transcript("Yes, I do.") is None
+
+def test_other_income_no_returns_zero():
+    from agent.state_manager import infer_other_income_from_transcript
+
+    assert infer_other_income_from_transcript("No.") == 0
+    assert infer_other_income_from_transcript("Nope.") == 0
+    assert infer_other_income_from_transcript("No other income") == 0
+
+
+def test_extract_inline_phone_after_no():
+    from agent.state_manager import _extract_inline_answer_after_no
+
+    result = _extract_inline_answer_after_no(
+        "No, it's 4132756066",
+        {"mobile_phone_number": "old_number"},
+    )
+    assert result.get("mobile_phone_number") == "4132756066"
+
+def test_extract_inline_email_after_no():
+    from agent.state_manager import _extract_inline_answer_after_no
+
+    result = _extract_inline_answer_after_no(
+        "No, it's john@gmail.com",
+        {"email_address": "old@old.com"},
+    )
+    assert result.get("email_address") == "john@gmail.com"
+
+def test_extract_inline_bare_no():
+    from agent.state_manager import _extract_inline_answer_after_no
+
+    result = _extract_inline_answer_after_no("No.", {"mobile_phone_number": "123"})
+    assert result == {}
+
+
+def test_spoken_nine_digits_after_filler():
+    from agent.state_manager import _spoken_digit_sequence_to_digits, normalize_answer_scaffold
+
+    raw = "Uh, it's four one three two seven five six zero six"
+    cleaned = normalize_answer_scaffold(raw)
+    digits = _spoken_digit_sequence_to_digits(cleaned)
+    assert digits == "413275606"
+    assert len(digits) == 9

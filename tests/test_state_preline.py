@@ -208,6 +208,54 @@ def test_prefill_initial_ask_greets_first_name_for_on_file_address():
         )
 
 
+def test_prefill_initial_ask_prepends_hi_for_opening_non_address_ask():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import get_initial_intake_ask, set_customer_prefill
+
+    mock_state = HelocApplicationState(address_line_1="1 Main St")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch(
+            "agent.state_manager.get_missing_fields",
+            return_value=(
+                '[BROWSER STAGE: PROPERTY] Still needed: ownership '
+                'Ask next: "Are you the sole owner, or is it jointly owned?"'
+            ),
+        ),
+    ):
+        set_customer_prefill({"first_name": "Pat"})
+        assert get_initial_intake_ask() == (
+            "Hi Pat, Are you the sole owner, or is it jointly owned?"
+        )
+
+
+def test_prefill_initial_ask_when_missing_line_has_no_quoted_ask():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import get_initial_intake_ask, set_customer_prefill
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch(
+            "agent.state_manager.get_missing_fields",
+            return_value="[BROWSER STAGE: PROPERTY] Still waiting.",
+        ),
+    ):
+        set_customer_prefill({"first_name": "Pat"})
+        assert (
+            get_initial_intake_ask()
+            == "Hi Pat, Can you tell me the property address?"
+        )
+
+
 def test_on_file_confirmation_yes_passes_non_answer_gate():
     from agent.state_manager import looks_like_answer_for_current_field
 
@@ -226,6 +274,157 @@ def test_on_file_confirmation_yes_passes_non_answer_gate():
     )
     assert looks_like_answer_for_current_field("Yeah.", last_name_missing) is True
     assert looks_like_answer_for_current_field("correct.", last_name_missing) is True
+
+
+async def test_preline_occupancy_garbled_final_not_commentary_reprompt():
+    """No regex UI-meta path: unparsed occupancy utterance falls through (LLM/tool path)."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
+
+    mock_state = HelocApplicationState(
+        address_line_1="123 LN",
+        ownership_type="Sole owner",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line("It says Henry Home.")
+
+    assert result.handled is False
+    mock_tool.func.assert_not_called()
+
+
+async def test_preline_occupancy_low_confidence_reprompt():
+    """Deepgram-low final on occupancy ask → scripted reprompt, no tool."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        OCCUPANCY_LOW_CONF_REPROMPT,
+        apply_voice_intake_heuristics_before_line,
+    )
+
+    mock_state = HelocApplicationState(
+        address_line_1="123 LN",
+        ownership_type="Sole owner",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line(
+            "Henry Home.",
+            stt_confidence=0.35,
+        )
+
+    assert result.handled is True
+    assert result.ask_next == OCCUPANCY_LOW_CONF_REPROMPT
+    assert result.handled_field == "occupancy_type"
+    mock_tool.func.assert_not_called()
+
+
+async def test_preline_final_bad_partial_recovery_occupancy():
+    """Final garbage but last partial had occupancy cue → deterministic save."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
+
+    mock_state = HelocApplicationState(
+        address_line_1="123 LN",
+        ownership_type="Sole owner",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(
+            return_value=_make_tool_result("Is the property currently listed for sale?")
+        )
+        result = await apply_voice_intake_heuristics_before_line(
+            "Henry Home.",
+            stt_confidence=0.95,
+            stt_recovery_text="Primary.",
+        )
+
+    assert result.handled is True
+    assert result.handled_field == "occupancy_type"
+    mock_tool.func.assert_called_once()
+
+
+async def test_preline_it_says_primary_home_still_saves_occupancy():
+    """Meta phrase + real answer → deterministic occupancy, not commentary-only."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
+
+    mock_state = HelocApplicationState(address_line_1="123 LN", ownership_type="Sole owner")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(
+            return_value=_make_tool_result("Is the property currently listed for sale?")
+        )
+        result = await apply_voice_intake_heuristics_before_line(
+            "It says primary home on the screen."
+        )
+
+    assert result.handled is True
+    assert result.handled_field == "occupancy_type"
+    mock_tool.func.assert_called_once()
+
+
+async def test_preline_redundant_occupancy_echo_skips_llm_and_tool():
+    """Echo same occupancy while browser lags — deterministic next ask, no tool."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
+
+    mock_state = HelocApplicationState(
+        address_line_1="123 LN",
+        ownership_type="Sole owner",
+        occupancy_type="Primary property",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "property"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch(
+            "agent.state_manager.get_missing_fields",
+            return_value=(
+                '[BROWSER STAGE: PROPERTY] Still needed: x '
+                'Ask next: "What is your annual income?"'
+            ),
+        ),
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line("Primary.")
+
+    assert result.handled is True
+    assert result.ask_next == "What is your annual income?"
+    mock_tool.func.assert_not_called()
 
 
 async def test_prefill_last_name_confirmation_accepts_repeated_yeah():
@@ -434,6 +633,44 @@ async def test_preline_idk_falls_back_sole_ownership():
     )
 
 
+async def test_primary_home_address_bridges_for_sale_without_pull_up_wording():
+    """Avoid 'I'll pull that up' before for-sale ask — bare 'yes' was mis-read as for-sale."""
+    from agent.schema import HeuristicResult, HelocApplicationState
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
+
+    for_sale_ask = "Is the property currently listed for sale?"
+    mock_state = HelocApplicationState(
+        address_line_1="123 Main St",
+        ownership_type="Sole owner",
+        occupancy_type="Secondary property",
+    )
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "primary-home"
+    mock_browser.address_not_found_primary_home = False
+    tool_return = _make_tool_result(for_sale_ask)
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch("agent.state_manager._use_deterministic_address_parsing", return_value=True),
+        patch(
+            "agent.state_manager.infer_property_address_from_transcript",
+            return_value="5100 Oak St",
+        ),
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(return_value=tool_return)
+        result = await apply_voice_intake_heuristics_before_line("5100 Oak Street")
+
+    assert isinstance(result, HeuristicResult)
+    assert result.handled is True
+    assert result.handled_field == "primary_home_address_line_1"
+    assert "i'll pull that up" not in (result.ask_next or "").lower()
+    assert (result.ask_next or "").startswith("Thanks for that.")
+    assert for_sale_ask in (result.ask_next or "")
+
+
 async def test_preline_heuristic_env_killswitch():
     """PATH2_ENABLE_PRELINE_HEURISTICS=0 forces handled=False."""
     from agent.schema import HeuristicResult
@@ -486,6 +723,67 @@ async def test_preline_partial_phone_reprompt_skips_tool():
     mock_tool.func.assert_not_called()
 
 
+async def test_preline_contact_spoken_nine_digit_spell_reprompt():
+    """Word-only digit spell producing 9 digits → partial reprompt (not silent LLM fail)."""
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        PARTIAL_MOBILE_PHONE_REPROMPT,
+        apply_voice_intake_heuristics_before_line,
+    )
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line(
+            "Four one three two seven five six zero six"
+        )
+
+    assert result.handled is True
+    assert result.ask_next == PARTIAL_MOBILE_PHONE_REPROMPT
+    mock_tool.func.assert_not_called()
+
+
+async def test_prefill_reject_clears_mobile_phone_from_state():
+    """Rejecting on-file mobile confirmation must drop stale digits from application_state."""
+    import agent.state_manager as sm
+    from agent.schema import HelocApplicationState
+
+    mock_state = HelocApplicationState(mobile_phone_number="4132726066")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+
+    pending = {
+        "values": {"mobile_phone_number": "4132726066"},
+        "ask": "I have your mobile number as 4132726066. Is that correct?",
+    }
+    with (
+        patch.object(sm, "_prefill_confirm_pending", pending),
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+        patch.object(
+            sm,
+            "get_missing_fields",
+            return_value='Ask next: "What\'s the best mobile number for this application?"',
+        ),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await sm.apply_voice_intake_heuristics_before_line("No.")
+
+    assert result.handled_field == "prefill_confirmation_rejected"
+    assert mock_state.mobile_phone_number is None
+    mock_tool.func.assert_not_called()
+
+
 def test_normalize_agent_tts_pins_offstage_narration_for_phone_ask():
     """Model echoes property/income while asking phone → speak current_ask only."""
     from app.line_session_client import LineSessionClient
@@ -515,6 +813,8 @@ async def test_preline_heuristic_field_already_filled():
         result = await apply_voice_intake_heuristics_before_line("sole owner")
 
     assert result.handled is False
+
+
 async def test_gate_order_idk_reaches_default_not_clarification():
     """'I don't know' during ownership ask must bypass non-answer gate and reach heuristic defaults."""
     from agent.schema import HeuristicResult, HelocApplicationState
@@ -546,3 +846,174 @@ async def test_gate_order_idk_reaches_default_not_clarification():
     call_kw = mock_tool.func.call_args[1]
     assert call_kw["ownership_type"] == DEFAULT_INTAKE_OWNERSHIP
     assert call_kw["raw_user_input"] is None
+
+
+async def test_preline_primary_home_address_with_filler():
+    from agent.schema import HelocApplicationState
+    import agent.state_manager as sm
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "primary-home"
+    mock_browser.address_not_found_primary_home = False
+    mock_browser._page = None
+
+    tool_return = _make_tool_result("Is the property currently listed for sale?")
+
+    with (
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(return_value=tool_return)
+        result = await sm.apply_voice_intake_heuristics_before_line(
+            "Yeah. Um, it's five one zero zero South Rolling Green Avenue, Sioux Falls."
+        )
+
+    assert result.handled is True
+    assert result.handled_field == "primary_home_address_line_1"
+    call_kw = mock_tool.func.call_args[1]
+    assert "5100" in call_kw["primary_home_address_line_1"]
+
+
+async def test_preline_dob_partial_reprompts_for_year():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import PARTIAL_DOB_REPROMPT
+    import agent.state_manager as sm
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "birthday"
+    mock_browser._page = None
+
+    with (
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await sm.apply_voice_intake_heuristics_before_line("April seventh.")
+
+    assert result.handled is True
+    assert result.handled_field == "date_of_birth"
+    assert result.ask_next == PARTIAL_DOB_REPROMPT
+    mock_tool.func.assert_not_called()
+
+
+async def test_preline_other_income_yes_asks_amount():
+    from agent.schema import HelocApplicationState
+    import agent.state_manager as sm
+
+    mock_state = HelocApplicationState(annual_pre_tax_income=600000)
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "income"
+    mock_browser._page = None
+
+    with (
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await sm.apply_voice_intake_heuristics_before_line("Yes.")
+
+    assert result.handled is True
+    assert result.handled_field == "other_income"
+    assert "dollar" in result.ask_next.lower() or "amount" in result.ask_next.lower()
+    mock_tool.func.assert_not_called()
+
+
+async def test_preline_phone_nine_digits_with_filler_reprompt():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import PARTIAL_MOBILE_PHONE_REPROMPT
+    import agent.state_manager as sm
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+    mock_browser._page = None
+
+    with (
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock()
+        result = await sm.apply_voice_intake_heuristics_before_line(
+            "Uh, it's four one three two seven five six zero six"
+        )
+
+    assert result.handled is True
+    assert result.handled_field == "mobile_phone_number"
+    assert result.ask_next == PARTIAL_MOBILE_PHONE_REPROMPT
+    mock_tool.func.assert_not_called()
+
+
+async def test_preline_prefill_reject_with_inline_phone():
+    import agent.state_manager as sm
+    from agent.schema import HelocApplicationState
+
+    mock_state = HelocApplicationState(mobile_phone_number="9999999999")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+
+    pending = {
+        "values": {"mobile_phone_number": "9999999999"},
+        "ask": "I have your mobile number as 9999999999. Is that correct?",
+    }
+    tool_return = _make_tool_result("What's the best email for this application?")
+
+    with (
+        patch.object(sm, "_prefill_confirm_pending", pending),
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+        patch.object(
+            sm, "get_missing_fields",
+            return_value='Ask next: "What\'s the best mobile number?"',
+        ),
+    ):
+        mock_tool.func = AsyncMock(return_value=tool_return)
+        result = await sm.apply_voice_intake_heuristics_before_line(
+            "No, it's 4132756066"
+        )
+
+    assert result.handled is True
+    assert result.handled_field == "prefill_confirmation_rejected"
+    assert mock_state.mobile_phone_number is None
+    mock_tool.func.assert_called_once()
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["mobile_phone_number"] == "4132756066"
+
+
+async def test_preline_income_uncertainty_saves_pending():
+    from agent.schema import HelocApplicationState
+    import agent.state_manager as sm
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "income"
+    mock_browser._page = None
+
+    with (
+        patch.object(sm, "browser_manager", mock_browser),
+        patch.object(sm, "application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        mock_tool.func = AsyncMock(
+            return_value="Update PENDING — uncertainty detected. Ask the caller to confirm."
+        )
+        result = await sm.apply_voice_intake_heuristics_before_line(
+            "I think it could be around six hundred thousand dollars."
+        )
+
+    assert result.handled is True
+    assert result.handled_field == "annual_pre_tax_income"
+    call_kw = mock_tool.func.call_args[1]
+    assert call_kw["annual_pre_tax_income"] == 600_000
