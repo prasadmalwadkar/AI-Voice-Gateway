@@ -224,20 +224,6 @@ def _score_address_suggestion(
     return min(1.0, base + bonus)
 
 
-def _zip_from_autocomplete_suggestion(text: str) -> Optional[str]:
-    """Extract 5-digit zip from WCL-style suggestion line (e.g. '..., LOS ANGELES, CA 90007')."""
-    if not text:
-        return None
-    normalized = re.sub(r"\s+", " ", text.upper().replace(",", " ")).strip()
-    m = re.search(r"\b([A-Z]{2})\s+(\d{5})\b", normalized)
-    if m:
-        return m.group(2)
-    m = re.search(r"\b(\d{5})\b(?=[^\d]|$)", normalized)
-    if m:
-        return m.group(1)
-    return None
-
-
 class BrowserManager:
     """Manages the full lifecycle of a Chromium browser for HELOC form automation.
 
@@ -493,6 +479,10 @@ class BrowserManager:
         dump = state.model_dump(exclude_none=True)
         out: dict[str, Any] = {}
         for k in keys:
+            # Never hydrate email from state alone — only explicit tool sync_updates.
+            # Prevents phantom addresses (e.g. LLM guess) typing into the live form.
+            if k == "email_address":
+                continue
             if k in dump:
                 out[k] = dump[k]
 
@@ -577,29 +567,22 @@ class BrowserManager:
         *,
         user_updated_address: bool,
         address_ranking_hints: Optional[list[str]] = None,
+        autocomplete_query: Optional[str] = None,
     ) -> None:
-        """
-        Run address autocomplete when street/city/state change — not when only zip is added
-        (zip is usually filled by the site's autocomplete). Always try to pull DOM → state
-        so zip/city/state match what the page shows.
-        """
         if self.get_current_stage() != "property":
             return
         if not state.address_line_1:
             return
 
-        # Re-syncing ownership/occupancy/zip in a **later** tool call must not re-type the
-        # combobox. Pull is enough; select_address is only for the first save or a real
-        # user address change in this turn.
         if not user_updated_address:
             await self.pull_property_fields_from_dom_into_state(state)
             return
 
-        full = _format_full_address_for_autocomplete(state)
+        full = (autocomplete_query or "").strip() or _format_full_address_for_autocomplete(state)
         if not full.strip():
             return
 
-        dedupe_key = _street_city_state_key(state)
+        dedupe_key = _street_city_state_key(state) + "|t:" + full.strip().lower()
         should_search = bool(dedupe_key) and (
             user_updated_address or dedupe_key != self._last_address_street_city_state_key
         )
@@ -610,7 +593,6 @@ class BrowserManager:
                 ranking_hints=address_ranking_hints or [],
             )
             if suggestion == "":
-                # Autocomplete had no valid match — clear address so caller can retry.
                 state.address_line_1 = None
                 state.city = None
                 state.state = None
@@ -621,10 +603,6 @@ class BrowserManager:
                 return
             self.address_not_found = False
             self._last_address_street_city_state_key = dedupe_key
-            z_from_line = _zip_from_autocomplete_suggestion(suggestion or "")
-            if z_from_line and not state.zipcode:
-                state.zipcode = z_from_line
-                logger.info("Set zipcode from autocomplete suggestion text: %s", z_from_line)
 
         await self.pull_property_fields_from_dom_into_state(state)
 
@@ -676,6 +654,7 @@ class BrowserManager:
         *,
         user_updated_address: bool,
         address_ranking_hints: Optional[list[str]] = None,
+        autocomplete_query: Optional[str] = None,
     ) -> None:
         if self.get_current_stage() != "primary-home":
             return
@@ -686,11 +665,13 @@ class BrowserManager:
             await self.pull_primary_home_fields_from_dom_into_state(state)
             return
 
-        full = _format_full_address_primary_home(state)
+        full = (autocomplete_query or "").strip() or _format_full_address_primary_home(state)
         if not full.strip():
             return
 
-        dedupe_key = _street_city_state_key_primary_home(state)
+        dedupe_key = (
+            _street_city_state_key_primary_home(state) + "|t:" + full.strip().lower()
+        )
         should_search = bool(dedupe_key) and (
             user_updated_address
             or dedupe_key != self._last_primary_home_street_city_state_key
@@ -715,12 +696,6 @@ class BrowserManager:
                 return
             self.address_not_found_primary_home = False
             self._last_primary_home_street_city_state_key = dedupe_key
-            z_from_line = _zip_from_autocomplete_suggestion(suggestion or "")
-            if z_from_line and not state.primary_home_zipcode:
-                state.primary_home_zipcode = z_from_line
-                logger.info(
-                    "Set primary_home_zipcode from autocomplete suggestion text: %s", z_from_line
-                )
 
         await self.pull_primary_home_fields_from_dom_into_state(state)
 
@@ -961,23 +936,24 @@ class BrowserManager:
                 except Exception:
                     pass
 
-        for label in (val, short):
-            if not label:
-                continue
-            for role in ("button", "radio"):
-                try:
-                    b = page.get_by_role(
-                        role,  # type: ignore[arg-type]
-                        name=label,
-                        exact=True,
-                    ).first
-                    await b.wait_for(state="visible", timeout=2_500)
-                    await b.scroll_into_view_if_needed()
-                    await b.click(timeout=3_000, force=True)
-                    logger.info("Clicked occupancy (role=%s) %r", role, label)
-                    return True
-                except Exception:
-                    pass
+        if await page.locator(SEL_OCCUPANCY_RADIOS).count() == 0:
+            for label in (val, short):
+                if not label:
+                    continue
+                for role in ("button", "radio"):
+                    try:
+                        b = page.get_by_role(
+                            role,  # type: ignore[arg-type]
+                            name=label,
+                            exact=True,
+                        ).first
+                        await b.wait_for(state="visible", timeout=2_500)
+                        await b.scroll_into_view_if_needed()
+                        await b.click(timeout=3_000, force=True)
+                        logger.info("Clicked occupancy (role=%s) %r", role, label)
+                        return True
+                    except Exception:
+                        pass
 
         for label in (val,):
             if not label:

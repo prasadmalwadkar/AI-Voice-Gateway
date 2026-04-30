@@ -47,6 +47,19 @@ from app.path2_transcript_debug import (
     path2_set_debug_call,
 )
 
+def _coerce_stt_unit_interval_confidence(raw: Any) -> Optional[float]:
+    """Keep only scores in [0, 1] (Deepgram-style); drop logprob/other scales."""
+    if raw is None:
+        return None
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if f < 0.0 or f > 1.0:
+        return None
+    return f
+
+
 ECHO_GUARD_SECONDS = max(0.30, float(os.getenv("TWILIO_PATH2_ECHO_GUARD_SECS", "0.45")))
 BARGE_IN_COOLDOWN_SECS = 0.8
 BARGE_IN_FINAL_GRACE_SECS = max(
@@ -81,13 +94,20 @@ CONTACT_BUFFER_MAX_FRAGMENTS = max(
 DETERMINISTIC_GOODBYE_TEXT = (
     "Thanks, we have all the information we need. Goodbye!"
 )
-DETERMINISTIC_GOODBYE_DRAIN_SEC = float(
-    os.getenv("DETERMINISTIC_GOODBYE_DRAIN_SEC", "6.0")
+TERMINAL_PLAYBACK_MAX_WAIT_SEC = float(
+    os.getenv("TERMINAL_PLAYBACK_MAX_WAIT_SEC", "120")
+)
+TERMINAL_IDLE_STABLE_TICKS = max(
+    3, int(float(os.getenv("TERMINAL_IDLE_STABLE_MS", "220")) / 50)
 )
 DETERMINISTIC_FOLLOWUP_POLL_SEC = 0.25
 DETERMINISTIC_FOLLOWUP_MAX_WAIT_SEC = 8.0
 CALLER_RESPONSE_WATCHDOG_SECS = max(
-    1.0, float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_SECS", "15.0"))
+    1.0, float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_SECS", "10.0"))
+)
+CALLER_RESPONSE_WATCHDOG_CONSENT_SECS = max(
+    CALLER_RESPONSE_WATCHDOG_SECS,
+    float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_CONSENT_SECS", "18.0")),
 )
 CALLER_RESPONSE_WATCHDOG_PREFIX = os.getenv(
     "TWILIO_CALLER_RESPONSE_WATCHDOG_PREFIX",
@@ -110,6 +130,32 @@ VAD_BARGE_IN_ENABLED = os.getenv("TWILIO_VAD_BARGE_IN_ENABLED", "1").strip().low
 VAD_RMS_THRESHOLD = max(1, int(os.getenv("TWILIO_VAD_RMS_THRESHOLD", "400")))
 VAD_CONSEC_FRAMES = max(1, int(os.getenv("TWILIO_VAD_CONSEC_FRAMES", "3")))
 VAD_ECHO_GRACE_SECS = max(0.0, float(os.getenv("TWILIO_VAD_ECHO_GRACE_SECS", "0.25")))
+VAD_CONSENT_RMS_FACTOR = max(
+    0.15,
+    min(1.0, float(os.getenv("TWILIO_VAD_CONSENT_RMS_FACTOR", "0.52"))),
+)
+VAD_CONSENT_MIN_RMS = max(50, int(os.getenv("TWILIO_VAD_CONSENT_MIN_RMS", "180")))
+
+# Substrings that identify privacy/consent/legal prompts (VAD softening + longer response watchdog).
+# Watchdog deliberately omits "regulatory reasons" only — keeps prior timeout behavior.
+_PATH2_CONSENT_WATCHDOG_MARKERS: frozenset[str] = frozenset(
+    (
+        "privacy policy",
+        "terms of service",
+        "soft credit",
+        "credit pull",
+        "credit check",
+        "electronic communications",
+    )
+)
+_PATH2_CONSENT_VAD_MARKERS: frozenset[str] = _PATH2_CONSENT_WATCHDOG_MARKERS | frozenset(
+    ("regulatory reasons",)
+)
+
+
+def _path2_text_has_consent_marker(text: str, markers: frozenset[str]) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in markers)
 
 
 class STTSession(Protocol):
@@ -208,6 +254,7 @@ class TwilioLineBridge:
         self._current_tts_text = ""
         self._caller_response_prompt = ""
         self._caller_response_watchdog_seq = 0
+        self._occupancy_stt_recovery_partial = ""
 
     async def run(self) -> None:
         self._running = True
@@ -396,7 +443,33 @@ class TwilioLineBridge:
         if not self._line:
             return
         await self._line.end_call_event.wait()
+        await self._wait_for_terminal_outbound_idle()
         self._running = False
+
+    async def _wait_for_terminal_outbound_idle(self) -> None:
+        """Let ``_consume_tts_queue`` drain after ``end_call`` before clearing ``_running``."""
+        deadline = time.monotonic() + TERMINAL_PLAYBACK_MAX_WAIT_SEC
+        stable = 0
+        while time.monotonic() < deadline:
+            if not self._line:
+                return
+            q_empty = self._line.tts_queue.empty()
+            if q_empty and not self._playback_audio_active():
+                stable += 1
+                if stable >= TERMINAL_IDLE_STABLE_TICKS:
+                    await asyncio.sleep(max(TTS_DRAIN_SECS, 0.15))
+                    self.call_logger.info(
+                        "Terminal outbound idle — stopping bridge tasks",
+                        event="path2.terminal_playback_drained",
+                    )
+                    return
+            else:
+                stable = 0
+            await asyncio.sleep(0.05)
+        self.call_logger.warning(
+            "Terminal outbound idle wait timed out — proceeding",
+            event="path2.terminal_playback_wait_timeout",
+        )
 
     def _log_pipeline_debug(self, message: str, *, event: str) -> None:
         if not PIPELINE_DEBUG_ENABLED:
@@ -445,7 +518,10 @@ class TwilioLineBridge:
 
     async def _caller_response_watchdog(self, seq: int) -> None:
         try:
-            await asyncio.sleep(CALLER_RESPONSE_WATCHDOG_SECS)
+            delay = TwilioLineBridge._caller_response_watchdog_delay_sec(
+                self._caller_response_prompt
+            )
+            await asyncio.sleep(delay)
             if (
                 not self._running
                 or not self._line
@@ -476,6 +552,23 @@ class TwilioLineBridge:
         tail_until = getattr(self, "_playback_tail_until", 0.0) or 0.0
         return time.monotonic() < tail_until
 
+    def _tts_sounds_like_consent_legal(self) -> bool:
+        return _path2_text_has_consent_marker(
+            self._current_tts_text or "", _PATH2_CONSENT_VAD_MARKERS
+        )
+
+    def _effective_vad_rms_threshold(self) -> int:
+        base = VAD_RMS_THRESHOLD
+        if self._tts_sounds_like_consent_legal():
+            return max(VAD_CONSENT_MIN_RMS, int(base * VAD_CONSENT_RMS_FACTOR))
+        return base
+
+    @staticmethod
+    def _caller_response_watchdog_delay_sec(prompt: str) -> float:
+        if _path2_text_has_consent_marker(prompt, _PATH2_CONSENT_WATCHDOG_MARKERS):
+            return CALLER_RESPONSE_WATCHDOG_CONSENT_SECS
+        return CALLER_RESPONSE_WATCHDOG_SECS
+
     @staticmethod
     def _looks_like_meaningful_barge_in(
         text: str,
@@ -502,6 +595,13 @@ class TwilioLineBridge:
         missing = get_missing_fields() or ""
         ask = (_ask_from_missing_line(missing) or "").lower()
         return "ownership type" in ask or "sole or joint" in ask
+
+    def _occupancy_ask_active(self) -> bool:
+        missing = get_missing_fields() or ""
+        ask = (_ask_from_missing_line(missing) or "").lower()
+        return ("primary home" in ask and "second home" in ask) or (
+            "investment property" in ask and "second home" in ask
+        )
 
     @staticmethod
     def _speech_tokens(text: str) -> list[str]:
@@ -550,11 +650,12 @@ class TwilioLineBridge:
             self._vad_consec_high = 0
             return
         rms = self._compute_mulaw_rms(data)
-        if rms >= VAD_RMS_THRESHOLD:
+        threshold = self._effective_vad_rms_threshold()
+        if rms >= threshold:
             self._vad_consec_high += 1
             if self._vad_consec_high >= VAD_CONSEC_FRAMES:
                 self._log_pipeline_debug(
-                    f"VAD barge-in triggered | rms={rms:.0f} consec={self._vad_consec_high}",
+                    f"VAD barge-in triggered | rms={rms:.0f} thr={threshold} consec={self._vad_consec_high}",
                     event="path2.vad.barge_in",
                 )
                 self._vad_consec_high = 0
@@ -744,6 +845,8 @@ class TwilioLineBridge:
                             text=text,
                             call_sid=self.call_sid,
                         )
+                        if self._occupancy_ask_active():
+                            self._occupancy_stt_recovery_partial = text
                         if self._should_trigger_barge_in(
                             text,
                             in_echo=in_echo,
@@ -825,7 +928,8 @@ class TwilioLineBridge:
                         continue
 
                     self._barge_in_accept_final_until = 0.0
-                    await self._handle_final_transcript(text)
+                    stt_u = _coerce_stt_unit_interval_confidence(confidence)
+                    await self._handle_final_transcript(text, stt_confidence=stt_u)
 
                 elif mtype == "error":
                     self.call_logger.warning(
@@ -841,7 +945,12 @@ class TwilioLineBridge:
                     event="path2.stt.consumer_end",
                 )
 
-    async def _handle_final_transcript(self, text: str) -> None:
+    async def _handle_final_transcript(
+        self,
+        text: str,
+        *,
+        stt_confidence: Optional[float] = None,
+    ) -> None:
         if getattr(self, "_ending_call", False):
             self.call_logger.info(
                 "Skipping STT final while deterministic goodbye is in progress",
@@ -887,6 +996,10 @@ class TwilioLineBridge:
                 },
             )
             append_transcript_turn(self.call_sid or "", "user", text)
+            occ_recovery = ""
+            if self._occupancy_ask_active():
+                occ_recovery = self._occupancy_stt_recovery_partial.strip()
+            self._occupancy_stt_recovery_partial = ""
             missing_snapshot = get_missing_fields() or ""
             ask_from_missing = self._extract_ask_next(missing_snapshot)
             if _is_status_check_utterance(text) and self._line:
@@ -901,9 +1014,16 @@ class TwilioLineBridge:
                     self._line.inject_ask_next_hint(
                         ask_from_missing, schedule_fallback=False
                     )
-                await self._line.enqueue_status_check_response()
+                await self._line.enqueue_status_check_response(
+                    ask_hint=ask_from_missing or None,
+                    user_transcript=text,
+                )
                 return
-            result = await apply_voice_intake_heuristics_before_line(text)
+            result = await apply_voice_intake_heuristics_before_line(
+                text,
+                stt_confidence=stt_confidence,
+                stt_recovery_text=occ_recovery or None,
+            )
             if result.handled and self._line:
                 self._log_pipeline_debug(
                     (
@@ -996,6 +1116,7 @@ class TwilioLineBridge:
 
     async def _barge_in(self) -> None:
         self.call_logger.info("Barge-in: cancel TTS + Line + Twilio clear", event="path2.barge_in")
+        self._cancel_caller_response_watchdog()
         self._discard_contact_buffer()
         self._playback_tail_until = 0.0
         self._barge_in_accept_final_until = time.monotonic() + BARGE_IN_FINAL_GRACE_SECS
@@ -1017,22 +1138,17 @@ class TwilioLineBridge:
             "Deterministic goodbye enqueued",
             event="path2.deterministic_goodbye",
         )
-        await asyncio.sleep(DETERMINISTIC_GOODBYE_DRAIN_SEC)
         if self._line:
             self._line.end_call_event.set()
 
     async def _hang_up_after_terminal_deterministic_speech(self) -> None:
-        """After a closing line (e.g. consent declined), wait for TTS then end the call."""
-        drain = float(
-            os.getenv(
-                "CONSENT_DECLINE_DRAIN_SEC",
-                str(DETERMINISTIC_GOODBYE_DRAIN_SEC),
-            )
+        """Signal end_call after goodbye is queued; playback drains in ``_watch_line_end_call``."""
+        await asyncio.sleep(
+            max(0.0, float(os.getenv("CONSENT_DECLINE_SIGNAL_DELAY_SEC", "0.08")))
         )
-        await asyncio.sleep(max(2.0, drain))
         if self._line:
             self.call_logger.info(
-                "Terminal deterministic speech drain complete — ending call",
+                "Terminal deterministic — signaling end_call (playback drain follows)",
                 event="path2.terminal_deterministic_hangup",
             )
             self._line.end_call_event.set()
@@ -1119,8 +1235,6 @@ class TwilioLineBridge:
         if TTS_STARTUP_DELAY_SECS > 0:
             await asyncio.sleep(TTS_STARTUP_DELAY_SECS)
         while self._running:
-            if self._line.end_call_event.is_set():
-                break
             try:
                 text = await asyncio.wait_for(self._line.tts_queue.get(), timeout=0.3)
             except asyncio.TimeoutError:
