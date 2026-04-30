@@ -98,6 +98,11 @@ def _normalize_phone_key(phone: str | None) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+def _phone_tail10(phone: str | None) -> str:
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
 def _decode_json_payload(value: str, *, b64: bool = False) -> dict[str, Any]:
     if not value:
         return {}
@@ -117,6 +122,24 @@ def _load_prefill_lookup() -> dict[str, Any]:
     raw = os.getenv("TWILIO_PREFILL_BY_PHONE_JSON", "").strip()
     if not raw:
         path = os.getenv("TWILIO_PREFILL_BY_PHONE_FILE", "").strip()
+        if not path:
+            disable_auto = os.getenv(
+                "TWILIO_PREFILL_DISABLE_AUTO_CUSTOMERS_JSON", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if not disable_auto:
+                cand = (
+                    Path(__file__).resolve().parent.parent
+                    / "data"
+                    / "prefill"
+                    / "customers.json"
+                )
+                if cand.is_file():
+                    path = str(cand)
+                    module_logger.info(
+                        "Using default phone prefill file %s (set "
+                        "TWILIO_PREFILL_DISABLE_AUTO_CUSTOMERS_JSON=1 to skip)",
+                        path,
+                    )
         if path:
             try:
                 raw = Path(path).read_text(encoding="utf-8")
@@ -138,6 +161,23 @@ def _prefill_for_phone(phone: str | None) -> dict[str, Any]:
     for key in _normalize_phone_key(phone):
         value = lookup.get(key)
         if isinstance(value, dict):
+            return dict(value)
+    caller_tail = _phone_tail10(phone)
+    if len(caller_tail) != 10:
+        return {}
+    for lk, value in lookup.items():
+        if not isinstance(value, dict):
+            continue
+        lk_tail = _phone_tail10(str(lk))
+        if lk_tail == caller_tail:
+            return dict(value)
+        embedded = (
+            value.get("mobile_phone_number")
+            or value.get("phone_number")
+            or value.get("phone")
+            or ""
+        )
+        if _phone_tail10(str(embedded)) == caller_tail:
             return dict(value)
     return {}
 
