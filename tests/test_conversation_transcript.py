@@ -64,3 +64,27 @@ def test_append_transcript_turn_skips_empty_text(tmp_path, monkeypatch):
 
     append_transcript_turn("CA_y", "user", "   ")
     assert not (tmp_path / "CA_y.jsonl").exists()
+
+
+def test_write_voice_sourced_fields_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONVERSATION_TRANSCRIPT_DIR", str(tmp_path))
+    from app.conversation_transcript import write_voice_sourced_fields_json
+
+    write_voice_sourced_fields_json(
+        "CA_voice",
+        {"address_line_1": "It's one two three Main.", "annual_pre_tax_income": "One million."},
+    )
+    path = tmp_path / "voice_fields" / "CA_voice.json"
+    assert path.is_file()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["call_sid"] == "CA_voice"
+    assert data["fields"]["address_line_1"] == "It's one two three Main."
+    assert data["fields"]["annual_pre_tax_income"] == "One million."
+
+
+def test_write_voice_sourced_fields_disabled_when_transcripts_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONVERSATION_TRANSCRIPT_DIR", "")
+    from app.conversation_transcript import write_voice_sourced_fields_json
+
+    write_voice_sourced_fields_json("CA_z", {"x": "y"})
+    assert not (tmp_path / "voice_fields").exists()

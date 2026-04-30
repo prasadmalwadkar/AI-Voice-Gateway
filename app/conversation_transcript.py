@@ -6,6 +6,10 @@ NDJSON: one JSON object per line in ``{UTC-datetime}_{call_sid}.jsonl``
 Lines may include ``role: ui`` with ``scope`` (``page`` during call = current wizard step only;
 ``full`` once at hang-up = entire captured snapshot), optional ``browser_stage``, and ``fields``.
 
+End-of-call **voice field map** (schema field → verbatim user utterance last accepted for that field):
+``<dir>/voice_fields/<call_sid>.json``. Written when ``scope: full`` snapshot runs; omitted when
+transcripts disabled.
+
 Env:
   ``CONVERSATION_TRANSCRIPT_DIR`` — unset → ``data/conversations``;
   set to empty → disabled; otherwise use that path.
@@ -116,5 +120,39 @@ def append_transcript_ui_fields(
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def write_voice_sourced_fields_json(
+    call_sid: str | None,
+    fields: dict[str, str],
+) -> None:
+    """Write field → verbatim user transcript map at call end (not UI-normalized values).
+
+    Stored under ``<CONVERSATION_TRANSCRIPT_DIR>/voice_fields/<call_sid>.json``.
+    """
+    base = _transcript_dir()
+    if base is None:
+        return
+    sid = (call_sid or "").strip()
+    if not sid:
+        return
+    try:
+        out_dir = base / "voice_fields"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    payload = {
+        "call_sid": sid,
+        "ended_ts": datetime.now(timezone.utc).isoformat(),
+        "fields": dict(sorted((fields or {}).items())),
+    }
+    path = out_dir / f"{sid}.json"
+    try:
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     except OSError:
         pass

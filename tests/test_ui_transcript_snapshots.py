@@ -46,6 +46,10 @@ def test_heloc_ui_final_snapshot_export_keys(transcript_dir):
     from agent.schema import HelocApplicationState
     from agent.state_manager import append_heloc_ui_transcript_final_snapshot
 
+    import agent.state_manager as sm
+
+    sm._voice_field_user_sources.clear()
+
     state = HelocApplicationState(
         address_line_1="1 Main St",
         city="San Jose",
@@ -78,3 +82,9 @@ def test_heloc_ui_final_snapshot_export_keys(transcript_dir):
     assert frozenset(line["fields"].keys()) == expected_keys
     assert line["fields"].get("first_name", "") == ""
     assert line["fields"].get("primary_home_address_line_1", "") == ""
+
+    vf = transcript_dir / "voice_fields" / "CA_fin.json"
+    assert vf.is_file()
+    vf_data = json.loads(vf.read_text(encoding="utf-8"))
+    assert vf_data["call_sid"] == "CA_fin"
+    assert vf_data["fields"] == {}

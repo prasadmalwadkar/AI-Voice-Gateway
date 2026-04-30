@@ -52,6 +52,22 @@ from agent.browser_manager import BrowserManager
 
 logger = logging.getLogger("voip.state")
 
+# Canonical scripted voice lines (field_to_question + deterministic pre-Line).
+VOICE_SCRIPT_OWNERSHIP_ASK = "Are you the sole owner, or is it jointly owned?"
+VOICE_SCRIPT_OCCUPANCY_ASK = (
+    "Is this your primary home, a second home, or an investment property?"
+)
+VOICE_SCRIPT_FOR_SALE_ASK = "Is the property currently listed for sale?"
+OCCUPANCY_LOW_CONF_REPROMPT = (
+    "Sorry, I didn't catch that. Say primary home, second home, or investment property."
+)
+OWNERSHIP_LOW_CONF_REPROMPT = (
+    "Sorry, I didn't catch that. Are you the sole owner, or is it jointly owned?"
+)
+FOR_SALE_LOW_CONF_REPROMPT = (
+    "Sorry, I didn't catch that. Is the property listed for sale — yes or no?"
+)
+
 # =============================================================================
 # Global instances — one state and one browser per call.
 # Reset via reset_state() at the start of each new call in get_agent().
@@ -436,14 +452,18 @@ def has_pending_prefill_confirmation() -> bool:
 def get_initial_intake_ask() -> Optional[str]:
     """Return the current deterministic Ask next for dynamic call introductions."""
     ask = _ask_from_missing_line(get_missing_fields() or "")
-    if not ask:
-        return None
     first_name = str(_customer_prefill.get("first_name") or "").strip()
     greeting = f"Hi {first_name}, " if first_name else ""
+    if not ask:
+        return f"{greeting}Can you tell me the property address?" if first_name else None
     if ask in {"What is the property address?", "Can you tell me the property address?"}:
-        return f"{greeting}can you tell me your property address?"
+        return f"{greeting}can you tell me your property address?" if greeting else ask
     if first_name and ask.startswith("I have "):
         return greeting + ask
+    if first_name:
+        low = ask.strip().lower()
+        if not low.startswith("hi "):
+            return greeting + ask
     return ask
 
 
@@ -466,6 +486,44 @@ def _current_prefill_confirmation_values() -> dict[str, Any]:
 def _clear_prefill_confirm_pending() -> None:
     global _prefill_confirm_pending
     _prefill_confirm_pending = None
+
+
+def _extract_inline_answer_after_no(
+    text: str, rejected_fields: dict[str, Any]
+) -> dict[str, Any]:
+    tail = re.sub(
+        r"^(?:uh[.,]?\s*|um[.,]?\s*)*"
+        r"(?:no|nope|nah)[.,!?\s]+"
+        r"(?:it'?s|it\s+is|the\s+correct\s+one\s+is|actually)?\s*",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    if not tail or len(tail) < 3:
+        return {}
+    result: dict[str, Any] = {}
+    if "mobile_phone_number" in rejected_fields:
+        ph = infer_phone_from_transcript(tail)
+        if ph:
+            result["mobile_phone_number"] = ph
+    if "email_address" in rejected_fields:
+        em = infer_email_from_transcript(tail)
+        if em:
+            result["email_address"] = em
+    if "first_name" in rejected_fields or "last_name" in rejected_fields:
+        parsed = infer_name_fields_from_transcript(
+            tail,
+            need_first="first_name" in rejected_fields,
+            need_last="last_name" in rejected_fields,
+            slot_focus="first" if "first_name" in rejected_fields else "last",
+        )
+        if parsed:
+            result.update(parsed)
+    if "ownership_type" in rejected_fields:
+        ot = infer_ownership_from_transcript(tail)
+        if ot:
+            result["ownership_type"] = ot
+    return result
 
 
 def has_pending_low_confidence_confirmation() -> bool:
@@ -496,6 +554,18 @@ def _pending_low_conf_ask() -> str:
     pending = _pending_low_conf_confirmation or {}
     values = pending.get("values") or {}
     attempts = int(pending.get("attempts") or 1)
+    if "annual_pre_tax_income" in values:
+        amt = int(values["annual_pre_tax_income"])
+        return (
+            f"I heard annual pre-tax income of about ${amt:,}. "
+            "Is that correct?"
+        )
+    if "other_income" in values:
+        amt = int(values["other_income"])
+        return (
+            f"I heard other income of about ${amt:,}. "
+            "Is that correct?"
+        )
     if "first_name" in values:
         return f"I heard first name {values['first_name']}. Is that correct?"
     if "last_name" in values:
@@ -661,6 +731,21 @@ def _heloc_ui_full_transcript_snapshot() -> dict[str, str]:
     return out
 
 
+def _maybe_record_voice_field_user_source(
+    field_name: str, raw_user_input: Optional[str]
+) -> None:
+    """Remember verbatim STT line last accepted into ``field_name`` (not UI-normalized)."""
+    if field_name in _SENSITIVE_FIELDS:
+        return
+    if not raw_user_input or not str(raw_user_input).strip():
+        return
+    _voice_field_user_sources[field_name] = str(raw_user_input).strip()
+
+
+def export_voice_field_user_sources_for_call() -> dict[str, str]:
+    return dict(sorted(_voice_field_user_sources.items()))
+
+
 def _append_heloc_ui_transcript_snapshot() -> None:
     """Append one NDJSON line: fields visible on the current browser stage only."""
     try:
@@ -687,9 +772,13 @@ def append_heloc_ui_transcript_final_snapshot(call_sid: str | None = None) -> No
 
     Writes one ``scope: full`` line with **all** ``_HELOC_UI_FULL_EXPORT_KEYS`` present
     (empty string when a field was never collected) so NDJSON always has a complete row.
+    Also writes ``voice_fields/<call_sid>.json`` (verbatim user utterances per saved field).
     """
     try:
-        from app.conversation_transcript import append_transcript_ui_fields
+        from app.conversation_transcript import (
+            append_transcript_ui_fields,
+            write_voice_sourced_fields_json,
+        )
     except ImportError:
         return
     snap = _heloc_ui_full_transcript_snapshot()
@@ -699,6 +788,12 @@ def append_heloc_ui_transcript_final_snapshot(call_sid: str | None = None) -> No
         append_transcript_ui_fields(call_sid, snap, scope="full")
     except Exception:
         logger.debug("append_transcript_ui_fields final failed", exc_info=True)
+    try:
+        write_voice_sourced_fields_json(
+            call_sid, export_voice_field_user_sources_for_call()
+        )
+    except Exception:
+        logger.debug("write_voice_sourced_fields_json failed", exc_info=True)
 
 
 async def _run_browser_sync(
@@ -727,8 +822,19 @@ async def _run_browser_sync(
             inferred_addr = infer_property_address_from_transcript(sh)
             if inferred_addr:
                 address_ranking_hints.append(inferred_addr)
-        # select_address + pull, state has the USPS line but u can still have the
-        # short STT street — re-filling the combobox with the short value breaks autocomplete.
+
+        prop_autocomplete_query = None
+        if application_state.address_line_1:
+            prop_autocomplete_query = build_address_autocomplete_type_query(
+                application_state.address_line_1,
+                spoken_transcript_hint,
+            )
+        primary_home_autocomplete_query = None
+        if application_state.primary_home_address_line_1:
+            primary_home_autocomplete_query = build_address_autocomplete_type_query(
+                application_state.primary_home_address_line_1,
+                spoken_transcript_hint,
+            )
         hydration = browser_manager.build_hydration_payload(application_state)
         merged: dict = {**u, **hydration}
         if hydration:
@@ -751,6 +857,7 @@ async def _run_browser_sync(
                         k in u for k in ("address_line_1", "city", "state")
                     ),
                     address_ranking_hints=address_ranking_hints or None,
+                    autocomplete_query=prop_autocomplete_query,
                 )
                 phases["address_autocomplete_ms"] = round(
                     (time.perf_counter() - t0) * 1000, 2
@@ -777,6 +884,7 @@ async def _run_browser_sync(
                         )
                     ),
                     address_ranking_hints=address_ranking_hints or None,
+                    autocomplete_query=primary_home_autocomplete_query,
                 )
                 phases["primary_home_autocomplete_ms"] = round(
                     (time.perf_counter() - t0) * 1000, 2
@@ -846,6 +954,14 @@ async def _run_browser_sync(
                 occ = application_state.occupancy_type
                 if o is None or occ is None:
                     complete = False
+            if (
+                complete
+                and browser_manager.get_current_stage() == "contact"
+            ):
+                ph = application_state.mobile_phone_number
+                em = application_state.email_address
+                if ph is None or em is None:
+                    complete = False
             phases["is_page_complete_ms"] = round((time.perf_counter() - t0) * 1000, 2)
             if complete:
                 logger.info("Page complete. Auto-navigating (1 jump max)...")
@@ -907,6 +1023,9 @@ async def ensure_browser_ready() -> None:
 # Tracks repeated "no" on required consent checkboxes (privacy vs commerce), per call.
 _consent_decline_round: dict[str, int] = {}
 
+# Schema field → verbatim user utterance that last successfully updated that field (Path2 voice).
+_voice_field_user_sources: dict[str, str] = {}
+
 # Serialize reset so overlapping cleanup paths cannot run two browser shutdowns
 # concurrently (duplicate "Closing stale browser" / double drain).
 _reset_state_lock = asyncio.Lock()
@@ -920,9 +1039,10 @@ async def reset_state() -> None:
 
 async def _reset_state_impl() -> None:
     await _await_inflight_browser_sync()
-    global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields, _consent_decline_round
+    global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields, _consent_decline_round, _voice_field_user_sources
     application_state = HelocApplicationState()
     _consent_decline_round = {}
+    _voice_field_user_sources = {}
     _clear_pending_low_confidence_confirmation()
     _customer_prefill = {}
     _prefill_confirm_pending = None
@@ -1056,16 +1176,12 @@ def get_missing_fields() -> str:
     # Short scripted asks per field. Keep deterministic to avoid drift.
     field_to_question = {
         "address_line_1": "Can you tell me the property address?",
-        "ownership_type": "Are you the sole owner, or is it jointly owned?",
-        "occupancy_type": (
-            "Is this your primary home, a second home, or an investment property?"
-        ),
+        "ownership_type": VOICE_SCRIPT_OWNERSHIP_ASK,
+        "occupancy_type": VOICE_SCRIPT_OCCUPANCY_ASK,
         "primary_home_address_line_1": (
             "What is the street address of your primary residence — where you live most of the year?"
         ),
-        "is_currently_for_sale": (
-            "Is the property currently listed for sale?"
-        ),
+        "is_currently_for_sale": VOICE_SCRIPT_FOR_SALE_ASK,
         "annual_pre_tax_income": "What's your annual pre-tax income?",
         "other_income": "Any other income to include?",
         "primary_source_of_income": "What's your main income source?",
@@ -1332,11 +1448,28 @@ def transcript_requests_intake_default(text: str) -> bool:
     return any(re.search(p, low) for p in _DECLINE_TO_SPECIFY_PATTERNS)
 
 
+_SPEECH_FILLER_RE = re.compile(
+    r"^[\s.,!?]*(yeah|yep|yea|yah|okay|ok|sure|right|"
+    r"uh+|u+m+|ah+|er+|well|hmm+|oh|hey|hi|like)[\s.,!?]+",
+    re.IGNORECASE,
+)
+
+
 def normalize_answer_scaffold(text: str) -> str:
-    """Remove natural answer lead-ins before deterministic field inference."""
+    """Remove natural answer lead-ins + speech fillers before deterministic field inference."""
     if not text or not str(text).strip():
         return ""
     s = re.sub(r"\s+", " ", str(text).strip())
+    # Strip leading speech fillers repeatedly (handles "Yeah. Um, ...")
+    # Don't strip "yes"/"no" — they are valid answers for y/n questions.
+    for _ in range(4):
+        m = _SPEECH_FILLER_RE.match(s)
+        if not m:
+            break
+        remainder = s[m.end():].strip()
+        if not remainder:
+            break
+        s = remainder
     s = re.sub(
         r"^\s*(?:"
         r"it'?s|it\s+is|this\s+is|"
@@ -1356,6 +1489,8 @@ def transcript_is_status_check(text: str) -> bool:
     """Presence / status pings should never be parsed as applicant data."""
     if not text or not str(text).strip():
         return False
+    if transcript_seeks_question_repeat(text):
+        return True
     t = str(text).strip().lower()
     t = re.sub(r"[^\w\s?']", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
@@ -1370,6 +1505,51 @@ def transcript_is_status_check(text: str) -> bool:
         r"\b(i'?m lost|i'?m confused|what do you need|what do i do)\b",
         r"\b(pardon|excuse me|sorry what)\b",
         r"\b(thank you|thanks)\b",
+    )
+    return any(re.search(p, t) for p in patterns)
+
+
+def transcript_seeks_question_repeat(text: str) -> bool:
+    """True when the caller wants the current question repeated (vs a pure presence ping)."""
+    if not text or not str(text).strip():
+        return False
+    t = normalize_answer_scaffold(text).lower()
+    t = re.sub(r"[^\w\s']", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return False
+    if re.fullmatch(r"(are you there|still there|you there)(\s+there)?(\?)?", t):
+        return False
+    if re.fullmatch(r"(hello|hey|hi)(\s+there)?(\?)?", t):
+        return False
+    if re.fullmatch(r"(thank you|thanks)(\s+you)?(\?)?", t):
+        return False
+    patterns = (
+        r"\bwhat'?s\s+the\s+question\b",
+        r"\bwhat\s+is\s+the\s+question\b",
+        r"\bwhich\s+question\b",
+        r"\bwhat\s+question\b",
+        r"\bwhat\s+(?:exactly\s+)?(?:do\s+you\s+need|are\s+you\s+asking)\b",
+        r"\bwhat\s+info(?:rmation)?\s+(?:do\s+you\s+need|should\s+i\s+give)\b",
+        r"\bwhat\s+details\s+do\s+you\s+need\b",
+        r"\b(remind\s+me|tell\s+me\s+again)\b",
+        r"^\s*repeat\s*\??\s*$",
+        r"\brepeat\s+(please|that)\b",
+        r"\b(repeat|say)\s+(?:that|the\s+question|it)\s+again\b",
+        r"\bsay\s+again\b",
+        r"\bcome\s+again\b",
+        r"\bpardon\b",
+        r"\bexcuse\s+me\b",
+        r"\bsorry\s*,?\s*what\b",
+        r"\bwhat\s+did\s+you\s+say\b",
+        r"\bi\s+didn'?t\s+(?:catch|hear|get|understand)\s+(?:that|it)\b",
+        r"\bi\s+m\s+(?:lost|confused)\b",
+        r"\bwhat\s+do\s+i\s+(?:need\s+to\s+)?(?:say|answer)\b",
+        r"\bwhat\s+should\s+i\s+say\b",
+        r"\bwhat'?s\s+next\b",
+        r"\bnext\s+question\b",
+        r"\bgo\s+ahead\b",
+        r"\bcontinue\b",
     )
     return any(re.search(p, t) for p in patterns)
 
@@ -1461,7 +1641,11 @@ def looks_like_answer_for_current_field(text: str, missing_line: str) -> bool:
             )
         )
 
-    if "property type" in ask or "primary, secondary, or investment" in ask:
+    if (
+        "property type" in ask
+        or "primary, secondary, or investment" in ask
+        or ("primary home" in ask and "second home" in ask)
+    ):
         return infer_occupancy_from_transcript(normalized) is not None
 
     if "currently for sale" in ask or "for sale" in ask:
@@ -1659,6 +1843,44 @@ def infer_occupancy_from_transcript(text: str) -> Optional[OccupancyType]:
     ):
         return "Primary property"
     return None
+
+
+def _stt_confidence_triggers_reprompt(conf: Optional[float]) -> bool:
+    """True when provider confidence is in [0,1] and below env threshold."""
+    if conf is None:
+        return False
+    try:
+        f = float(conf)
+    except (TypeError, ValueError):
+        return False
+    if f < 0.0 or f > 1.0:
+        return False
+    try:
+        thresh = float(os.getenv("PATH2_STT_LOW_CONFIDENCE_REPROMPT_MAX", "0.52"))
+    except ValueError:
+        thresh = 0.52
+    return f < thresh
+
+
+def infer_occupancy_with_optional_recovery(
+    text: str,
+    recovery: Optional[str],
+) -> tuple[str, Optional[OccupancyType]]:
+    """
+    Parse occupancy from final transcript, then recovery partial, then concatenations.
+    Returns (effective_text_for_raw_user_input, occupancy or None).
+    """
+    t = (text or "").strip()
+    r = (recovery or "").strip()
+    seen: list[str] = []
+    for cand in (t, r, f"{r} {t}".strip(), f"{t} {r}".strip()):
+        if not cand or cand in seen:
+            continue
+        seen.append(cand)
+        occ = infer_occupancy_from_transcript(cand)
+        if occ is not None:
+            return cand, occ
+    return t, None
 
 
 def infer_for_sale_from_transcript(text: str) -> Optional[bool]:
@@ -1883,7 +2105,7 @@ def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
     low = re.sub(r"\bmanual\b", "annual", low)
     stripped = low
     stripped = re.sub(
-        r"\b(my|the|our|this|that)\b",
+        r"\b(my|the|our|this|that|it)\b",
         " ",
         stripped,
     )
@@ -1892,7 +2114,13 @@ def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
         " ",
         stripped,
     )
-    stripped = re.sub(r"\b(pre\s*-?\s*tax|pretax|income|salary|is|it'?s|about|around)\b", " ", stripped)
+    stripped = re.sub(
+        r"\b(pre\s*-?\s*tax|pretax|income|salary|is|it'?s|about|around|"
+        r"could\s+be|would\s+be|might\s+be|maybe|probably|per\s+annum|"
+        r"per\s+year|a\s+year|annually)\b",
+        " ",
+        stripped,
+    )
     stripped = re.sub(r"\s+", " ", stripped).strip()
 
     _millionish = r"(?=\s*(?:million|\bm\b|\bk\b))"
@@ -2062,6 +2290,24 @@ _MONTH_NAMES: dict[str, int] = {
 }
 _MONTH_PAT = "|".join(_MONTH_NAMES.keys())
 
+# Regex fragments for infer_partial_dob_month_day (must match previous inlined patterns exactly).
+_DOB_PARTIAL_SPOKEN_ORDINALS_ALT_RE = (
+    "first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+    "eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|"
+    "seventeenth|eighteenth|nineteenth|twentieth|"
+    "twenty\\s*-?\\s*first|twenty\\s*-?\\s*second|twenty\\s*-?\\s*third|"
+    "twenty\\s*-?\\s*fourth|twenty\\s*-?\\s*fifth|twenty\\s*-?\\s*sixth|"
+    "twenty\\s*-?\\s*seventh|twenty\\s*-?\\s*eighth|twenty\\s*-?\\s*ninth|"
+    "thirtieth|thirty\\s*-?\\s*first"
+)
+_DOB_PARTIAL_CARDINAL_DAY_WORDS_RE = (
+    r"one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|twenty\s*-?\s*(?:one|two|three|four|five|six|seven|eight|nine)|"
+    r"thirty|thirty\s*-?\s*one"
+)
+_DOB_SPOKEN_YEAR_PREFIX_RE = "eighteen|nineteen|twenty"
+
 _ORDINAL_WORDS: dict[str, str] = {
     "first": "one",
     "second": "two",
@@ -2152,7 +2398,7 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
     low = text.lower().strip()
     # Deepgram/phone garble: "first Jan ..." can arrive as "first ten ...".
     low = re.sub(
-        r"\b(first|1st)\s+ten\s+(?=eighteen|nineteen|twenty|\d{4}\b)",
+        rf"\b(first|1st)\s+ten\s+(?={_DOB_SPOKEN_YEAR_PREFIX_RE}|\d{{4}}\b)",
         r"\1 jan ",
         low,
     )
@@ -2182,7 +2428,7 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
 
     # Fully spoken: "January first nineteen ninety two"
     m = re.search(
-        rf"\b({_MONTH_PAT})\s+([a-z0-9\s-]+?)\s+((?:eighteen|nineteen|twenty|\d{{4}})\b[a-z0-9\s-]*)",
+        rf"\b({_MONTH_PAT})\s+([a-z0-9\s-]+?)\s+((?:{_DOB_SPOKEN_YEAR_PREFIX_RE}|\d{{4}})\b[a-z0-9\s-]*)",
         low,
     )
     if m:
@@ -2194,7 +2440,7 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
 
     # Fully spoken reversed: "first January nineteen ninety two"
     m = re.search(
-        rf"\b([a-z0-9\s-]+?)\s+({_MONTH_PAT})\s+((?:eighteen|nineteen|twenty|\d{{4}})\b[a-z0-9\s-]*)",
+        rf"\b([a-z0-9\s-]+?)\s+({_MONTH_PAT})\s+((?:{_DOB_SPOKEN_YEAR_PREFIX_RE}|\d{{4}})\b[a-z0-9\s-]*)",
         low,
     )
     if m:
@@ -2205,6 +2451,53 @@ def infer_dob_from_transcript(text: str) -> Optional[str]:
             return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
 
     return None
+
+
+PARTIAL_DOB_REPROMPT = (
+    "Could you also include the year? For example, month, day, and four-digit year."
+)
+
+
+def infer_partial_dob_month_day(text: str) -> bool:
+    if not text or not str(text).strip():
+        return False
+    text = normalize_answer_scaffold(text)
+    if not text:
+        return False
+    low = text.lower().strip()
+
+    if re.search(rf"\b({_MONTH_PAT})\s+\d{{1,2}}\s*(?:st|nd|rd|th)?\s*\.?$", low):
+        return True
+    if re.search(rf"\b\d{{1,2}}\s*(?:st|nd|rd|th)?\s+({_MONTH_PAT})\s*\.?$", low):
+        return True
+    if re.search(
+        rf"\b({_MONTH_PAT})\s+(?:{_DOB_PARTIAL_SPOKEN_ORDINALS_ALT_RE})\s*\.?$", low
+    ):
+        return True
+    if re.search(
+        rf"\b(?:{_DOB_PARTIAL_SPOKEN_ORDINALS_ALT_RE})\s+(?:of\s+)?({_MONTH_PAT})\s*\.?$", low
+    ):
+        return True
+
+    if re.fullmatch(rf"in\s+({_MONTH_PAT})\s*\.?", low):
+        return True
+    if re.fullmatch(rf"({_MONTH_PAT})\s*\.?", low):
+        return True
+
+    dm = re.search(
+        rf"\b(?:{_DOB_PARTIAL_CARDINAL_DAY_WORDS_RE})\s+(?:{_MONTH_PAT})\b", low
+    )
+    if dm:
+        tail = low[dm.end() :].strip().strip(".!?")
+        if not tail:
+            return True
+        if re.match(r"^(?:19|20)\d{2}\b", tail):
+            return False
+        if re.match(rf"^(?:{_DOB_SPOKEN_YEAR_PREFIX_RE})\b", tail):
+            return False
+        return True
+
+    return False
 
 
 PARTIAL_MOBILE_PHONE_REPROMPT = (
@@ -2385,6 +2678,38 @@ def _expand_spoken_numbers_in_email_segment(segment: str) -> str:
     return " ".join(out)
 
 
+def _normalize_spoken_email_domain(rhs: str) -> str:
+    """Collapse ``g mail dot``, ``yahoo dot co dot uk``, ``gmail period com``, etc."""
+    s = (rhs or "").strip().lower()
+    if not s:
+        return s
+    changed = True
+    while changed:
+        changed = False
+        ns = re.sub(r"\s+(?:dot|period)\s+", ".", s)
+        if ns != s:
+            s = ns
+            changed = True
+    s = re.sub(r"\s+(?:dot|period)\s*$", "", s).strip()
+    s = re.sub(r"\s+", "", s)
+    if s and "." not in s:
+        s = f"{s}.com"
+    return s
+
+
+def _normalize_spoken_email_local(lhs: str) -> str:
+    expanded = _expand_spoken_numbers_in_email_segment((lhs or "").strip())
+    raw_l = expanded.strip().lower()
+    raw_l = (
+        raw_l.replace(" dot ", ".")
+        .replace(" period ", ".")
+        .replace(" underscore ", "_")
+        .replace(" dash ", "-")
+        .replace(" hyphen ", "-")
+    )
+    return raw_l.replace(" ", "")
+
+
 def infer_email_from_transcript(text: str) -> Optional[str]:
     """Parse email from typed form or spoken 'at'/'dot' variants."""
     if not text or not str(text).strip():
@@ -2395,26 +2720,35 @@ def infer_email_from_transcript(text: str) -> Optional[str]:
     raw = text.strip().lower()
     if " at " in raw:
         left, right = raw.split(" at ", 1)
-        left = _expand_spoken_numbers_in_email_segment(left)
-        raw = f"{left} at {right}"
+        local = _normalize_spoken_email_local(left).rstrip(".")
+        normalized = f"{local}@{_normalize_spoken_email_domain(right)}"
     elif "@" in raw:
         lp, rp = raw.split("@", 1)
-        lp = _expand_spoken_numbers_in_email_segment(lp)
-        raw = f"{lp}@{rp}"
+        local = _normalize_spoken_email_local(lp).rstrip(".")
+        normalized = f"{local}@{_normalize_spoken_email_domain(rp)}"
+    else:
+        return None
 
-    normalized = (
-        raw.replace(" at ", "@")
-        .replace(" dot ", ".")
-        .replace(" period ", ".")
-        .replace(" underscore ", "_")
-        .replace(" dash ", "-")
-        .replace(" hyphen ", "-")
-        .replace(" ", "")
-    )
     normalized = normalized.rstrip(".,;:!?")
     if STRICT_EMAIL_REGEX.match(normalized):
         return normalized
     return None
+
+
+def _normalize_email_for_tool_compare(addr: str) -> str:
+    return (addr or "").strip().lower().rstrip(".")
+
+
+def _email_save_matches_transcript(raw_user_input: Optional[str], saved: str) -> bool:
+    """Require parsed spoken email to match saved value — stops LLM invented addresses."""
+    if not raw_user_input or not saved:
+        return False
+    parsed = infer_email_from_transcript(raw_user_input)
+    if not parsed:
+        return False
+    return _normalize_email_for_tool_compare(parsed) == _normalize_email_for_tool_compare(
+        str(saved)
+    )
 
 
 def _spoken_email_evidence(raw_user_input: Optional[str]) -> bool:
@@ -2429,6 +2763,87 @@ def _spoken_email_evidence(raw_user_input: Optional[str]) -> bool:
     if re.search(r"\bat\s+[\w.+-]+\s+dot\s+", low):
         return True
     return False
+
+
+def _spoken_dob_year_in_transcript(raw_user_input: str, yyyy: int) -> bool:
+    """True when transcript plausibly mentions ``yyyy`` (digits or spoken)."""
+    if yyyy < 1900 or yyyy > 2010:
+        return True
+    raw = str(raw_user_input).strip()
+    if str(yyyy) in raw:
+        return True
+    low = normalize_answer_scaffold(raw).lower()
+    low = re.sub(r"[^\w\s]", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+    words = low.split()
+    for i in range(len(words)):
+        for j in range(i + 1, min(i + 8, len(words) + 1)):
+            frag = " ".join(words[i:j])
+            if _parse_spoken_year(frag) == yyyy:
+                return True
+    yy = yyyy % 100
+    yy_pat = rf"\b{yy:02d}\b|\b{yy}\b"
+    if re.search(yy_pat, low):
+        century = yyyy // 100
+        if century == 19 and re.search(r"\bnineteen\b", low):
+            return True
+        if century == 20 and re.search(r"\btwenty\b", low):
+            return True
+    return False
+
+
+def _month_tokens_present_for_dob(mm: int, low_sp: str) -> bool:
+    keys = [k for k, v in _MONTH_NAMES.items() if v == mm]
+    return any(re.search(rf"\b{re.escape(k)}\b", low_sp) for k in keys)
+
+
+def _day_token_evidence_for_dob(dd: int, low_for_day: str) -> bool:
+    tokens = [t for t in re.split(r"\s+", low_for_day) if t]
+    for tok in tokens:
+        m = re.match(r"^(\d{1,2})(?:st|nd|rd|th)?$", tok, re.I)
+        if m and int(m.group(1)) == dd:
+            return True
+        if _parse_spoken_day(tok) == dd:
+            return True
+    return False
+
+
+def _transcript_supports_saved_dob(raw_user_input: Optional[str], dob: str) -> bool:
+    """Block LLM/tool hallucinated DOB when speech lacks month, day, and year cues."""
+    if not raw_user_input or not str(raw_user_input).strip() or not dob:
+        return False
+    parts = dob.strip().split("/")
+    if len(parts) != 3:
+        return True
+    try:
+        mm, dd, yyyy = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return True
+
+    raw = str(raw_user_input).strip()
+    scaffolded = normalize_answer_scaffold(raw) or raw
+    low_sp = scaffolded.lower()
+    low_sp = re.sub(r"\s+", " ", re.sub(r"[^\w\s/\.-]", " ", low_sp)).strip()
+
+    for sep in ("/", "-", "."):
+        esc = re.escape(sep)
+        if re.search(
+            rf"\b{mm}\s*{esc}\s*{dd}\s*{esc}\s*{yyyy}\b",
+            low_sp,
+        ) or re.search(
+            rf"\b{mm:02d}\s*{esc}\s*{dd:02d}\s*{esc}\s*{yyyy}\b",
+            low_sp,
+        ):
+            return True
+
+    if not _month_tokens_present_for_dob(mm, low_sp):
+        return False
+    if not _spoken_dob_year_in_transcript(raw, yyyy):
+        return False
+
+    low_for_day = re.sub(r"\b(?:19|20)\d{2}\b", " ", low_sp)
+    low_for_day = re.sub(r"\s+", " ", low_for_day).strip()
+    return _day_token_evidence_for_dob(dd, low_for_day)
 
 
 def infer_property_address_from_transcript(text: str) -> Optional[str]:
@@ -2491,7 +2906,6 @@ def infer_property_address_from_transcript(text: str) -> Optional[str]:
         return None
     num = m.group(1)
     rest = m.group(2)
-    # Stop at clear separators before city/state tail.
     rest = re.split(r",|\bin\s+[a-z]+\b|\bcalifornia\b|\bca\b", rest, maxsplit=1)[0].strip()
     if not rest:
         return None
@@ -2586,8 +3000,10 @@ def _state_abbr_from_text(text: str) -> Optional[str]:
 
 
 def infer_property_city_state_from_transcript(text: str) -> dict[str, str]:
-    """Conservative city/state hints from same address utterance."""
     if not text or not str(text).strip():
+        return {}
+    text = normalize_answer_scaffold(text)
+    if not text:
         return {}
     out: dict[str, str] = {}
 
@@ -2616,6 +3032,27 @@ def infer_property_city_state_from_transcript(text: str) -> dict[str, str]:
         if state:
             out["state"] = state
     return out
+
+
+def build_address_autocomplete_type_query(
+    street_line: Optional[str],
+    spoken_transcript_hint: Optional[str],
+) -> Optional[str]:
+    street = (street_line or "").strip()
+    if not street:
+        return None
+    sh = (spoken_transcript_hint or "").strip()
+    if not sh:
+        return street
+    hints = infer_property_city_state_from_transcript(sh)
+    tail = " ".join(
+        x.strip()
+        for x in (hints.get("city"), hints.get("state"))
+        if x and str(x).strip()
+    )
+    if tail:
+        return f"{street} {tail}".strip()
+    return street
 
 
 def _name_slot_focus_from_missing(missing_blob: str) -> Optional[str]:
@@ -3067,7 +3504,6 @@ async def update_application_state(
                 + (missing if missing and missing.strip() else "")
             )
 
-    # STT often garbles "sole owner" / "primary property"; infer if LLM omitted fields.
     if raw_user_input and browser_manager.get_current_stage() == "property":
         if (
             _use_deterministic_address_parsing()
@@ -3077,9 +3513,6 @@ async def update_application_state(
             inferred_addr = infer_property_address_from_transcript(raw_user_input)
             if inferred_addr:
                 local_vars["address_line_1"] = inferred_addr
-        # Same utterance must not fill both: "one"/"1" is sole owner, not primary occupancy.
-        # If this call already sets occupancy, do not infer ownership (e.g. "two" for
-        # secondary must not become joint owner).
         if local_vars.get("ownership_type") is None and local_vars.get(
             "occupancy_type"
         ) is None:
@@ -3106,39 +3539,32 @@ async def update_application_state(
             if inferred_fs is not None:
                 local_vars["is_currently_for_sale"] = inferred_fs
 
-    # Determine effective confidence (default to 1.0 if not provided)
     score = confidence_score if confidence_score is not None else 1.0
     is_low_confidence = score < CONFIDENCE_THRESHOLD
     
-    # =========================================================================
-    # SAFETY NET: Scan raw user speech for uncertainty markers.
-    # This overrides the LLM's self-reported confidence — if the user said
-    # "maybe" or "I think", we block the save regardless of what the LLM says.
-    # =========================================================================
     matched_markers = detect_uncertainty(raw_user_input or "")
-    
+    if deterministic_call:
+        _money_only = frozenset({"annual_pre_tax_income", "other_income"})
+        pending_money = frozenset(
+            k for k, v in local_vars.items() if v is not None and k in _money_only
+        )
+        if pending_money and pending_money <= _money_only:
+            scaffold_scan = normalize_answer_scaffold(raw_user_input or "") or ""
+            matched_markers = detect_uncertainty(scaffold_scan)
+
     if matched_markers:
-        # Identify which fields the LLM was trying to update
-        pending_fields = [k for k, v in local_vars.items() if v is not None]
-        
-        if pending_fields:
-            fields_list = ", ".join(pending_fields)
+        pending_update = {k: v for k, v in local_vars.items() if v is not None}
+        if pending_update:
             markers_list = ", ".join(f"'{m}'" for m in matched_markers)
             logger.warning(
-                "Uncertainty detected in user speech — markers: %s | pending fields: %s | raw: '%s'",
-                markers_list, fields_list, raw_user_input,
+                "Uncertainty detected — markers: %s | fields: %s | raw: '%s'",
+                markers_list, list(pending_update.keys()), raw_user_input,
             )
-            
-            missing = get_missing_fields()
-            missing_str = f" {missing}" if missing and missing.strip() else ""
-            
+            _set_pending_low_confidence_confirmation(pending_update, CONFIDENCE_THRESHOLD)
+            conf_ask = _pending_low_conf_ask()
             return (
-                f"Update PENDING. Uncertainty detected in user speech: "
-                f"'{raw_user_input}' (markers: {markers_list}). "
-                f"You MUST ask the user to explicitly confirm the values for "
-                f"{fields_list} before I can save them to the state. "
-                f"Ask: 'I want to make sure I have this right — is it [value]?'"
-                f"{missing_str}"
+                f"Update PENDING — uncertainty detected ({markers_list}). "
+                f"Ask the caller to confirm: {conf_ask}"
             )
     
     low_conf_pending = []
@@ -3183,6 +3609,30 @@ async def update_application_state(
                         (raw_user_input or "")[:200],
                     )
                     continue
+                if not _email_save_matches_transcript(raw_user_input, str(value)):
+                    validation_errors.append(
+                        "email_address rejected: transcript does not parse to the same "
+                        "address you tried to save — only save what they literally said "
+                        "(e.g. full local part then at domain dot com)."
+                    )
+                    logger.warning(
+                        "email_address rejected — transcript mismatch | raw=%r saved=%r",
+                        (raw_user_input or "")[:200],
+                        _redact_if_sensitive("email_address", value),
+                    )
+                    continue
+            if field_name == "date_of_birth" and value is not None:
+                if not _transcript_supports_saved_dob(raw_user_input, str(value)):
+                    validation_errors.append(
+                        "date_of_birth rejected: caller speech did not clearly state that "
+                        "full date (month, day, and year). Ask them for a complete date."
+                    )
+                    logger.warning(
+                        "date_of_birth rejected — transcript lacks evidence | raw=%r dob=%r",
+                        (raw_user_input or "")[:200],
+                        value,
+                    )
+                    continue
             field_threshold = (
                 ADDRESS_CONFIDENCE_THRESHOLD
                 if field_name in ADDRESS_CONFIDENCE_FIELDS
@@ -3207,7 +3657,8 @@ async def update_application_state(
             try:
                 setattr(application_state, field_name, value)
                 updates[field_name] = value
-                
+                _maybe_record_voice_field_user_source(field_name, raw_user_input)
+
             except (ValidationError, ValueError) as e:
                 # Validator rejected this value — tell the LLM what went wrong
                 # so it can ask the caller to correct it.
@@ -3223,8 +3674,6 @@ async def update_application_state(
                     error_msg,
                 )
 
-    # WCL: first checkbox (consent-1) covers privacy, terms, and soft credit. State
-    # keeps agreed_to_credit_pull in sync for logs/exports (no separate DOM control).
     if (
         "agreed_to_privacy_policy" in updates
         and "agreed_to_credit_pull" not in updates
@@ -3233,16 +3682,16 @@ async def update_application_state(
         if pv is True:
             updates["agreed_to_credit_pull"] = True
             setattr(application_state, "agreed_to_credit_pull", True)
+            _maybe_record_voice_field_user_source(
+                "agreed_to_credit_pull", raw_user_input
+            )
         elif pv is False:
             updates["agreed_to_credit_pull"] = False
             setattr(application_state, "agreed_to_credit_pull", False)
+            _maybe_record_voice_field_user_source(
+                "agreed_to_credit_pull", raw_user_input
+            )
     
-    # =========================================================================
-    # BROWSER SYNCHRONIZATION — Mirror valid updates to the live browser
-    # Default: run async in background so the LLM is not blocked ~10s on address
-    # autocomplete. Set SYNC_BROWSER_INLINE=1 to block in-process (stricter
-    # validation errors in the same turn).
-    # =========================================================================
     if low_conf_pending:
         pending = "; ".join(low_conf_pending)
         required_conf = (
@@ -3334,7 +3783,12 @@ async def update_application_state(
     return ". ".join(parts) + "."
 
 
-async def apply_voice_intake_heuristics_before_line(transcript: str) -> HeuristicResult:
+async def apply_voice_intake_heuristics_before_line(
+    transcript: str,
+    *,
+    stt_confidence: Optional[float] = None,
+    stt_recovery_text: Optional[str] = None,
+) -> HeuristicResult:
     """
     Pre-Line heuristic hook (deterministic-only safety net).
 
@@ -3427,6 +3881,11 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         if field == "primary_home_address_line_1":
             if "primary home" in low or "saved" in low:
                 return ask
+            low_ask = ask.strip().lower()
+            # "I'll pull that up" sounds like a yes/no confirmation; callers often say "yes"
+            # before the for-sale question lands. Use neutral bridge before binary for-sale.
+            if "for sale" in low_ask:
+                return f"Thanks for that. {ask}"
             return f"Got it, I'll pull that up. {ask}"
         return ask
 
@@ -3479,6 +3938,36 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
         _clear_prefill_confirm_pending()
         if yn is False:
             _prefill_rejected_fields.update(pending_values.keys())
+            for fname in pending_values:
+                if fname not in HelocApplicationState.model_fields:
+                    continue
+                try:
+                    setattr(application_state, fname, None)
+                except Exception:
+                    logger.debug(
+                        "prefill reject: could not clear %s",
+                        fname,
+                        exc_info=True,
+                    )
+            # Check if the rejection utterance also contains an inline answer.
+            # e.g. "No, it's 413-275-6066" → reject prefill AND parse the phone.
+            inline = _extract_inline_answer_after_no(text, pending_values)
+            if inline:
+                try:
+                    tool_result = await update_application_state.func(
+                        None,
+                        **inline,
+                        confidence_score=0.92,
+                        raw_user_input=text,
+                        deterministic_call=True,
+                    )
+                    return _ok(
+                        _extract_ask_next(tool_result),
+                        "prefill_confirmation_rejected",
+                        stage,
+                    )
+                except Exception:
+                    logger.debug("inline answer after prefill reject failed", exc_info=True)
             ask = _ask_from_missing_line(get_missing_fields() or "")
             return _ok(ask, "prefill_confirmation_rejected", stage)
 
@@ -3555,6 +4044,11 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                     )
                 return _fail(stage)
         if application_state.ownership_type is None:
+            miss = get_missing_fields() or ""
+            ask_m = (_ask_from_missing_line(miss) or "").lower()
+            own_q = "ownership type" in ask_m or "sole or joint" in ask_m
+            if own_q and _stt_confidence_triggers_reprompt(stt_confidence):
+                return _ok(OWNERSHIP_LOW_CONF_REPROMPT, "ownership_type", stage)
             if transcript_requests_intake_default(text):
                 logger.info(
                     "intake default: ownership_type=%s (caller declined to specify)",
@@ -3604,6 +4098,13 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             return _fail(stage)
 
         if application_state.occupancy_type is None:
+            miss = get_missing_fields() or ""
+            ask_m = (_ask_from_missing_line(miss) or "").lower()
+            occ_q = ("primary home" in ask_m and "second home" in ask_m) or (
+                "investment property" in ask_m and "second home" in ask_m
+            )
+            if occ_q and _stt_confidence_triggers_reprompt(stt_confidence):
+                return _ok(OCCUPANCY_LOW_CONF_REPROMPT, "occupancy_type", stage)
             if transcript_requests_intake_default(text):
                 logger.info(
                     "intake default: occupancy_type=%s (caller declined to specify)",
@@ -3632,14 +4133,16 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
-            occ = infer_occupancy_from_transcript(text)
+            eff, occ = infer_occupancy_with_optional_recovery(
+                text, stt_recovery_text
+            )
             if occ is not None:
                 try:
                     tool_result = await update_application_state.func(
                         None,
                         occupancy_type=occ,
                         confidence_score=0.95,
-                        raw_user_input=text,
+                        raw_user_input=eff,
                         deterministic_call=True,
                     )
                     return _ok(_extract_ask_next(tool_result), "occupancy_type", stage)
@@ -3651,6 +4154,22 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                     )
                 return _fail(stage)
             return _fail(stage)
+
+        _eff_echo, occ_infer = infer_occupancy_with_optional_recovery(
+            text, stt_recovery_text
+        )
+        if (
+            occ_infer is not None
+            and occ_infer == application_state.occupancy_type
+        ):
+            blob = get_missing_fields() or ""
+            ask_next = _ask_from_missing_line(blob)
+            if ask_next:
+                return _ok(ask_next, "occupancy_type", stage)
+            if "waiting for navigation" in blob.lower():
+                return _ok("Got it. One moment.", "occupancy_type", stage)
+            return _fail(stage)
+
         return _fail(stage)
 
     if stage == "primary-home":
@@ -3932,6 +4451,14 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
                         exc_info=True,
                     )
                 return _fail(stage)
+            # "Yes" / affirmative without dollar amount → ask how much
+            yn = infer_yes_no_from_transcript(text)
+            if yn is True:
+                return _ok(
+                    "How much additional income per year, in dollars?",
+                    "other_income",
+                    stage,
+                )
             return _fail(stage)
 
         if application_state.primary_source_of_income is None:
@@ -3990,6 +4517,8 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
             return _fail(stage)
         dob = infer_dob_from_transcript(text)
         if dob is None:
+            if infer_partial_dob_month_day(text):
+                return _ok(PARTIAL_DOB_REPROMPT, "date_of_birth", stage)
             return _fail(stage)
         try:
             tool_result = await update_application_state.func(
@@ -4010,7 +4539,19 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
 
     if stage == "contact":
         if application_state.mobile_phone_number is None:
-            digit_run = re.sub(r"\D", "", text)
+            clean_text = normalize_answer_scaffold(text) or text
+            digit_run = re.sub(r"\D", "", clean_text)
+            spoken_digits = _spoken_digit_sequence_to_digits(clean_text)
+            if spoken_digits:
+                sd = spoken_digits
+                if len(sd) == 11 and sd.startswith("1"):
+                    sd = sd[1:]
+                if 5 <= len(sd) <= 9:
+                    return _ok(
+                        PARTIAL_MOBILE_PHONE_REPROMPT,
+                        "mobile_phone_number",
+                        stage,
+                    )
             if 5 <= len(digit_run) <= 9:
                 return _ok(
                     PARTIAL_MOBILE_PHONE_REPROMPT,
@@ -4059,7 +4600,24 @@ async def apply_voice_intake_heuristics_before_line(transcript: str) -> Heuristi
     if stage != "for-sale":
         return _NOT_HANDLED
     if application_state.is_currently_for_sale is not None:
+        fs_echo = infer_for_sale_from_transcript(text)
+        if (
+            fs_echo is not None
+            and fs_echo == application_state.is_currently_for_sale
+        ):
+            blob = get_missing_fields() or ""
+            ask_next = _ask_from_missing_line(blob)
+            if ask_next:
+                return _ok(ask_next, "is_currently_for_sale", stage)
+            if "waiting for navigation" in blob.lower():
+                return _ok("Got it. One moment.", "is_currently_for_sale", stage)
+            return _fail(stage)
         return _fail(stage)
+    miss_fs = get_missing_fields() or ""
+    ask_fs = (_ask_from_missing_line(miss_fs) or "").lower()
+    fs_q = "for sale" in ask_fs or "listed for sale" in ask_fs
+    if fs_q and _stt_confidence_triggers_reprompt(stt_confidence):
+        return _ok(FOR_SALE_LOW_CONF_REPROMPT, "is_currently_for_sale", stage)
     if transcript_requests_intake_default(text):
         fs = DEFAULT_INTAKE_FOR_SALE
         used_for_sale_default = True
