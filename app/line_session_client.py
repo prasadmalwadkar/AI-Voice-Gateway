@@ -15,8 +15,11 @@ from typing import Any, Optional
 import websockets
 from websockets.client import WebSocketClientProtocol
 
+from agent.state_manager import transcript_is_status_check, transcript_seeks_question_repeat
+
 from app.logging_config import CallLogger
 from app.path2_transcript_debug import broadcast_stt
+
 
 class LineSessionClient:
     """Async client for the Line VoiceAgentApp websocket protocol."""
@@ -531,7 +534,11 @@ class LineSessionClient:
             return True
 
         # Existing key asks.
-        if "primary, secondary, or investment" in a:
+        if (
+            "primary, secondary, or investment" in a
+            or ("primary home" in a and "second home" in a)
+            or ("investment property" in a and "second home" in a)
+        ):
             pu = u.strip().rstrip(".,!?").lower()
             return any(k in u for k in ("primary", "secondary", "investment")) or pu in {
                 "1",
@@ -826,11 +833,25 @@ class LineSessionClient:
                 ask_next, event="line.session.deterministic_ask"
             )
 
-    async def enqueue_status_check_response(self) -> bool:
-        """Repeat current ask directly for 'repeat/you there' intents."""
-        ask = (self._last_tool_ask or "").strip()
-        response = ask if ask else self.BRIEF_REPEAT_PROMPT
+    async def enqueue_status_check_response(
+        self,
+        *,
+        ask_hint: Optional[str] = None,
+        user_transcript: Optional[str] = None,
+    ) -> bool:
+        """Acknowledge status / confusion checks; repeat Ask next verbatim when requested."""
+        base = (ask_hint or self._last_tool_ask or "").strip()
         self._ask_spoken_this_turn = False
+        if (
+            user_transcript
+            and transcript_seeks_question_repeat(user_transcript)
+            and base
+        ):
+            response = base
+        elif base:
+            response = self._clarification_for_ask(base)
+        else:
+            response = self.BRIEF_REPEAT_PROMPT
         return await self._enqueue_ask_if_needed(
             response,
             event="line.session.status_check_response",
@@ -851,6 +872,15 @@ class LineSessionClient:
             return (
                 "Sorry, I didn't catch that. Is this primary, secondary, or investment?"
             )
+        if (
+            "primary home" in low
+            and "second home" in low
+            and "investment" in low
+        ):
+            return (
+                "I'm here. Is this your primary home, a second home, "
+                "or an investment property?"
+            )
         if "currently for sale" in low or "for sale" in low:
             return "Sorry, I missed that. Is the property currently listed for sale?"
         if "annual pre-tax income" in low or "annual income" in low:
@@ -865,7 +895,7 @@ class LineSessionClient:
             return "Could you say your last name one more time?"
         if "date of birth" in low:
             return "Could you say your date of birth again: month, day, and year?"
-        if "phone" in low:
+        if "mobile" in low or "phone" in low:
             return "Could you say the mobile number one more time, all ten digits?"
         if "email" in low:
             return "Could you say the email slowly one more time?"
@@ -928,10 +958,10 @@ class LineSessionClient:
         self._ask_spoken_this_turn = False
         lower_text = text.lower()
         ask_l = (self._last_tool_ask or "").strip()
-        # Status pings ("you there?", "what's next?") should repeat current ask
-        # locally and never reopen LLM context for stale/out-of-stage questions.
+        # Status pings — repeat Ask next verbatim when user asks what we need;
+        # otherwise short clarification for current ask; skip LLM for this turn.
         if ask_l and self._is_status_check_utterance(lower_text):
-            await self.enqueue_status_check_response()
+            await self.enqueue_status_check_response(user_transcript=text)
             return
         frames = [
             {"type": "user_state", "value": "speaking"},
@@ -975,7 +1005,6 @@ class LineSessionClient:
 
     @staticmethod
     def _is_status_check_utterance(text: str) -> bool:
-        from agent.state_manager import transcript_is_status_check
         return transcript_is_status_check(text)
 
     async def close(self) -> None:

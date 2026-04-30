@@ -133,11 +133,48 @@ async def test_send_user_transcript_status_ping_repeats_current_ask_without_llm(
     client._turn_watchdog_task = None
     client._pending_ask_fallback_task = None
     client._enqueue_ask_if_needed = AsyncMock(return_value=True)
+    client._no_response_watchdog_sec = 3600.0
 
     await client.send_user_transcript("Hello, you there?")
 
     client._enqueue_ask_if_needed.assert_awaited_once_with(
-        "Last name?",
+        "Could you say your last name one more time?",
+        event="line.session.status_check_response",
+    )
+    client._ws.send.assert_not_called()
+
+
+async def test_send_user_transcript_meta_question_replays_verbatim():
+    """Meta-requests ('what's the question') replay Ask next verbatim."""
+    from app.line_session_client import LineSessionClient
+
+    ask = "What's your annual pre-tax income?"
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._ws = AsyncMock()
+    client._ws.closed = False
+    client._closed = False
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client._call_logger.call_sid = "test"
+    client._fallback_spoken_text = ""
+    client._ask_spoken_this_turn = False
+    client._awaiting_turn_response = False
+    client._last_tool_ask = ask
+    client._last_spoken_ask_text = ""
+    client._last_spoken_ask_ts = 0.0
+    client._ask_dedup_window_sec = 3.0
+    client._post_fallback_mute_model_sec = 1.8
+    client._mute_model_text_until = 0.0
+    client.tts_queue = asyncio.Queue()
+    client._no_response_watchdog_task = None
+    client._turn_watchdog_task = None
+    client._pending_ask_fallback_task = None
+    client._enqueue_ask_if_needed = AsyncMock(return_value=True)
+    client._no_response_watchdog_sec = 3600.0
+
+    await client.send_user_transcript("What info do you need from me?")
+
+    client._enqueue_ask_if_needed.assert_awaited_once_with(
+        ask,
         event="line.session.status_check_response",
     )
     client._ws.send.assert_not_called()
