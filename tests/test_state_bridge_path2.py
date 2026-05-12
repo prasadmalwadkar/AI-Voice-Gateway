@@ -960,6 +960,39 @@ def test_caller_response_watchdog_uses_current_ask_for_clarification():
     asyncio.run(_run())
 
 
+def test_schedule_caller_response_watchdog_keeps_prior_when_agent_text_prefix_only():
+    """Prefix-only watchdog TTS still reschedules with substantive Ask next."""
+
+    async def _run() -> None:
+        from app.twilio_line_bridge import (
+            CALLER_RESPONSE_WATCHDOG_PREFIX,
+            TwilioLineBridge,
+        )
+
+        substantive = "How much additional income per year, in dollars?"
+        bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+        bridge._caller_response_watchdog_task = None
+        bridge._caller_response_watchdog_seq = 0
+        bridge._running = True
+        bridge._line = MagicMock()
+        bridge._line._last_tool_ask = substantive
+        bridge._caller_response_prompt = substantive
+
+        TwilioLineBridge._schedule_caller_response_watchdog(
+            bridge, CALLER_RESPONSE_WATCHDOG_PREFIX
+        )
+
+        assert bridge._caller_response_prompt == substantive
+        assert bridge._caller_response_watchdog_task is not None
+        bridge._caller_response_watchdog_task.cancel()
+        try:
+            await bridge._caller_response_watchdog_task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
+
+
 def test_caller_response_watchdog_queues_repeat(monkeypatch):
     import app.twilio_line_bridge as bridge_module
     from app.twilio_line_bridge import TwilioLineBridge
@@ -982,6 +1015,127 @@ def test_caller_response_watchdog_queues_repeat(monkeypatch):
             "I may have missed you there. Could you say that one more time?"
         )
         bridge.call_logger.info.assert_called_once()
+
+    asyncio.run(_run())
+
+
+def test_call_state_is_isolated_by_call_id():
+    from agent.state_manager import (
+        application_state,
+        bind_call_state,
+        release_call_state,
+    )
+
+    try:
+        bind_call_state("CA_one", fresh=True)
+        application_state.first_name = "Jane"
+
+        bind_call_state("CA_two", fresh=True)
+        assert application_state.first_name is None
+        application_state.first_name = "Sam"
+
+        bind_call_state("CA_one")
+        assert application_state.first_name == "Jane"
+
+        bind_call_state("CA_two")
+        assert application_state.first_name == "Sam"
+    finally:
+        release_call_state("CA_one")
+        release_call_state("CA_two")
+
+
+def test_call_state_registered():
+    from agent.state_manager import (
+        bind_call_state,
+        call_state_registered,
+        release_call_state,
+    )
+
+    assert not call_state_registered("CA_regchk")
+    bind_call_state("CA_regchk", fresh=True)
+    assert call_state_registered("CA_regchk")
+    release_call_state("CA_regchk")
+    assert not call_state_registered("CA_regchk")
+
+
+def test_bind_same_call_id_twice_preserves_browser_manager_when_not_fresh():
+    from agent.state_manager import (
+        _current_call_state,
+        application_state,
+        bind_call_state,
+        release_call_state,
+    )
+
+    try:
+        bind_call_state("CA_rebind", fresh=True)
+        bm1 = _current_call_state().browser_manager
+        application_state.first_name = "Pat"
+        bind_call_state("CA_rebind", fresh=False)
+        assert _current_call_state().browser_manager is bm1
+        assert application_state.first_name == "Pat"
+    finally:
+        release_call_state("CA_rebind")
+
+
+def test_fresh_true_replaces_browser_manager_for_existing_call():
+    from agent.state_manager import (
+        _current_call_state,
+        bind_call_state,
+        release_call_state,
+    )
+
+    try:
+        bind_call_state("CA_fresh2", fresh=True)
+        bm1 = _current_call_state().browser_manager
+        bind_call_state("CA_fresh2", fresh=True)
+        bm2 = _current_call_state().browser_manager
+        assert bm1 is not bm2
+    finally:
+        release_call_state("CA_fresh2")
+
+
+def test_path2_transcript_debug_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("PATH2_TRANSCRIPT_DEBUG_WS", raising=False)
+    monkeypatch.delenv("PATH2_TRANSCRIPT_DEBUG_TOKEN", raising=False)
+
+    from app.path2_transcript_debug import (
+        path2_transcript_debug_enabled,
+        path2_transcript_debug_token,
+    )
+
+    assert path2_transcript_debug_enabled() is False
+    assert path2_transcript_debug_token() == ""
+
+
+def test_cleanup_cancels_background_browser_launch():
+    from app.twilio_line_bridge import TwilioLineBridge
+
+    async def _run() -> None:
+        bridge = TwilioLineBridge.__new__(TwilioLineBridge)
+        bridge._stt_task = None
+        bridge._tts_task = None
+        bridge._end_watch_task = None
+        bridge._caller_response_watchdog_task = None
+        bridge._caller_response_watchdog_seq = 0
+        bridge._deterministic_followup_task = None
+        bridge._contact_buffer_task = None
+        bridge._contact_final_buffer = []
+        bridge._contact_buffer_kind = None
+        bridge._line = None
+        bridge._tts = None
+        bridge._stt = None
+        bridge.call_sid = "CA_cleanup"
+        bridge.call_logger = MagicMock(spec=["debug", "info", "warning", "error", "ttfa_ms"])
+        bridge.call_logger.ttfa_ms = None
+
+        async def pending_browser() -> None:
+            await asyncio.sleep(30)
+
+        bridge._browser_launch_task = asyncio.create_task(pending_browser())
+
+        await TwilioLineBridge._cleanup(bridge)
+
+        assert bridge._browser_launch_task is None
 
     asyncio.run(_run())
 
@@ -1015,4 +1169,3 @@ def test_repeated_clarification_escalates_to_spelling_prompt():
         )
 
     asyncio.run(_run())
-

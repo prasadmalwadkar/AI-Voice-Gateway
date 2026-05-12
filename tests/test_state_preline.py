@@ -49,7 +49,7 @@ async def test_preline_income_garble_passes_low_confidence_for_confirmation():
     assert call_kw["confidence_score"] == _INCOME_AMBIGUOUS_STT_CONFIDENCE
 
 
-async def test_prefill_confirmation_yes_commits_pending_values():
+async def test_prefill_confirmation_yes_commits_first_then_last_separately():
     from agent.schema import HelocApplicationState
     from agent.state_manager import (
         apply_voice_intake_heuristics_before_line,
@@ -61,6 +61,13 @@ async def test_prefill_confirmation_yes_commits_pending_values():
     mock_browser = MagicMock()
     mock_browser.get_current_stage.return_value = "name"
 
+    async def tool_effect(*args, **kwargs):
+        if kwargs.get("first_name"):
+            mock_state.first_name = kwargs["first_name"]
+        if kwargs.get("last_name"):
+            mock_state.last_name = kwargs["last_name"]
+        return _make_tool_result("What's your date of birth?")
+
     with (
         patch("agent.state_manager.browser_manager", mock_browser),
         patch("agent.state_manager.application_state", mock_state),
@@ -68,18 +75,69 @@ async def test_prefill_confirmation_yes_commits_pending_values():
         patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
     ):
         set_customer_prefill({"first_name": "Jane", "last_name": "Doe"})
-        assert "I have your legal name as Jane Doe" in get_missing_fields()
-        mock_tool.func = AsyncMock(return_value=_make_tool_result("What is your date of birth?"))
-        result = await apply_voice_intake_heuristics_before_line("yes")
+        assert "first name as Jane" in get_missing_fields()
+        mock_tool.func = AsyncMock(side_effect=tool_effect)
 
-    assert result.handled is True
-    assert result.handled_field == "prefill_confirmation"
-    mock_tool.func.assert_called_once()
-    call_kw = mock_tool.func.call_args[1]
-    assert call_kw["first_name"] == "Jane"
-    assert call_kw["last_name"] == "Doe"
-    assert call_kw["confidence_score"] == 1.0
-    assert call_kw["raw_user_input"] == "yes"
+        result1 = await apply_voice_intake_heuristics_before_line("yes")
+        assert result1.handled is True
+        mock_tool.func.assert_called_once()
+        kw1 = mock_tool.func.call_args[1]
+        assert kw1["first_name"] == "Jane"
+        assert "last_name" not in kw1
+        mock_tool.func.reset_mock()
+
+        assert "last name as Doe" in get_missing_fields()
+
+        await apply_voice_intake_heuristics_before_line("yes")
+        mock_tool.func.assert_called_once()
+        kw2 = mock_tool.func.call_args[1]
+        assert kw2["last_name"] == "Doe"
+        assert "first_name" not in kw2
+
+
+async def test_prefill_last_name_carry_over_thats_correct_commits_last_name():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        apply_voice_intake_heuristics_before_line,
+        get_missing_fields,
+        set_customer_prefill,
+    )
+
+    mock_state = HelocApplicationState()
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "name"
+
+    async def tool_effect_first(*args, **kwargs):
+        mock_state.first_name = kwargs["first_name"]
+        return _make_tool_result("next")
+
+    async def tool_effect_last(*args, **kwargs):
+        mock_state.last_name = kwargs["last_name"]
+        return _make_tool_result("What's your date of birth?")
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        set_customer_prefill({"first_name": "Jane", "last_name": "Doe"})
+        assert "first name as Jane" in get_missing_fields()
+        mock_tool.func = AsyncMock(side_effect=tool_effect_first)
+
+        await apply_voice_intake_heuristics_before_line("yes")
+        assert mock_state.first_name == "Jane"
+        assert mock_tool.func.call_count == 1
+
+        mock_tool.func.reset_mock()
+        mock_tool.func = AsyncMock(side_effect=tool_effect_last)
+        assert "last name as Doe" in get_missing_fields()
+
+        rc = await apply_voice_intake_heuristics_before_line("That's correct.")
+        assert rc.handled is True
+        assert "separate clear yes" not in (rc.ask_next or "").lower()
+        mock_tool.func.assert_called_once()
+        assert mock_state.last_name == "Doe"
 
 
 async def test_prefill_confirmation_yes_beats_stale_low_conf_pending():
@@ -134,7 +192,7 @@ async def test_prefill_confirmation_no_rejects_and_asks_normal_question():
         patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
     ):
         set_customer_prefill({"first_name": "Jane", "last_name": "Doe"})
-        assert "I have your legal name as Jane Doe" in get_missing_fields()
+        assert "first name as Jane" in get_missing_fields()
         mock_tool.func = AsyncMock()
         result = await apply_voice_intake_heuristics_before_line("no")
         followup = get_missing_fields()
@@ -543,10 +601,12 @@ async def test_consent_decline_privacy_explains_then_terminal():
     with (
         patch("agent.state_manager.browser_manager", mock_browser),
         patch("agent.state_manager.application_state", mock_state),
-        patch("agent.state_manager._consent_decline_round", rounds),
         patch("agent.state_manager.update_application_state") as mock_tool,
         patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
     ):
+        import agent.state_manager as sm
+
+        sm._current_call_state().consent_decline_round = rounds
         mock_tool.func = AsyncMock(return_value="unexpected")
         from agent.state_manager import apply_voice_intake_heuristics_before_line
 
@@ -723,6 +783,34 @@ async def test_preline_partial_phone_reprompt_skips_tool():
     mock_tool.func.assert_not_called()
 
 
+async def test_preline_contact_email_i_dont_know_forwards_to_line_keeps_prefill():
+    from agent.schema import HelocApplicationState
+    from agent.state_manager import (
+        apply_voice_intake_heuristics_before_line,
+        get_customer_prefill_fields,
+        set_customer_prefill,
+    )
+
+    mock_state = HelocApplicationState(mobile_phone_number="2135550100")
+    mock_browser = MagicMock()
+    mock_browser.get_current_stage.return_value = "contact"
+
+    with (
+        patch("agent.state_manager.browser_manager", mock_browser),
+        patch("agent.state_manager.application_state", mock_state),
+        patch("agent.state_manager.update_application_state") as mock_tool,
+        patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
+    ):
+        set_customer_prefill({"email_address": "onfile@example.com"})
+        mock_tool.func = AsyncMock()
+        result = await apply_voice_intake_heuristics_before_line("I don't know.")
+
+    assert result.handled is False
+    mock_tool.func.assert_not_called()
+    assert mock_state.email_address is None
+    assert get_customer_prefill_fields() == ["email_address"]
+
+
 async def test_preline_contact_spoken_nine_digit_spell_reprompt():
     """Word-only digit spell producing 9 digits → partial reprompt (not silent LLM fail)."""
     from agent.schema import HelocApplicationState
@@ -765,7 +853,6 @@ async def test_prefill_reject_clears_mobile_phone_from_state():
         "ask": "I have your mobile number as 4132726066. Is that correct?",
     }
     with (
-        patch.object(sm, "_prefill_confirm_pending", pending),
         patch.object(sm, "browser_manager", mock_browser),
         patch.object(sm, "application_state", mock_state),
         patch("agent.state_manager.update_application_state") as mock_tool,
@@ -776,6 +863,7 @@ async def test_prefill_reject_clears_mobile_phone_from_state():
             return_value='Ask next: "What\'s the best mobile number for this application?"',
         ),
     ):
+        sm._current_call_state().prefill_confirm_pending = pending
         mock_tool.func = AsyncMock()
         result = await sm.apply_voice_intake_heuristics_before_line("No.")
 
@@ -968,7 +1056,6 @@ async def test_preline_prefill_reject_with_inline_phone():
     tool_return = _make_tool_result("What's the best email for this application?")
 
     with (
-        patch.object(sm, "_prefill_confirm_pending", pending),
         patch.object(sm, "browser_manager", mock_browser),
         patch.object(sm, "application_state", mock_state),
         patch("agent.state_manager.update_application_state") as mock_tool,
@@ -978,6 +1065,7 @@ async def test_preline_prefill_reject_with_inline_phone():
             return_value='Ask next: "What\'s the best mobile number?"',
         ),
     ):
+        sm._current_call_state().prefill_confirm_pending = pending
         mock_tool.func = AsyncMock(return_value=tool_return)
         result = await sm.apply_voice_intake_heuristics_before_line(
             "No, it's 4132756066"

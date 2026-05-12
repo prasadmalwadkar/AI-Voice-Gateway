@@ -48,7 +48,7 @@ def test_heloc_ui_final_snapshot_export_keys(transcript_dir):
 
     import agent.state_manager as sm
 
-    sm._voice_field_user_sources.clear()
+    sm._current_call_state().voice_field_user_sources = {}
 
     state = HelocApplicationState(
         address_line_1="1 Main St",

@@ -76,6 +76,7 @@ def test_infer_other_income():
     assert infer_other_income_from_transcript("not right now") == 0
     assert infer_other_income_from_transcript("I don't have any other income") == 0
     assert infer_other_income_from_transcript("50K") == 50_000
+    assert infer_other_income_from_transcript("It's around ten k.") == 10_000
 
 
 def test_infer_dob_spoken():
@@ -239,6 +240,12 @@ def test_infer_phone_email_yesno_and_address():
     assert infer_email_from_transcript("john_doe@gmail.com") == "john_doe@gmail.com"
     assert infer_email_from_transcript("john at gmail dot com.") == "john@gmail.com"
     assert infer_email_from_transcript("john at gmail dot com!") == "john@gmail.com"
+    assert infer_email_from_transcript(
+        "prasat at the rate gmail dot com"
+    ) == "prasat@gmail.com"
+    assert infer_email_from_transcript(
+        "prasad at sign yahoo dot com"
+    ) == "prasad@yahoo.com"
     assert infer_email_from_transcript(
         "prasad mahavat kar eighty four at g mail dot com"
     ) == "prasadmahavatkar84@gmail.com"

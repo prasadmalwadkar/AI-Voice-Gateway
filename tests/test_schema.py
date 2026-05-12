@@ -56,6 +56,10 @@ def test_heloc_schema():
 
     with pytest.raises(ValueError):
         state.date_of_birth = "March 15 1990"
+    with pytest.raises(ValueError):
+        state.date_of_birth = "02/31/1990"
+    with pytest.raises(ValueError):
+        state.date_of_birth = "12/31/2010"
 
     state.email_address = "john.smith@example.com"
     assert state.email_address == "john.smith@example.com"

@@ -219,3 +219,38 @@ async def test_clear_pending_speech_drains_stale_tts_queue():
     assert client.tts_queue.empty()
 
 
+async def test_busy_hold_does_not_consume_turn_ask_slot():
+    """BUSY_HOLD_PROMPT extends mute delay but leaves slot for tool Ask-next fallback."""
+    from app.line_session_client import LineSessionClient
+
+    client = LineSessionClient.__new__(LineSessionClient)
+    client._call_logger = MagicMock(spec=["debug", "info", "warning", "error", "call_sid"])
+    client._call_logger.call_sid = "test"
+    client._ask_spoken_this_turn = False
+    client._awaiting_turn_response = True
+    client._last_spoken_ask_text = ""
+    client._last_spoken_ask_ts = 0.0
+    client._ask_dedup_window_sec = 3.0
+    client._post_fallback_mute_model_sec = 1.8
+    client._mute_model_text_until = 0.0
+    client.tts_queue = asyncio.Queue()
+
+    ok = await client._enqueue_ask_if_needed(
+        LineSessionClient.BUSY_HOLD_PROMPT,
+        event="line.session.test_busy_hold",
+        consumes_turn_ask_slot=False,
+    )
+    assert ok is True
+    assert client._ask_spoken_this_turn is False
+
+    ok2 = await client._enqueue_ask_if_needed(
+        "What's your main income source?",
+        event="line.session.test_real_ask",
+    )
+    assert ok2 is True
+    assert client._ask_spoken_this_turn is True
+    assert client.tts_queue.qsize() == 2
+    assert client.tts_queue.get_nowait() == LineSessionClient.BUSY_HOLD_PROMPT
+    assert client.tts_queue.get_nowait() == "What's your main income source?"
+
+
