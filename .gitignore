@@ -41,3 +41,6 @@ scripts/fixtures/voice_replays/orchestrator_runs/
 
 FILE_REFERENCE.md
 
+agent/STATE_MANAGER.md
+
+docs/END_TO_END_PIPELINE.md

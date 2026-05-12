@@ -37,8 +37,12 @@ _call_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("path2_ca
 
 
 def path2_transcript_debug_enabled() -> bool:
-    v = os.getenv("PATH2_TRANSCRIPT_DEBUG_WS", "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
+    v = os.getenv("PATH2_TRANSCRIPT_DEBUG_WS", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def path2_transcript_debug_token() -> str:
+    return os.getenv("PATH2_TRANSCRIPT_DEBUG_TOKEN", "").strip()
 
 
 def path2_debug_detailed() -> bool:

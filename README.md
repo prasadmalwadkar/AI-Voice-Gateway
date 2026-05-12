@@ -20,6 +20,8 @@ The bridge may run **pre-line heuristics** that update application state before 
 
 Diagrams are versioned under [`docs/architecture/`](docs/architecture/); replace the PNGs with exports from your source when the pipeline changes.
 
+**Step-by-step pipeline (files, functions, async):** [`docs/END_TO_END_PIPELINE.md`](docs/END_TO_END_PIPELINE.md)
+
 ## Prerequisites
 
 - Python **3.11+** (3.13: see `requirements.txt` for `audioop-lts` where needed)

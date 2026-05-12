@@ -47,6 +47,7 @@ from app.twilio_line_bridge import TwilioLineBridge
 from app.path2_transcript_debug import (
     keepalive_loop,
     path2_transcript_debug_enabled,
+    path2_transcript_debug_token,
     register_client,
     unregister_client,
 )
@@ -442,6 +443,11 @@ async def path2_transcript_debug_ws(websocket: WebSocket):
     """Live STT events for local debugging (no Twilio protocol — safe for mimic)."""
     await websocket.accept()
     if not path2_transcript_debug_enabled():
+        await websocket.close(code=1008)
+        return
+    expected_token = path2_transcript_debug_token()
+    provided_token = websocket.query_params.get("token", "")
+    if not expected_token or provided_token != expected_token:
         await websocket.close(code=1008)
         return
     await register_client(websocket)
