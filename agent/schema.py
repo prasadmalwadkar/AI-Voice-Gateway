@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import ClassVar, Literal, Optional
@@ -147,12 +148,16 @@ class HelocApplicationState(BaseModel):
                 f"Date of birth must be in MM/DD/YYYY format, got '{v}'."
             )
         month, day, year = int(v[:2]), int(v[3:5]), int(v[6:])
-        if not (1 <= month <= 12):
-            raise ValueError(f"Invalid month: {month}. Must be 01-12.")
-        if not (1 <= day <= 31):
-            raise ValueError(f"Invalid day: {day}. Must be 01-31.")
-        if not (1900 <= year <= 2010):
-            raise ValueError(f"Invalid year: {year}. Must be between 1900-2010.")
+        try:
+            dob = date(year, month, day)
+        except ValueError as e:
+            raise ValueError(f"Invalid date of birth: {v}.") from e
+        today = date.today()
+        min_birthdate = date(today.year - 18, today.month, today.day)
+        if dob > min_birthdate:
+            raise ValueError("Borrower must be at least 18 years old.")
+        if year < 1900:
+            raise ValueError(f"Invalid year: {year}. Must be 1900 or later.")
         return v
 
     @field_validator("email_address", mode="before")
@@ -229,4 +234,3 @@ class HelocApplicationState(BaseModel):
         while len(base) < 12:
             base += "X"
         return base[:64]
-
