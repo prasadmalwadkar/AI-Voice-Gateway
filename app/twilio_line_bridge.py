@@ -20,6 +20,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from agent.state_manager import (
     _ask_from_missing_line,
     apply_voice_intake_heuristics_before_line,
+    bind_call_state,
     ensure_browser_ready,
     get_contact_buffer_mode,
     get_missing_fields,
@@ -28,6 +29,7 @@ from agent.state_manager import (
     infer_phone_from_transcript,
     infer_yes_no_from_transcript,
     looks_like_answer_for_current_field,
+    release_call_state,
     reset_state,
     transcript_is_status_check,
     transcript_requests_intake_default,
@@ -233,6 +235,7 @@ class TwilioLineBridge:
         self._stt_task: Optional[asyncio.Task[None]] = None
         self._tts_task: Optional[asyncio.Task[None]] = None
         self._end_watch_task: Optional[asyncio.Task[None]] = None
+        self._browser_launch_task: Optional[asyncio.Task[None]] = None
         self._caller_response_watchdog_task: Optional[asyncio.Task[None]] = None
         self._deterministic_followup_task: Optional[asyncio.Task[None]] = None
         self._contact_buffer_task: Optional[asyncio.Task[None]] = None
@@ -299,6 +302,7 @@ class TwilioLineBridge:
                         )
                     if self.call_sid:
                         self.call_logger.call_sid = self.call_sid
+                        bind_call_state(self.call_sid)
                     self.call_logger.info(
                         (
                             f"Media stream started | stream_sid={self.stream_sid} "
@@ -367,6 +371,7 @@ class TwilioLineBridge:
         line_url = f"ws://127.0.0.1:{port}/ws"
 
         call_id = self.call_sid or str(uuid.uuid4())
+        bind_call_state(call_id)
         from_num = self.caller_from or self.call_sid or "unknown"
         to_num = self.caller_to or os.getenv("TWILIO_PATH2_TO_NUMBER", "west-capital")
         metadata = {
@@ -399,7 +404,7 @@ class TwilioLineBridge:
             "true",
             "yes",
         ):
-            asyncio.create_task(
+            self._browser_launch_task = asyncio.create_task(
                 self._launch_playwright_session(),
                 name=f"path2_browser:{call_id[:8]}",
             )
@@ -496,15 +501,24 @@ class TwilioLineBridge:
         return t
 
     def _schedule_caller_response_watchdog(self, agent_text: str) -> None:
+        prior_prompt = (getattr(self, "_caller_response_prompt", "") or "").strip()
         prompt = self._caller_response_prompt_from_agent_text(agent_text)
+        line_ask = ""
         if self._line:
-            current_ask = (getattr(self._line, "_last_tool_ask", "") or "").strip()
-            if current_ask and (
-                "i didn't catch" in prompt.lower()
-                or "please say" in prompt.lower()
-                or "please spell" in prompt.lower()
+            line_ask = (getattr(self._line, "_last_tool_ask", "") or "").strip()
+            if line_ask and (
+                prompt
+                and (
+                    "i didn't catch" in prompt.lower()
+                    or "please say" in prompt.lower()
+                    or "please spell" in prompt.lower()
+                )
             ):
-                prompt = current_ask
+                prompt = line_ask
+        if not (prompt or "").strip():
+            prompt = line_ask
+        if not (prompt or "").strip():
+            prompt = prior_prompt
         if not prompt or not self._line:
             self._cancel_caller_response_watchdog()
             return
@@ -1360,6 +1374,7 @@ class TwilioLineBridge:
             self._stt_task,
             self._tts_task,
             self._end_watch_task,
+            self._browser_launch_task,
             self._caller_response_watchdog_task,
         ):
             if t and not t.done():
@@ -1372,6 +1387,7 @@ class TwilioLineBridge:
         self._stt_task = None
         self._tts_task = None
         self._end_watch_task = None
+        self._browser_launch_task = None
         self._caller_response_watchdog_task = None
 
         if self._line:
@@ -1406,6 +1422,7 @@ class TwilioLineBridge:
             await reset_state()
         except Exception:
             pass
+        release_call_state(self.call_sid)
 
         self.call_logger.info(
             f"Path2 cleanup | TTFA={self.call_logger.ttfa_ms}ms",

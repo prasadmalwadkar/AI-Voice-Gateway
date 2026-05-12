@@ -44,7 +44,9 @@ from litellm.exceptions import (
 )
 
 from agent.state_manager import (
+    bind_call_state,
     build_intake_llm_context_string,
+    call_state_registered,
     get_initial_intake_ask,
     reset_state,
     set_customer_prefill,
@@ -319,9 +321,15 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
         getattr(call_request, "call_id", "unknown"),
     )
 
-    # Reset application state for this new call — prevents cross-call
-    # data leakage (e.g., caller B seeing caller A's address).
-    await reset_state()
+    call_id = getattr(call_request, "call_id", None)
+
+    # Twilio Path2 binds the same call_id first; fresh=True would replace the
+    # BrowserManager (second Chromium) and clear state before the LLM runs.
+    if call_state_registered(call_id):
+        bind_call_state(call_id, fresh=False)
+    else:
+        bind_call_state(call_id, fresh=True)
+        await reset_state()
 
     metadata = getattr(call_request, "metadata", None) or {}
     if not isinstance(metadata, dict):
@@ -331,7 +339,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest) -> LlmAgent:
         set_customer_prefill(
             customer_prefill,
             caller_from=metadata.get("caller_from"),
-            call_sid=getattr(call_request, "call_id", None),
+            call_sid=call_id,
         )
     introduction = get_initial_intake_ask() or INTRODUCTION
 

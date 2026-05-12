@@ -29,11 +29,13 @@ Design decisions:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Annotated, Any, List, Literal, Optional
 
 from pydantic import ValidationError
@@ -69,21 +71,103 @@ FOR_SALE_LOW_CONF_REPROMPT = (
 )
 
 # =============================================================================
-# Global instances — one state and one browser per call.
-# Reset via reset_state() at the start of each new call in get_agent().
+# Per-call state lives in a ContextVar so overlapping calls in one server process
+# cannot reset or mutate each other's HELOC application.
 # =============================================================================
-application_state = HelocApplicationState()
-browser_manager = BrowserManager()
+@dataclass
+class _CallState:
+    application_state: HelocApplicationState
+    browser_manager: BrowserManager
+    browser_sync_inflight: Optional[asyncio.Task[None]] = None
+    pending_low_conf_confirmation: Optional[dict] = None
+    customer_prefill: Optional[dict[str, Any]] = None
+    prefill_confirm_pending: Optional[dict[str, Any]] = None
+    prefill_rejected_fields: Optional[set[str]] = None
+    consent_decline_round: Optional[dict[str, int]] = None
+    voice_field_user_sources: Optional[dict[str, str]] = None
+    last_prefill_yes_mono: float = 0.0
+    last_prefill_yes_fields: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        self.customer_prefill = {}
+        self.prefill_rejected_fields = set()
+        self.consent_decline_round = {}
+        self.voice_field_user_sources = {}
+
+
+_call_state_registry: dict[str, _CallState] = {}
+_call_state_ctx: contextvars.ContextVar[_CallState] = contextvars.ContextVar(
+    "heloc_call_state",
+    default=_CallState(HelocApplicationState(), BrowserManager()),
+)
+
+
+def _new_call_state() -> _CallState:
+    return _CallState(HelocApplicationState(), BrowserManager())
+
+
+def bind_call_state(call_id: str | None, *, fresh: bool = False) -> None:
+    """Bind this async context to the state bucket for one call."""
+    key = (call_id or "").strip()
+    if not key:
+        if fresh:
+            _call_state_ctx.set(_new_call_state())
+        return
+    state = _call_state_registry.get(key)
+    if state is None:
+        state = _new_call_state()
+        _call_state_registry[key] = state
+    elif fresh:
+        state.application_state = HelocApplicationState()
+        state.browser_manager = BrowserManager()
+    _call_state_ctx.set(state)
+
+
+def release_call_state(call_id: str | None) -> None:
+    key = (call_id or "").strip()
+    if key:
+        _call_state_registry.pop(key, None)
+
+
+def call_state_registered(call_id: str | None) -> bool:
+    """True when Path2 / Twilio already created the registry bucket for this call."""
+    key = (call_id or "").strip()
+    return bool(key and key in _call_state_registry)
+
+
+def _current_call_state() -> _CallState:
+    return _call_state_ctx.get()
+
+
+class _ApplicationStateProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_current_call_state().application_state, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(_current_call_state().application_state, name, value)
+
+    def __repr__(self) -> str:
+        return repr(_current_call_state().application_state)
+
+
+class _BrowserManagerProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_current_call_state().browser_manager, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(_current_call_state().browser_manager, name, value)
+
+    def __repr__(self) -> str:
+        return repr(_current_call_state().browser_manager)
+
+
+application_state = _ApplicationStateProxy()
+browser_manager = _BrowserManagerProxy()
 
 # Background Playwright work so the model can return before ~10s of address autocomplete;
 # the next `update_application_state` / heuristics await the prior task. Set
 # ``SYNC_BROWSER_INLINE=1`` in env to use blocking sync (e.g. debugging).
-_browser_sync_inflight: Optional[asyncio.Task[None]] = None
 _SENSITIVE_FIELDS = frozenset({"password", "confirm_password"})
-_pending_low_conf_confirmation: Optional[dict] = None
-_customer_prefill: dict[str, Any] = {}
-_prefill_confirm_pending: Optional[dict[str, Any]] = None
-_prefill_rejected_fields: set[str] = set()
 
 _PREFILL_FIELD_ALIASES = {
     "property_address": "address_line_1",
@@ -126,16 +210,16 @@ _PREFILL_ALLOWED_FIELDS = frozenset(
     }
 )
 async def _await_inflight_browser_sync() -> None:
-    global _browser_sync_inflight
+    call_state = _current_call_state()
     t0 = time.perf_counter()
-    t = _browser_sync_inflight
+    t = call_state.browser_sync_inflight
     waited = bool(t is not None and not t.done())
     if t is not None and not t.done():
         try:
             await t
         except Exception as e:
             logger.debug("Background browser task ended with: %s", e)
-    _browser_sync_inflight = None
+    call_state.browser_sync_inflight = None
     await path2_debug_log(
         "path2.drain_inflight",
         waited=waited,
@@ -283,10 +367,14 @@ def set_customer_prefill(
     Values are validated through ``HelocApplicationState`` assignment but are not
     written into ``application_state`` until the caller explicitly confirms.
     """
-    global _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields
-    _customer_prefill = {}
-    _prefill_confirm_pending = None
-    _prefill_rejected_fields = set()
+    call_state = _current_call_state()
+    customer_prefill = call_state.customer_prefill or {}
+    customer_prefill.clear()
+    call_state.customer_prefill = customer_prefill
+    call_state.prefill_confirm_pending = None
+    call_state.prefill_rejected_fields = set()
+    call_state.last_prefill_yes_mono = 0.0
+    call_state.last_prefill_yes_fields = frozenset()
     _clear_pending_low_confidence_confirmation()
     if not payload:
         return {}
@@ -308,20 +396,20 @@ def set_customer_prefill(
                 str(e).split("\n")[-1],
             )
             continue
-        _customer_prefill[field_name] = getattr(validator_state, field_name)
+        customer_prefill[field_name] = getattr(validator_state, field_name)
 
-    if _customer_prefill:
+    if customer_prefill:
         logger.info(
             "Customer prefill loaded | fields=%s caller_last4=%s call_sid=%s",
-            sorted(_customer_prefill.keys()),
+            sorted(customer_prefill.keys()),
             re.sub(r"\D", "", caller_from or "")[-4:] or "unknown",
             call_sid or "unknown",
         )
-    return dict(_customer_prefill)
+    return dict(customer_prefill)
 
 
 def get_customer_prefill_fields() -> list[str]:
-    return sorted(_customer_prefill.keys())
+    return sorted((_current_call_state().customer_prefill or {}).keys())
 
 
 def _format_prefill_value(field_name: str, value: Any) -> str:
@@ -402,19 +490,22 @@ def _prefill_prompt_for_values(values: dict[str, Any]) -> str:
 
 
 def _prefill_values_for_field(field_name: str, stage_num: int) -> dict[str, Any]:
-    if field_name in _prefill_rejected_fields or field_name not in _customer_prefill:
+    call_state = _current_call_state()
+    customer_prefill = call_state.customer_prefill or {}
+    rejected_fields = call_state.prefill_rejected_fields or set()
+    if field_name in rejected_fields or field_name not in customer_prefill:
         return {}
     if getattr(application_state, field_name, None) not in (None, ""):
         return {}
-    values = {field_name: _customer_prefill[field_name]}
+    values = {field_name: customer_prefill[field_name]}
     if field_name == "address_line_1":
         for extra_field in ("apt_suite", "city", "state", "zipcode"):
             if (
-                extra_field in _customer_prefill
-                and extra_field not in _prefill_rejected_fields
+                extra_field in customer_prefill
+                and extra_field not in rejected_fields
                 and getattr(application_state, extra_field, None) in (None, "")
             ):
-                values[extra_field] = _customer_prefill[extra_field]
+                values[extra_field] = customer_prefill[extra_field]
     if field_name == "primary_home_address_line_1":
         for extra_field in (
             "primary_home_apt_suite",
@@ -423,36 +514,28 @@ def _prefill_values_for_field(field_name: str, stage_num: int) -> dict[str, Any]
             "primary_home_zipcode",
         ):
             if (
-                extra_field in _customer_prefill
-                and extra_field not in _prefill_rejected_fields
+                extra_field in customer_prefill
+                and extra_field not in rejected_fields
                 and getattr(application_state, extra_field, None) in (None, "")
             ):
-                values[extra_field] = _customer_prefill[extra_field]
-    if stage_num == 5 and field_name == "first_name":
-        if (
-            "last_name" in _customer_prefill
-            and "last_name" not in _prefill_rejected_fields
-            and application_state.last_name in (None, "")
-        ):
-            values["last_name"] = _customer_prefill["last_name"]
+                values[extra_field] = customer_prefill[extra_field]
     return values
 
 
 def _set_prefill_confirm_pending(values: dict[str, Any]) -> str:
-    global _prefill_confirm_pending
     prompt = _prefill_prompt_for_values(values)
-    _prefill_confirm_pending = {"values": dict(values), "ask": prompt}
+    _current_call_state().prefill_confirm_pending = {"values": dict(values), "ask": prompt}
     return prompt
 
 
 def has_pending_prefill_confirmation() -> bool:
-    return bool(_prefill_confirm_pending)
+    return bool(_current_call_state().prefill_confirm_pending)
 
 
 def get_initial_intake_ask() -> Optional[str]:
     """Return the current deterministic Ask next for dynamic call introductions."""
     ask = _ask_from_missing_line(get_missing_fields() or "")
-    first_name = str(_customer_prefill.get("first_name") or "").strip()
+    first_name = str((_current_call_state().customer_prefill or {}).get("first_name") or "").strip()
     greeting = f"Hi {first_name}, " if first_name else ""
     if not ask:
         return f"{greeting}Can you tell me the property address?" if first_name else None
@@ -472,20 +555,20 @@ def _current_prefill_confirmation_values() -> dict[str, Any]:
     Recover the active on-file confirmation values if a stale TTS/LLM path lost
     ``_prefill_confirm_pending`` before the caller answered yes/no.
     """
-    if _prefill_confirm_pending:
-        return dict(_prefill_confirm_pending.get("values") or {})
+    pending = _current_call_state().prefill_confirm_pending
+    if pending:
+        return dict(pending.get("values") or {})
     missing_line = get_missing_fields() or ""
-    if not _prefill_confirm_pending:
+    if not pending:
         return {}
-    ask = _prefill_confirm_pending.get("ask") or ""
+    ask = pending.get("ask") or ""
     if ask and ask in missing_line:
-        return dict(_prefill_confirm_pending.get("values") or {})
+        return dict(pending.get("values") or {})
     return {}
 
 
 def _clear_prefill_confirm_pending() -> None:
-    global _prefill_confirm_pending
-    _prefill_confirm_pending = None
+    _current_call_state().prefill_confirm_pending = None
 
 
 def _extract_inline_answer_after_no(
@@ -528,7 +611,7 @@ def _extract_inline_answer_after_no(
 
 def has_pending_low_confidence_confirmation() -> bool:
     """True when a low-confidence candidate is waiting for repeat/confirm handling."""
-    return bool(_pending_low_conf_confirmation)
+    return bool(_current_call_state().pending_low_conf_confirmation)
 
 
 def _field_display_name(field_name: str) -> str:
@@ -551,7 +634,7 @@ def _field_display_name(field_name: str) -> str:
 
 
 def _pending_low_conf_ask() -> str:
-    pending = _pending_low_conf_confirmation or {}
+    pending = _current_call_state().pending_low_conf_confirmation or {}
     values = pending.get("values") or {}
     attempts = int(pending.get("attempts") or 1)
     if "annual_pre_tax_income" in values:
@@ -586,13 +669,13 @@ def _pending_low_conf_ask() -> str:
 def _set_pending_low_confidence_confirmation(
     values: dict[str, object], required_confidence: float
 ) -> None:
-    global _pending_low_conf_confirmation
-    previous = _pending_low_conf_confirmation or {}
+    call_state = _current_call_state()
+    previous = call_state.pending_low_conf_confirmation or {}
     previous_values = previous.get("values") or {}
     attempts = int(previous.get("attempts") or 0)
     if set(previous_values.keys()) != set(values.keys()):
         attempts = 0
-    _pending_low_conf_confirmation = {
+    call_state.pending_low_conf_confirmation = {
         "values": dict(values),
         "required_confidence": required_confidence,
         "attempts": attempts + 1,
@@ -600,8 +683,7 @@ def _set_pending_low_confidence_confirmation(
 
 
 def _clear_pending_low_confidence_confirmation() -> None:
-    global _pending_low_conf_confirmation
-    _pending_low_conf_confirmation = None
+    _current_call_state().pending_low_conf_confirmation = None
 
 
 # Fields shown on one browser step — transcript ``ui`` lines use only these per ``current_stage``.
@@ -739,11 +821,13 @@ def _maybe_record_voice_field_user_source(
         return
     if not raw_user_input or not str(raw_user_input).strip():
         return
-    _voice_field_user_sources[field_name] = str(raw_user_input).strip()
+    sources = _current_call_state().voice_field_user_sources or {}
+    sources[field_name] = str(raw_user_input).strip()
+    _current_call_state().voice_field_user_sources = sources
 
 
 def export_voice_field_user_sources_for_call() -> dict[str, str]:
-    return dict(sorted(_voice_field_user_sources.items()))
+    return dict(sorted((_current_call_state().voice_field_user_sources or {}).items()))
 
 
 def _append_heloc_ui_transcript_snapshot() -> None:
@@ -1020,12 +1104,6 @@ async def ensure_browser_ready() -> None:
         await browser_manager.navigate_to_start()
 
 
-# Tracks repeated "no" on required consent checkboxes (privacy vs commerce), per call.
-_consent_decline_round: dict[str, int] = {}
-
-# Schema field → verbatim user utterance that last successfully updated that field (Path2 voice).
-_voice_field_user_sources: dict[str, str] = {}
-
 # Serialize reset so overlapping cleanup paths cannot run two browser shutdowns
 # concurrently (duplicate "Closing stale browser" / double drain).
 _reset_state_lock = asyncio.Lock()
@@ -1039,14 +1117,16 @@ async def reset_state() -> None:
 
 async def _reset_state_impl() -> None:
     await _await_inflight_browser_sync()
-    global application_state, _customer_prefill, _prefill_confirm_pending, _prefill_rejected_fields, _consent_decline_round, _voice_field_user_sources
-    application_state = HelocApplicationState()
-    _consent_decline_round = {}
-    _voice_field_user_sources = {}
+    call_state = _current_call_state()
+    call_state.application_state = HelocApplicationState()
+    call_state.consent_decline_round = {}
+    call_state.voice_field_user_sources = {}
     _clear_pending_low_confidence_confirmation()
-    _customer_prefill = {}
-    _prefill_confirm_pending = None
-    _prefill_rejected_fields = set()
+    call_state.customer_prefill = {}
+    call_state.prefill_confirm_pending = None
+    call_state.prefill_rejected_fields = set()
+    call_state.last_prefill_yes_mono = 0.0
+    call_state.last_prefill_yes_fields = frozenset()
     # If a previous browser was left running, shut it down so we start fresh
     if browser_manager.is_running:
         logger.info("Closing stale browser session...")
@@ -1063,8 +1143,12 @@ def get_missing_fields() -> str:
     """
     missing = []
     state = application_state
-    if _pending_low_conf_confirmation:
-        pending_values = _pending_low_conf_confirmation.get("values") or {}
+    call_state = _current_call_state()
+    pending_low_conf = call_state.pending_low_conf_confirmation
+    prefill_pending = call_state.prefill_confirm_pending
+    rejected_fields = call_state.prefill_rejected_fields or set()
+    if pending_low_conf:
+        pending_values = pending_low_conf.get("values") or {}
         pending_labels = [
             _field_display_name(field_name) for field_name in pending_values.keys()
         ]
@@ -1075,12 +1159,12 @@ def get_missing_fields() -> str:
             f'Ask next: "{_pending_low_conf_ask()}"'
         )
 
-    if _prefill_confirm_pending:
-        pending_values = _prefill_confirm_pending.get("values") or {}
+    if prefill_pending:
+        pending_values = prefill_pending.get("values") or {}
         active_values = {
             field_name: value
             for field_name, value in pending_values.items()
-            if field_name not in _prefill_rejected_fields
+            if field_name not in rejected_fields
             and getattr(state, field_name, None) in (None, "")
         }
         if active_values:
@@ -1088,7 +1172,7 @@ def get_missing_fields() -> str:
             stage_header = f"[BROWSER STAGE: {browser_manager.get_current_stage().upper()}]"
             return (
                 f"{stage_header} Still needed: {label}. "
-                f'Ask next: "{_prefill_confirm_pending.get("ask")}"'
+                f'Ask next: "{prefill_pending.get("ask")}"'
             )
         _clear_prefill_confirm_pending()
 
@@ -2057,6 +2141,11 @@ def _spoken_number_to_int(text: str) -> Optional[int]:
             total += current
             current = 0
             has_value = True
+        elif t == "k":
+            current = max(current, 1) * 1_000
+            total += current
+            current = 0
+            has_value = True
         elif t == "million":
             current = max(current, 1) * 1_000_000
             total += current
@@ -2710,6 +2799,15 @@ def _normalize_spoken_email_local(lhs: str) -> str:
     return raw_l.replace(" ", "")
 
 
+def _normalize_spoken_email_separator_phrases(raw: str) -> str:
+    """Map spoken @-synonyms so split/join sees a single `` at `` delimiter."""
+    s = re.sub(r"\s+", " ", (raw or "").strip())
+    low = s.lower()
+    low = re.sub(r"\bat\s+the\s+rate\b", " at ", low)
+    low = re.sub(r"\bat\s+sign\b", " at ", low)
+    return low
+
+
 def infer_email_from_transcript(text: str) -> Optional[str]:
     """Parse email from typed form or spoken 'at'/'dot' variants."""
     if not text or not str(text).strip():
@@ -2717,7 +2815,7 @@ def infer_email_from_transcript(text: str) -> Optional[str]:
     text = normalize_answer_scaffold(text)
     if not text:
         return None
-    raw = text.strip().lower()
+    raw = _normalize_spoken_email_separator_phrases(text.strip().lower())
     if " at " in raw:
         left, right = raw.split(" at ", 1)
         local = _normalize_spoken_email_local(left).rstrip(".")
@@ -2759,6 +2857,10 @@ def _spoken_email_evidence(raw_user_input: Optional[str]) -> bool:
     if "@" in low:
         return True
     if " at " in low:
+        return True
+    if re.search(r"\bat\s+the\s+rate\b", low):
+        return True
+    if re.search(r"\bat\s+sign\b", low):
         return True
     if re.search(r"\bat\s+[\w.+-]+\s+dot\s+", low):
         return True
@@ -3476,17 +3578,17 @@ async def update_application_state(
     current_stage = browser_manager.get_current_stage()
     allowed_now = stage_to_allowed_fields.get(current_stage)
 
-    if _pending_low_conf_confirmation and any(
+    pending_low_conf = _current_call_state().pending_low_conf_confirmation
+    if pending_low_conf and any(
         value is not None for value in local_vars.values()
     ):
         _clear_pending_low_confidence_confirmation()
+        pending_low_conf = None
 
-    if raw_user_input and _pending_low_conf_confirmation:
+    if raw_user_input and pending_low_conf:
         pending_yes_no = infer_yes_no_from_transcript(raw_user_input)
         if pending_yes_no is True:
-            pending_values = dict(
-                (_pending_low_conf_confirmation.get("values") or {})
-            )
+            pending_values = dict((pending_low_conf.get("values") or {}))
             _clear_pending_low_confidence_confirmation()
             if pending_values:
                 return await update_application_state.func(
@@ -3728,21 +3830,22 @@ async def update_application_state(
             except Exception as e:
                 logger.error("Browser sync failed: %s", str(e), exc_info=True)
         else:
-            global _browser_sync_inflight
+            call_state = _current_call_state()
             task = asyncio.create_task(
                 _run_browser_sync(ucopy, None, spoken_transcript_hint=raw_user_input)
             )
 
             def _on_done(t: asyncio.Task) -> None:
-                global _browser_sync_inflight
-                if _browser_sync_inflight is t:
-                    _browser_sync_inflight = None
+                if call_state.browser_sync_inflight is t:
+                    call_state.browser_sync_inflight = None
+                if t.cancelled():
+                    return
                 ex = t.exception()
                 if ex is not None and not isinstance(ex, asyncio.CancelledError):
                     logger.error("Background browser task failed: %s", ex, exc_info=ex)
 
             task.add_done_callback(_on_done)
-            _browser_sync_inflight = task
+            call_state.browser_sync_inflight = task
 
     if not updates and not validation_errors:
         missing = get_missing_fields()
@@ -3919,25 +4022,30 @@ async def apply_voice_intake_heuristics_before_line(
     if transcript_is_status_check(text):
         return _NOT_HANDLED
     stage = browser_manager.get_current_stage()
+    call_state = _current_call_state()
+    prefill_pending = call_state.prefill_confirm_pending
     yn_for_prefill = infer_yes_no_from_transcript(text)
     prefill_confirmation_values = (
         _current_prefill_confirmation_values()
-        if _prefill_confirm_pending or yn_for_prefill is not None
+        if prefill_pending or yn_for_prefill is not None
         else {}
     )
     if prefill_confirmation_values:
         yn = yn_for_prefill
         if yn is None:
             ask = (
-                (_prefill_confirm_pending or {}).get("ask")
+                (call_state.prefill_confirm_pending or {}).get("ask")
                 or _prefill_prompt_for_values(prefill_confirmation_values)
             )
             return _ok(ask, "prefill_confirmation", stage)
 
         pending_values = dict(prefill_confirmation_values)
+
         _clear_prefill_confirm_pending()
         if yn is False:
-            _prefill_rejected_fields.update(pending_values.keys())
+            rejected_fields = call_state.prefill_rejected_fields or set()
+            rejected_fields.update(pending_values.keys())
+            call_state.prefill_rejected_fields = rejected_fields
             for fname in pending_values:
                 if fname not in HelocApplicationState.model_fields:
                     continue
@@ -3972,7 +4080,7 @@ async def apply_voice_intake_heuristics_before_line(
             return _ok(ask, "prefill_confirmation_rejected", stage)
 
         for field_name in pending_values:
-            _customer_prefill.pop(field_name, None)
+            (call_state.customer_prefill or {}).pop(field_name, None)
         _clear_pending_low_confidence_confirmation()
         try:
             tool_result = await update_application_state.func(
@@ -3982,6 +4090,8 @@ async def apply_voice_intake_heuristics_before_line(
                 raw_user_input=text,
                 deterministic_call=True,
             )
+            call_state.last_prefill_yes_mono = time.monotonic()
+            call_state.last_prefill_yes_fields = frozenset(pending_values.keys())
             return _ok(
                 _extract_ask_next(tool_result),
                 "prefill_confirmation",
@@ -4212,6 +4322,8 @@ async def apply_voice_intake_heuristics_before_line(
         yn = infer_yes_no_from_transcript(text)
         if yn is None:
             return _fail(stage)
+        consent_decline_round = call_state.consent_decline_round or {}
+        call_state.consent_decline_round = consent_decline_round
 
         def _privacy_retry_ask() -> str:
             missing = get_missing_fields() or ""
@@ -4231,7 +4343,7 @@ async def apply_voice_intake_heuristics_before_line(
 
         if application_state.agreed_to_privacy_policy is None:
             if yn is True:
-                _consent_decline_round.pop("privacy", None)
+                consent_decline_round.pop("privacy", None)
                 try:
                     tool_result = await update_application_state.func(
                         None,
@@ -4253,8 +4365,8 @@ async def apply_voice_intake_heuristics_before_line(
                     )
                 return _fail(stage)
             # Declined privacy/terms — do not call tool with False (would loop validation).
-            _consent_decline_round["privacy"] = _consent_decline_round.get("privacy", 0) + 1
-            rnd = _consent_decline_round["privacy"]
+            consent_decline_round["privacy"] = consent_decline_round.get("privacy", 0) + 1
+            rnd = consent_decline_round["privacy"]
             if rnd == 1:
                 retry = _privacy_retry_ask()
                 msg = (
@@ -4264,7 +4376,7 @@ async def apply_voice_intake_heuristics_before_line(
                     + retry
                 )
                 return _ok(msg, "consent_decline_explained_privacy", stage)
-            _consent_decline_round.pop("privacy", None)
+            consent_decline_round.pop("privacy", None)
             return _ok(
                 "Okay—without that agreement we can't continue your application today. "
                 "You're welcome to call back when you're ready. Goodbye for now.",
@@ -4275,7 +4387,7 @@ async def apply_voice_intake_heuristics_before_line(
 
         if application_state.agreed_to_commerce_communication is None:
             if yn is True:
-                _consent_decline_round.pop("commerce", None)
+                consent_decline_round.pop("commerce", None)
                 try:
                     tool_result = await update_application_state.func(
                         None,
@@ -4296,8 +4408,8 @@ async def apply_voice_intake_heuristics_before_line(
                         exc_info=True,
                     )
                 return _fail(stage)
-            _consent_decline_round["commerce"] = _consent_decline_round.get("commerce", 0) + 1
-            rnd = _consent_decline_round["commerce"]
+            consent_decline_round["commerce"] = consent_decline_round.get("commerce", 0) + 1
+            rnd = consent_decline_round["commerce"]
             if rnd == 1:
                 retry = _commerce_retry_ask()
                 msg = (
@@ -4306,7 +4418,7 @@ async def apply_voice_intake_heuristics_before_line(
                     + retry
                 )
                 return _ok(msg, "consent_decline_explained_commerce", stage)
-            _consent_decline_round.pop("commerce", None)
+            consent_decline_round.pop("commerce", None)
             return _ok(
                 "Understood—without that consent we can't finish your application. "
                 "Thanks for your time; goodbye for now.",
@@ -4594,6 +4706,8 @@ async def apply_voice_intake_heuristics_before_line(
                         e,
                         exc_info=True,
                     )
+                return _fail(stage)
+            if transcript_requests_intake_default(text):
                 return _fail(stage)
         return _fail(stage)
 

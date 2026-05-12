@@ -143,7 +143,12 @@ class TwilioMimicManager:
         self._emit("Status", msg)
 
     def _transcript_debug_url(self) -> str:
-        return self.ws_url.replace("/media-stream", "/debug/path2-transcripts", 1)
+        url = self.ws_url.replace("/media-stream", "/debug/path2-transcripts", 1)
+        token = os.getenv("PATH2_TRANSCRIPT_DEBUG_TOKEN", "").strip()
+        if token:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}token={token}"
+        return url
 
     async def _transcript_debug_loop(self) -> None:
         url = self._transcript_debug_url()

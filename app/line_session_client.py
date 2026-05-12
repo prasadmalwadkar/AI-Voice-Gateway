@@ -358,32 +358,45 @@ class LineSessionClient:
             return False
         return len(fb_words & mt_words) / len(fb_words) >= 0.7
 
-    async def _enqueue_ask_if_needed(self, ask: str, *, event: str) -> bool:
+    async def _enqueue_ask_if_needed(
+        self,
+        ask: str,
+        *,
+        event: str,
+        consumes_turn_ask_slot: bool = True,
+    ) -> bool:
+        """Queue agent TTS unless dedup suppresses.
+
+        ``consumes_turn_ask_slot`` is False for ``BUSY_HOLD_PROMPT`` so a tool
+        ``Ask next`` can enqueue via ``_enqueue_ask_fallback`` in the same user turn.
+        """
         q = (ask or "").strip()
         if not q:
             return False
-        if self._ask_spoken_this_turn:
+        if consumes_turn_ask_slot and self._ask_spoken_this_turn:
             self._call_logger.debug(
                 f"Turn-level ask already spoken; suppressing ({event}): {q}",
                 event="line.session.ask_turn_deduped",
             )
             return False
         now = time.monotonic()
-        if (
-            self._last_spoken_ask_text
-            and self._last_spoken_ask_text.strip().lower() == q.lower()
-            and (now - self._last_spoken_ask_ts) < self._ask_dedup_window_sec
-        ):
-            self._call_logger.debug(
-                f"Dedup ask suppressed ({event}): {q}",
-                event="line.session.ask_deduped",
-            )
-            return False
+        if consumes_turn_ask_slot:
+            if (
+                self._last_spoken_ask_text
+                and self._last_spoken_ask_text.strip().lower() == q.lower()
+                and (now - self._last_spoken_ask_ts) < self._ask_dedup_window_sec
+            ):
+                self._call_logger.debug(
+                    f"Dedup ask suppressed ({event}): {q}",
+                    event="line.session.ask_deduped",
+                )
+                return False
         await self.tts_queue.put(q)
-        self._last_spoken_ask_text = q
-        self._last_spoken_ask_ts = now
-        self._ask_spoken_this_turn = True
-        self._awaiting_turn_response = False
+        if consumes_turn_ask_slot:
+            self._last_spoken_ask_text = q
+            self._last_spoken_ask_ts = now
+            self._ask_spoken_this_turn = True
+            self._awaiting_turn_response = False
         self._mute_model_text_until = now + self._post_fallback_mute_model_sec
         return True
 
@@ -747,6 +760,7 @@ class LineSessionClient:
             emitted = await self._enqueue_ask_if_needed(
                 to_speak,
                 event="line.session.turn_watchdog",
+                consumes_turn_ask_slot=False,
             )
             if not emitted:
                 return
