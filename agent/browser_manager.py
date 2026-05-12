@@ -39,6 +39,7 @@ from playwright.async_api import (
     async_playwright,
     Browser,
     BrowserContext,
+    Locator,
     Page,
     Playwright,
 )
@@ -66,9 +67,19 @@ SEL_STREET_LINE = (
 SEL_ADDRESS_INPUT = (
     f"{SEL_PROPERTY_STREET1}, input[placeholder='Search for your address']"
 )
-SEL_AUTOCOMPLETE_LIST = "ul[role='listbox']"
-# Skips the "Address not listed" option at the top of the dropdown.
-SEL_FIRST_SUGGESTION = "li[role='option']:not([id*='not-listed'])"
+# Use attribute-only selectors (no tag name) so they survive WCL switching
+# the container from <ul> to <div> or options from <li> to <div>.
+SEL_AUTOCOMPLETE_LIST = "[role='listbox']"
+# All option rows — element-agnostic, filtering 'not listed' done in Python.
+SEL_FIRST_SUGGESTION = "[role='option']"
+
+# Text fragments that identify the "Address not listed / Enter manually" sentinel.
+_NOT_LISTED_TEXT_FRAGMENTS: tuple[str, ...] = (
+    "address not listed",
+    "enter your address manually",
+    "enter address manually",
+    "not listed",
+)
 
 # WCL /register/home-address — primary residence combobox (secondary / investment HELOC).
 SEL_HOME_ADDRESS_STREET1 = "input[data-test-id='home-address-street1']"
@@ -90,8 +101,18 @@ OCCUPANCY_ENUM_TO_WCL: dict[str, str] = {
 }
 
 
+def _is_not_listed_option(text: str) -> bool:
+    """Return True if the autocomplete row is the 'Address not listed' sentinel."""
+    tl = (text or "").strip().lower()
+    return any(frag in tl for frag in _NOT_LISTED_TEXT_FRAGMENTS)
+
+
 async def _poll_autocomplete_option_count(page: Page) -> int:
-    """Wait until listbox is visible and at least one real row has text (API may lag list shell)."""
+    """Wait until listbox is visible and at least one *real* address row has text.
+
+    The 'Address not listed / Enter your address manually' sentinel is excluded
+    from the count so the caller knows there are actual pickable suggestions.
+    """
     try:
         max_wait_ms = int(os.getenv("WCL_ADDRESS_OPTIONS_WAIT_MS", "12000").strip() or "12000")
     except ValueError:
@@ -118,18 +139,23 @@ async def _poll_autocomplete_option_count(page: Page) -> int:
             await asyncio.sleep(poll_sec)
             continue
         try:
-            n = await opts.count()
+            total = await opts.count()
         except Exception:
-            n = 0
-        if n <= 0:
+            total = 0
+        if total <= 0:
             await asyncio.sleep(poll_sec)
             continue
-        try:
-            txt = (await opts.first.text_content(timeout=2500) or "").strip()
-        except Exception:
-            txt = ""
-        if txt:
-            return n
+        # Count only real address rows (skip the sentinel)
+        real_count = 0
+        for i in range(total):
+            try:
+                t = (await opts.nth(i).text_content(timeout=1500) or "").strip()
+            except Exception:
+                t = ""
+            if t and not _is_not_listed_option(t):
+                real_count += 1
+        if real_count > 0:
+            return real_count
         await asyncio.sleep(poll_sec)
 
     return 0
@@ -224,6 +250,43 @@ def _score_address_suggestion(
     return min(1.0, base + bonus)
 
 
+async def _react_safe_click(page: Page, locator: Locator) -> None:
+    """Click a React-rendered autocomplete option reliably.
+
+    React patches native DOM events via event delegation, so a plain
+    Playwright ``click()`` may not fire the synthetic handler if the element
+    is positioned off-screen or if React's SyntheticEvent layer intercepts it.
+
+    Strategy:
+    1. Scroll the element into view and hover (ensures it's in the viewport).
+    2. Native Playwright click (fast path, works most of the time).
+    3. If city field is still empty after 1 s, fire a JS ``MouseEvent``
+       directly through React's event system (``dispatchEvent``).
+    """
+    try:
+        await locator.scroll_into_view_if_needed(timeout=3_000)
+    except Exception:
+        pass
+    try:
+        await locator.hover(timeout=2_000)
+    except Exception:
+        pass
+    try:
+        await locator.click(timeout=5_000)
+        logger.debug("_react_safe_click: native click succeeded.")
+        return
+    except Exception as e:
+        logger.debug("_react_safe_click: native click failed (%s), trying JS dispatch.", e)
+
+    # Fallback — JS MouseEvent fired through React's synthetic system.
+    try:
+        await locator.dispatch_event("click")
+        logger.debug("_react_safe_click: JS dispatch_event('click') sent.")
+    except Exception as e2:
+        logger.warning("_react_safe_click: JS dispatch also failed: %s", e2)
+        raise
+
+
 class BrowserManager:
     """Manages the full lifecycle of a Chromium browser for HELOC form automation.
 
@@ -281,6 +344,12 @@ class BrowserManager:
         "other_income",
         "middle_name",
         "suffix",
+        "city",
+        "state",
+        "zipcode",
+        "primary_home_city",
+        "primary_home_state",
+        "primary_home_zipcode",
     ]
 
     # Ordered URL substring → required fields for that step (first match wins).
@@ -327,6 +396,7 @@ class BrowserManager:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._is_running: bool = False
+        self._start_lock = asyncio.Lock()
         # Dedupe autocomplete on street+city+state only (not zip — site fills zip from suggestion).
         self._last_address_street_city_state_key: Optional[str] = None
         self.address_not_found: bool = False
@@ -367,52 +437,55 @@ class BrowserManager:
         Raises:
             RuntimeError: If the browser is already running.
         """
-        if self._is_running:
-            logger.warning("BrowserManager.start() called but browser is already running.")
-            return
+        async with self._start_lock:
+            if self._is_running:
+                logger.warning(
+                    "BrowserManager.start() called but browser is already running."
+                )
+                return
 
-        try:
-            self._playwright = await async_playwright().start()
-
-            # Build launch kwargs based on demo flag
-            launch_kwargs: dict = {
-                "headless": not is_demo,
-            }
-            # Default 0: demo used to force slow_mo=500ms per action (~10s+ on address).
-            # Set BROWSER_SLOW_MO_MS=400–500 only when debugging visually.
             try:
-                _smo = int(os.getenv("BROWSER_SLOW_MO_MS", "0").strip() or "0")
-            except ValueError:
-                _smo = 0
-            if _smo > 0:
-                launch_kwargs["slow_mo"] = _smo
-            if is_demo:
-                # --start-maximized opens the window at full screen size
-                launch_kwargs["args"] = ["--start-maximized"]
+                self._playwright = await async_playwright().start()
 
-            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+                # Build launch kwargs based on demo flag
+                launch_kwargs: dict = {
+                    "headless": not is_demo,
+                }
+                # Default 0: demo used to force slow_mo=500ms per action (~10s+ on address).
+                # Set BROWSER_SLOW_MO_MS=400–500 only when debugging visually.
+                try:
+                    _smo = int(os.getenv("BROWSER_SLOW_MO_MS", "0").strip() or "0")
+                except ValueError:
+                    _smo = 0
+                if _smo > 0:
+                    launch_kwargs["slow_mo"] = _smo
+                if is_demo:
+                    # --start-maximized opens the window at full screen size
+                    launch_kwargs["args"] = ["--start-maximized"]
 
-            # Single context — maintains cookies & session across pages.
-            # In demo mode, use no_viewport so the window fills the screen.
-            context_kwargs: dict = {}
-            if is_demo:
-                context_kwargs["no_viewport"] = True
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
 
-            self._context = await self._browser.new_context(**context_kwargs)
-            self._page = await self._context.new_page()
+                # Single context — maintains cookies & session across pages.
+                # In demo mode, use no_viewport so the window fills the screen.
+                context_kwargs: dict = {}
+                if is_demo:
+                    context_kwargs["no_viewport"] = True
 
-            self._is_running = True
-            logger.info(
-                "Browser started — mode=%s, headless=%s",
-                "demo" if is_demo else "headless",
-                not is_demo,
-            )
+                self._context = await self._browser.new_context(**context_kwargs)
+                self._page = await self._context.new_page()
 
-        except Exception:
-            logger.exception("Failed to start browser.")
-            # Clean up partial state so the caller can retry
-            await self._teardown()
-            raise
+                self._is_running = True
+                logger.info(
+                    "Browser started — mode=%s, headless=%s",
+                    "demo" if is_demo else "headless",
+                    not is_demo,
+                )
+
+            except Exception:
+                logger.exception("Failed to start browser.")
+                # Clean up partial state so the caller can retry
+                await self._teardown()
+                raise
 
     async def navigate_to_start(self) -> None:
         """Navigate the active page to the HELOC registration form.
@@ -700,21 +773,36 @@ class BrowserManager:
         await self.pull_primary_home_fields_from_dom_into_state(state)
 
     async def _wait_for_city_populated(self, page: Page, timeout_ms: int = 4000) -> None:
-        """After picking a listbox row, city/state/zip fill async. Avoid ``networkidle`` (SPA)."""
+        """After picking a listbox row, city/state/zip fill async. 
+        In the new WCL UI, these might be optional or included in the street line.
+        """
         steps = max(1, timeout_ms // 50)
-        loc = page.locator("input[name='city']").first
+        city_loc = page.locator("input[name='city']").first
+        street_loc = page.locator(SEL_STREET_LINE).first
+        
         for _ in range(steps):
             try:
-                if await loc.count() == 0:
-                    await asyncio.sleep(0.05)
-                    continue
-                c = await loc.input_value()
-                if c and str(c).strip():
-                    return
+                # 1. If city/state fields don't even exist, don't wait 4s
+                if await city_loc.count() == 0:
+                    # Check if street line has a zip code (meaning it's fully populated)
+                    if await street_loc.count() > 0:
+                        val = await street_loc.input_value()
+                        if val and re.search(r"\b\d{5}\b", val):
+                            logger.debug("Street line contains zip code; skipping city/state wait.")
+                            return
+                    # If we waited at least 1s and still no city field, assume it's not coming
+                    if _ > 20: 
+                        return
+                
+                # 2. Standard check: if city is filled, we are done
+                if await city_loc.count() > 0:
+                    c = await city_loc.input_value()
+                    if c and str(c).strip():
+                        return
             except Exception:
                 pass
             await asyncio.sleep(0.05)
-        logger.debug("City field still empty after suggestion pick (timeout=%sms).", timeout_ms)
+        logger.debug("City field still empty or missing after suggestion pick (timeout=%sms).", timeout_ms)
 
     # ------------------------------------------------------------------
     # Form Interaction — address autocomplete
@@ -767,33 +855,63 @@ class BrowserManager:
 
                 opts = page.locator(SEL_FIRST_SUGGESTION)
 
+                # Collect all rows, skipping the "Address not listed" sentinel.
+                all_rows: list[tuple[int, str]] = []  # (locator-index, text)
+                total_options = await opts.count()
+                for i in range(total_options):
+                    try:
+                        raw_t = (await opts.nth(i).text_content(timeout=2_000) or "").strip()
+                    except Exception:
+                        raw_t = ""
+                    if raw_t and not _is_not_listed_option(raw_t):
+                        all_rows.append((i, raw_t))
+
+                if not all_rows:
+                    raise RuntimeError("no real address suggestion rows (only sentinel or empty)")
+
                 if use_rank:
                     best_i = -1
+                    best_loc_i = -1
                     suggestion_text = ""
                     best_score = -1.0
-                    for i in range(n):
-                        raw_t = (await opts.nth(i).text_content(timeout=2_000) or "").strip()
-                        if not raw_t:
-                            continue
+                    for loc_i, raw_t in all_rows:
                         sc = _score_address_suggestion(raw_t, address, hints)
                         if sc > best_score:
                             best_score = sc
-                            best_i = i
+                            best_i = loc_i
                             suggestion_text = raw_t
-                    if best_i < 0:
-                        raise RuntimeError("no scored suggestion rows")
-                    pick = opts.nth(best_i)
-                    logger.info(
-                        "Autocomplete ranked %s options (best score %.3f) — picking '%s'",
-                        n,
-                        best_score,
-                        suggestion_text[:120],
+
+                    # Minimum score threshold — if nothing scores well enough,
+                    # fall back to the first real address option (closest match).
+                    min_score = float(
+                        os.getenv("WCL_ADDRESS_MIN_SCORE", "0.20").strip() or "0.20"
                     )
-                    await pick.click(timeout=5_000)
+                    if best_i < 0 or best_score < min_score:
+                        fallback_loc_i, fallback_text = all_rows[0]
+                        logger.warning(
+                            "Best autocomplete score %.3f below threshold %.2f — "
+                            "falling back to first real option '%s'",
+                            best_score,
+                            min_score,
+                            fallback_text[:120],
+                        )
+                        best_i = fallback_loc_i
+                        suggestion_text = fallback_text
+                    else:
+                        logger.info(
+                            "Autocomplete ranked %s options (best score %.3f) — picking '%s'",
+                            len(all_rows),
+                            best_score,
+                            suggestion_text[:120],
+                        )
+
+                    pick = opts.nth(best_i)
+                    await _react_safe_click(page, pick)
                 else:
-                    first_option = opts.first
-                    suggestion_text = (await first_option.text_content(timeout=5_000) or "").strip()
-                    await first_option.click(timeout=5_000)
+                    # No ranking — click the first real (non-sentinel) option.
+                    first_loc_i, first_text = all_rows[0]
+                    suggestion_text = first_text
+                    await _react_safe_click(page, opts.nth(first_loc_i))
                     logger.info(
                         "Selected autocomplete suggestion — '%s'",
                         suggestion_text,
@@ -1346,38 +1464,124 @@ class BrowserManager:
     async def _field_selected_in_cards_or_select(
         self, page: Page, select_name: str, card_labels: tuple[str, ...]
     ) -> bool:
-        """WCL: native select can be hidden; also detect selection via same card text as fill."""
+        """WCL: detect selection for card-style or native-select field.
+
+        Checks (in order):
+        1. Native <select name=...> with a non-empty value.
+        2. ARIA role=button cards (WCL legacy).
+        3. Any element (div/label/li/span) containing the card label text
+           that carries ARIA or CSS selected state — covers WCL UI changes
+           where cards are now rendered as divs or labels.
+        4. JS full-DOM scan as last resort (catches ring-* / border-primary
+           class patterns that indicate selection in Tailwind-based UIs).
+        """
         try:
+            # 1. Native select
             sel = page.locator(f"select[name='{select_name}']").first
             if await sel.count() > 0:
                 val = (await sel.input_value() or "").strip()
                 if val:
                     return True
-            # Use role=button to avoid false positives from headings / footers that
-            # contain the same string as a card (e.g. "Primary property").
+
+            _SELECTED_JS = """el => {
+                if (!el) return false;
+                if (el.getAttribute('aria-pressed') === 'true' ||
+                    el.getAttribute('aria-selected') === 'true' ||
+                    el.getAttribute('aria-checked') === 'true') return true;
+                const ds = el.getAttribute && el.getAttribute('data-state');
+                if (ds === 'checked' || ds === 'active' || ds === 'on' || ds === 'selected') return true;
+                const cls = el.className ? String(el.className) : '';
+                if (/ring-|border-primary|selected|active|checked|bg-primary|text-primary/.test(cls))
+                    return true;
+                // Walk up two ancestors in case the selection class is on a wrapper
+                const p = el.parentElement;
+                if (p) {
+                    const pc = p.className ? String(p.className) : '';
+                    if (/ring-|border-primary|selected|active|bg-primary/.test(pc)) return true;
+                    const pp = p.parentElement;
+                    if (pp) {
+                        const ppc = pp.className ? String(pp.className) : '';
+                        if (/ring-|border-primary|selected|active|bg-primary/.test(ppc)) return true;
+                    }
+                }
+                return false;
+            }"""
+
             for label in card_labels:
-                loc = page.get_by_role("button", name=label, exact=True)
-                n = await loc.count()
-                for i in range(n):
+                # 2. role=button (original WCL pattern)
+                for role in ("button", "option", "radio", "tab"):
                     try:
-                        btn = loc.nth(i)
-                        if not await btn.is_visible():
+                        loc = page.get_by_role(role, name=label, exact=True)  # type: ignore[arg-type]
+                        n = await loc.count()
+                    except Exception:
+                        n = 0
+                    for i in range(n):
+                        try:
+                            el = loc.nth(i)
+                            if not await el.is_visible():
+                                continue
+                            if await el.evaluate(_SELECTED_JS):
+                                return True
+                        except Exception:
                             continue
+
+                # 3. Any element containing this text (div / label / li / span)
+                try:
+                    any_el = page.locator(
+                        f"div, label, li, span, [role='radio'], [role='option']"
+                    ).filter(has_text=label)
+                    cnt = await any_el.count()
+                except Exception:
+                    cnt = 0
+                for i in range(min(cnt, 6)):
+                    try:
+                        el = any_el.nth(i)
+                        if not await el.is_visible():
+                            continue
+                        txt = (await el.text_content() or "").strip()
+                        # Only evaluate if the text matches closely to avoid noise
+                        if label.lower() not in txt.lower():
+                            continue
+                        if await el.evaluate(_SELECTED_JS):
+                            return True
                     except Exception:
                         continue
-                    picked = await btn.evaluate(
-                        """el => {
-                        if (el.getAttribute('aria-pressed') === 'true' ||
-                            el.getAttribute('aria-selected') === 'true') return true;
-                        const ds = el.getAttribute && el.getAttribute('data-state');
-                        if (ds === 'checked' || ds === 'active' || ds === 'on') return true;
-                        if (el.classList && [...el.classList].some(c => c.includes('ring-') || c.includes('border-primary')))
-                          return true;
+
+            # 4. JS full-DOM scan — finds any element whose text matches a label
+            # and has a selection class, regardless of element type.
+            try:
+                found = await page.evaluate(
+                    """(labels) => {
+                        const sel_re = /ring-|border-primary|selected|active|checked|bg-primary/;
+                        for (const label of labels) {
+                            const all = Array.from(document.querySelectorAll('*'));
+                            for (const el of all) {
+                                if (!el.children.length && el.textContent &&
+                                        el.textContent.trim() === label) {
+                                    // Check self + two ancestors
+                                    let node = el;
+                                    for (let d = 0; d < 3; d++) {
+                                        if (!node) break;
+                                        const c = node.className ? String(node.className) : '';
+                                        const ap = node.getAttribute && (
+                                            node.getAttribute('aria-pressed') === 'true' ||
+                                            node.getAttribute('aria-selected') === 'true' ||
+                                            node.getAttribute('aria-checked') === 'true');
+                                        if (sel_re.test(c) || ap) return true;
+                                        node = node.parentElement;
+                                    }
+                                }
+                            }
+                        }
                         return false;
-                    }"""
-                    )
-                    if picked:
-                        return True
+                    }""",
+                    list(card_labels),
+                )
+                if found:
+                    return True
+            except Exception as e:
+                logger.debug("JS DOM scan for card labels failed: %s", e)
+
             return False
         except Exception as e:
             logger.debug("card/select completeness check failed (%s): %s", select_name, e)
