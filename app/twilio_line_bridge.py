@@ -21,7 +21,7 @@ from agent.state_manager import (
     _ask_from_missing_line,
     apply_voice_intake_heuristics_before_line,
     bind_call_state,
-    ensure_browser_ready,
+    store_call_metadata,
     get_contact_buffer_mode,
     get_missing_fields,
     has_pending_low_confidence_confirmation,
@@ -235,7 +235,6 @@ class TwilioLineBridge:
         self._stt_task: Optional[asyncio.Task[None]] = None
         self._tts_task: Optional[asyncio.Task[None]] = None
         self._end_watch_task: Optional[asyncio.Task[None]] = None
-        self._browser_launch_task: Optional[asyncio.Task[None]] = None
         self._caller_response_watchdog_task: Optional[asyncio.Task[None]] = None
         self._deterministic_followup_task: Optional[asyncio.Task[None]] = None
         self._contact_buffer_task: Optional[asyncio.Task[None]] = None
@@ -372,6 +371,11 @@ class TwilioLineBridge:
 
         call_id = self.call_sid or str(uuid.uuid4())
         bind_call_state(call_id)
+        store_call_metadata(
+            call_sid=call_id,
+            caller_from=self.caller_from,
+            caller_to=self.caller_to,
+        )
         from_num = self.caller_from or self.call_sid or "unknown"
         to_num = self.caller_to or os.getenv("TWILIO_PATH2_TO_NUMBER", "west-capital")
         metadata = {
@@ -396,19 +400,6 @@ class TwilioLineBridge:
         )
         await self._line.connect()
 
-        # Browser only started inside update_application_state when there are field
-        # updates; open Playwright as soon as the call/session is live so the form
-        # is visible during the intro (runs in parallel — does not block TTS).
-        if os.getenv("TWILIO_PATH2_OPEN_BROWSER", "1").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
-            self._browser_launch_task = asyncio.create_task(
-                self._launch_playwright_session(),
-                name=f"path2_browser:{call_id[:8]}",
-            )
-
         self._tts = CartesiaSonicMulawTTS(self.call_logger)
         await self._tts.connect()
 
@@ -430,24 +421,15 @@ class TwilioLineBridge:
             event="path2.session.ready",
         )
 
-    async def _launch_playwright_session(self) -> None:
-        try:
-            await ensure_browser_ready()
-            self.call_logger.info(
-                "Playwright browser up (HELOC register page)",
-                event="path2.browser.ready",
-            )
-        except Exception as e:
-            self.call_logger.warning(
-                f"Playwright failed to start — form sync waits for first tool save: {e}",
-                event="path2.browser.failed",
-                exc_info=True,
-            )
-
     async def _watch_line_end_call(self) -> None:
         if not self._line:
             return
         await self._line.end_call_event.wait()
+        # The receive loop calls flush_now() before setting end_call_event, so the
+        # closing TTS text is already queued. Suppress VAD barge-in and the caller
+        # response watchdog immediately so nothing cuts the closing message mid-sentence.
+        self._ending_call = True
+        self._cancel_caller_response_watchdog()
         await self._wait_for_terminal_outbound_idle()
         self._running = False
 
@@ -657,6 +639,9 @@ class TwilioLineBridge:
 
     async def _vad_check_barge_in(self, data: bytes, now: float) -> None:
         """Fire barge-in when consecutive high-energy frames detected during TTS."""
+        if getattr(self, "_ending_call", False):
+            self._vad_consec_high = 0
+            return
         if not VAD_BARGE_IN_ENABLED or not self._playback_audio_active():
             self._vad_consec_high = 0
             return
@@ -685,6 +670,8 @@ class TwilioLineBridge:
         in_echo: bool,
         now: float,
     ) -> bool:
+        if getattr(self, "_ending_call", False):
+            return False
         if not self._playback_audio_active():
             return False
         if (now - self._last_barge_at) < BARGE_IN_COOLDOWN_SECS:
@@ -1306,7 +1293,7 @@ class TwilioLineBridge:
                 self._agent_playing = False
                 self._agent_playing_started_at = 0.0
                 self._current_tts_text = ""
-                if (text or "").strip() == DETERMINISTIC_GOODBYE_TEXT.strip():
+                if (text or "").strip() == DETERMINISTIC_GOODBYE_TEXT.strip() or getattr(self, "_ending_call", False):
                     self._cancel_caller_response_watchdog()
                     await broadcast_stt(
                         kind="call_ended",
@@ -1374,7 +1361,6 @@ class TwilioLineBridge:
             self._stt_task,
             self._tts_task,
             self._end_watch_task,
-            self._browser_launch_task,
             self._caller_response_watchdog_task,
         ):
             if t and not t.done():
@@ -1387,7 +1373,6 @@ class TwilioLineBridge:
         self._stt_task = None
         self._tts_task = None
         self._end_watch_task = None
-        self._browser_launch_task = None
         self._caller_response_watchdog_task = None
 
         if self._line:

@@ -42,7 +42,7 @@ def default_generation_config() -> Dict[str, float]:
     Speed: [0.6, 1.5] — 0.6 is slowest, 1.0 is Cartesia default.
     Volume: [0.5, 2.0] — boost above 1.0 for PSTN audibility.
     """
-    speed = max(0.6, min(1.5, float(os.getenv("CARTESIA_TTS_SPEED", "1.05"))))
+    speed = max(0.6, min(1.5, float(os.getenv("CARTESIA_TTS_SPEED", "1.0"))))
     volume = max(0.5, min(2.0, float(os.getenv("CARTESIA_TTS_VOLUME", "2.0"))))
     return {"speed": speed, "volume": volume}
 
