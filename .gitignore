@@ -35,6 +35,7 @@ data/conversations/
 data/prefill/customers.json
 data/intake_audit/
 data/intake_snapshots/
+data/queue/
 
 # Local orchestrator session dumps only (replay JSON stays tracked)
 scripts/fixtures/voice_replays/orchestrator_runs/
