@@ -36,12 +36,11 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Annotated, Any, List, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import ValidationError
 from line.llm_agent import loopback_tool
 
-from app.path2_transcript_debug import path2_debug_log
 from agent.schema import (
     HelocApplicationState,
     HeuristicResult,
@@ -50,9 +49,45 @@ from agent.schema import (
     IncomeSource,
     STRICT_EMAIL_REGEX,
 )
-from agent.browser_manager import BrowserManager
+# BrowserManager removed from hot path — used only by form_filler_consumer.
+# Import queue publisher for completed intake payloads.
+from agent.queue_publisher import publish_completed_intake
 
 logger = logging.getLogger("voip.state")
+
+# Maps conversation stages (logic-based) to the browser-stage strings used
+# throughout the file for stage gating and heuristics. Browser is no longer
+# running in the voice path — this replaces browser_manager.get_current_stage().
+_COMPLETED_CLOSING_LINE = (
+    "Great, that's everything we need. Your application has been submitted and "
+    "someone from West Capital Lending will be in touch soon. Thanks for your time, goodbye!"
+)
+
+# Seconds after a preline success during which subsequent preline calls return _NOT_HANDLED.
+# Prevents trailing STT finals from the same utterance from confirming the *next* field.
+_PRELINE_COOLDOWN_SECS = 1.5
+
+# GREETING soft-decline keyword patterns — matched before yes/no inference.
+_GREETING_SOFT_DECLINE_PATTERNS = (
+    "not now", "not a good time", "bad time", "not the right time",
+    "call back", "call later", "call me later", "call me back",
+    "not free", "busy right now", "i'm busy", "catch me later",
+    "another time", "can i call", "can you call", "reach me later",
+    "not ready", "not interested",
+)
+
+_CONV_STAGE_TO_BROWSER: dict[str, str] = {
+    "PROPERTY": "property",
+    "PRIMARY_HOME": "primary-home",
+    "FOR_SALE": "for-sale",
+    "INCOME": "income",
+    "PERSONAL": "name",
+    "BIRTHDAY": "birthday",
+    "CONTACT": "contact",
+    "CONSENT": "consent",
+    "GREETING": "greeting",
+    "COMPLETED": "completed",
+}
 
 # Canonical scripted voice lines (field_to_question + deterministic pre-Line).
 VOICE_SCRIPT_OWNERSHIP_ASK = "Are you the sole owner, or is it jointly owned?"
@@ -77,8 +112,6 @@ FOR_SALE_LOW_CONF_REPROMPT = (
 @dataclass
 class _CallState:
     application_state: HelocApplicationState
-    browser_manager: BrowserManager
-    browser_sync_inflight: Optional[asyncio.Task[None]] = None
     pending_low_conf_confirmation: Optional[dict] = None
     customer_prefill: Optional[dict[str, Any]] = None
     prefill_confirm_pending: Optional[dict[str, Any]] = None
@@ -87,6 +120,16 @@ class _CallState:
     voice_field_user_sources: Optional[dict[str, str]] = None
     last_prefill_yes_mono: float = 0.0
     last_prefill_yes_fields: frozenset[str] = frozenset()
+    # Track whether empathy has already been shown this call so the LLM
+    # context can explicitly tell it not to repeat the acknowledgement.
+    empathy_shown: bool = False
+    # Call metadata for queue publishing
+    call_sid: str = ""
+    caller_from: str = ""
+    caller_to: str = ""
+    intake_published: bool = False  # guards against double-publish
+    greeting_completed: bool = False  # set to True when caller confirms OK to proceed
+    _preline_last_handled_at: float = 0.0  # monotonic timestamp of last preline success
 
     def __post_init__(self) -> None:
         self.customer_prefill = {}
@@ -98,12 +141,12 @@ class _CallState:
 _call_state_registry: dict[str, _CallState] = {}
 _call_state_ctx: contextvars.ContextVar[_CallState] = contextvars.ContextVar(
     "heloc_call_state",
-    default=_CallState(HelocApplicationState(), BrowserManager()),
+    default=_CallState(HelocApplicationState()),
 )
 
 
 def _new_call_state() -> _CallState:
-    return _CallState(HelocApplicationState(), BrowserManager())
+    return _CallState(HelocApplicationState())
 
 
 def bind_call_state(call_id: str | None, *, fresh: bool = False) -> None:
@@ -119,7 +162,6 @@ def bind_call_state(call_id: str | None, *, fresh: bool = False) -> None:
         _call_state_registry[key] = state
     elif fresh:
         state.application_state = HelocApplicationState()
-        state.browser_manager = BrowserManager()
     _call_state_ctx.set(state)
 
 
@@ -127,6 +169,18 @@ def release_call_state(call_id: str | None) -> None:
     key = (call_id or "").strip()
     if key:
         _call_state_registry.pop(key, None)
+
+
+def store_call_metadata(
+    call_sid: str,
+    caller_from: Optional[str] = None,
+    caller_to: Optional[str] = None,
+) -> None:
+    """Persist Twilio call identifiers so publish_completed_intake has non-empty IDs."""
+    cs = _current_call_state()
+    cs.call_sid = call_sid or ""
+    cs.caller_from = caller_from or ""
+    cs.caller_to = caller_to or ""
 
 
 def call_state_registered(call_id: str | None) -> bool:
@@ -150,23 +204,8 @@ class _ApplicationStateProxy:
         return repr(_current_call_state().application_state)
 
 
-class _BrowserManagerProxy:
-    def __getattr__(self, name: str) -> Any:
-        return getattr(_current_call_state().browser_manager, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        setattr(_current_call_state().browser_manager, name, value)
-
-    def __repr__(self) -> str:
-        return repr(_current_call_state().browser_manager)
-
-
 application_state = _ApplicationStateProxy()
-browser_manager = _BrowserManagerProxy()
 
-# Background Playwright work so the model can return before ~10s of address autocomplete;
-# the next `update_application_state` / heuristics await the prior task. Set
-# ``SYNC_BROWSER_INLINE=1`` in env to use blocking sync (e.g. debugging).
 _SENSITIVE_FIELDS = frozenset({"password", "confirm_password"})
 
 _PREFILL_FIELD_ALIASES = {
@@ -209,61 +248,8 @@ _PREFILL_ALLOWED_FIELDS = frozenset(
         "email_address",
     }
 )
-async def _await_inflight_browser_sync() -> None:
-    call_state = _current_call_state()
-    t0 = time.perf_counter()
-    t = call_state.browser_sync_inflight
-    waited = bool(t is not None and not t.done())
-    if t is not None and not t.done():
-        try:
-            await t
-        except Exception as e:
-            logger.debug("Background browser task ended with: %s", e)
-    call_state.browser_sync_inflight = None
-    await path2_debug_log(
-        "path2.drain_inflight",
-        waited=waited,
-        await_ms=round((time.perf_counter() - t0) * 1000, 2),
-    )
-
-
-def _use_inline_browser_sync() -> bool:
-    return os.getenv("SYNC_BROWSER_INLINE", "").lower() in ("1", "true", "yes")
-
-
 def _occupancy_requires_primary_home_intake(occ: Optional[str]) -> bool:
     return occ in ("Secondary property", "Investment property")
-
-
-def _should_force_inline_browser_sync(sync_updates: dict) -> bool:
-    """
-    Force inline sync on stage-boundary answers so tool response can include
-    next-page "Still needed" immediately (prevents dead-air after navigation).
-    """
-    stage = browser_manager.get_current_stage()
-    if stage == "property":
-        return "occupancy_type" in sync_updates
-    if stage == "primary-home":
-        return "primary_home_address_line_1" in sync_updates
-    if stage == "for-sale":
-        # This answer completes for-sale page and can trigger next navigation.
-        return "is_currently_for_sale" in sync_updates
-    return False
-
-
-def _should_wait_for_address_sync(sync_updates: dict) -> bool:
-    if os.getenv("PATH2_WAIT_FOR_ADDRESS_SYNC", "1").strip().lower() in (
-        "0",
-        "false",
-        "no",
-    ):
-        return False
-    st = browser_manager.get_current_stage()
-    if st == "property" and "address_line_1" in sync_updates:
-        return True
-    if st == "primary-home" and "primary_home_address_line_1" in sync_updates:
-        return True
-    return False
 
 
 def _use_deterministic_address_parsing() -> bool:
@@ -532,21 +518,35 @@ def has_pending_prefill_confirmation() -> bool:
     return bool(_current_call_state().prefill_confirm_pending)
 
 
+_AGENT_SELF_INTRO = (
+    "This is Alex, a digital AI assistant with West Capital Lending — and this call is recorded. "
+)
+
+
 def get_initial_intake_ask() -> Optional[str]:
     """Return the current deterministic Ask next for dynamic call introductions."""
-    ask = _ask_from_missing_line(get_missing_fields() or "")
     first_name = str((_current_call_state().customer_prefill or {}).get("first_name") or "").strip()
+    hi = f"Hi {first_name}!" if first_name else "Hi there!"
+    full_intro = f"{hi} {_AGENT_SELF_INTRO}"
+
+    # In production this is always called at call-start (GREETING stage).
+    # When GREETING, return the full self-intro + good-time-to-talk ask.
+    if get_current_conversation_stage() == "GREETING":
+        return full_intro + "Is now a good time to go through a few quick questions about your hee-lok application?"
+
+    # Past GREETING (test scaffolding / edge case): return a concise field ask.
+    ask = _ask_from_missing_line(get_missing_fields() or "")
+    if ask:
+        ask = ask.replace("HELOC", "hee-lok")
+
     greeting = f"Hi {first_name}, " if first_name else ""
-    if not ask:
-        return f"{greeting}Can you tell me the property address?" if first_name else None
-    if ask in {"What is the property address?", "Can you tell me the property address?"}:
-        return f"{greeting}can you tell me your property address?" if greeting else ask
+
+    if not ask or ask in {"What is the property address?", "Can you tell me the property address?"}:
+        return f"{greeting}can you tell me your property address?" if first_name else None
     if first_name and ask.startswith("I have "):
         return greeting + ask
-    if first_name:
-        low = ask.strip().lower()
-        if not low.startswith("hi "):
-            return greeting + ask
+    if first_name and not ask.strip().lower().startswith("hi "):
+        return greeting + ask
     return ask
 
 
@@ -688,6 +688,7 @@ def _clear_pending_low_confidence_confirmation() -> None:
 
 # Fields shown on one browser step — transcript ``ui`` lines use only these per ``current_stage``.
 _HELOC_UI_PAGE_FIELDS_BY_STAGE: dict[str, frozenset[str]] = {
+    "greeting": frozenset(),
     "unknown": frozenset(
         {
             "address_line_1",
@@ -836,7 +837,7 @@ def _append_heloc_ui_transcript_snapshot() -> None:
         from app.conversation_transcript import append_transcript_ui_fields
     except ImportError:
         return
-    stage = browser_manager.get_current_stage()
+    stage = _CONV_STAGE_TO_BROWSER.get(get_current_conversation_stage(), "unknown")
     keys = _HELOC_UI_PAGE_FIELDS_BY_STAGE.get(stage) or _HELOC_UI_PAGE_FIELDS_BY_STAGE[
         "unknown"
     ]
@@ -880,266 +881,81 @@ def append_heloc_ui_transcript_final_snapshot(call_sid: str | None = None) -> No
         logger.debug("write_voice_sourced_fields_json failed", exc_info=True)
 
 
-async def _run_browser_sync(
-    sync_updates: dict,
-    out_errors: Optional[List[str]] = None,
-    *,
-    spoken_transcript_hint: Optional[str] = None,
-) -> None:
-    def _ve(msg: str) -> None:
-        if out_errors is not None:
-            out_errors.append(msg)
-        else:
-            logger.warning("Browser sync (background): %s", msg)
-
-    run_t0 = time.perf_counter()
-    phases: dict[str, float] = {}
-    try:
-        t0 = time.perf_counter()
-        await ensure_browser_ready()
-        phases["ensure_browser_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-        u = sync_updates
-        address_ranking_hints: list[str] = []
-        if spoken_transcript_hint and spoken_transcript_hint.strip():
-            sh = spoken_transcript_hint.strip()
-            address_ranking_hints.append(sh)
-            inferred_addr = infer_property_address_from_transcript(sh)
-            if inferred_addr:
-                address_ranking_hints.append(inferred_addr)
-
-        prop_autocomplete_query = None
-        if application_state.address_line_1:
-            prop_autocomplete_query = build_address_autocomplete_type_query(
-                application_state.address_line_1,
-                spoken_transcript_hint,
-            )
-        primary_home_autocomplete_query = None
-        if application_state.primary_home_address_line_1:
-            primary_home_autocomplete_query = build_address_autocomplete_type_query(
-                application_state.primary_home_address_line_1,
-                spoken_transcript_hint,
-            )
-        hydration = browser_manager.build_hydration_payload(application_state)
-        merged: dict = {**u, **hydration}
-        if hydration:
-            logger.info("Browser hydration for current URL — fields: %s", list(hydration.keys()))
-        await path2_debug_log(
-            "path2.browser_sync_start",
-            sync_keys_preview=list(merged.keys())[:24],
-            inline=bool(_use_inline_browser_sync()),
-        )
-
-        max_nav_attempts = 3
-        current_nav = 0
-
-        while current_nav < max_nav_attempts:
-            if application_state.address_line_1:
-                t0 = time.perf_counter()
-                await browser_manager.sync_property_address_from_state(
-                    application_state,
-                    user_updated_address=any(
-                        k in u for k in ("address_line_1", "city", "state")
-                    ),
-                    address_ranking_hints=address_ranking_hints or None,
-                    autocomplete_query=prop_autocomplete_query,
-                )
-                phases["address_autocomplete_ms"] = round(
-                    (time.perf_counter() - t0) * 1000, 2
-                )
-                # sync_updates may still hold address_line_* while hydration dropped them after a
-                # failed autocomplete clear — {**u, **hydration} would otherwise leave u's stale keys.
-                if browser_manager.address_not_found:
-                    for _k in ("address_line_1", "city", "state", "zipcode"):
-                        u.pop(_k, None)
-                merged = {**u, **browser_manager.build_hydration_payload(application_state)}
-
-            if application_state.primary_home_address_line_1 or any(
-                k.startswith("primary_home") for k in u
-            ):
-                t0 = time.perf_counter()
-                await browser_manager.sync_primary_home_address_from_state(
-                    application_state,
-                    user_updated_address=any(
-                        k in u
-                        for k in (
-                            "primary_home_address_line_1",
-                            "primary_home_city",
-                            "primary_home_state",
-                        )
-                    ),
-                    address_ranking_hints=address_ranking_hints or None,
-                    autocomplete_query=primary_home_autocomplete_query,
-                )
-                phases["primary_home_autocomplete_ms"] = round(
-                    (time.perf_counter() - t0) * 1000, 2
-                )
-                if browser_manager.address_not_found_primary_home:
-                    for _k in (
-                        "primary_home_address_line_1",
-                        "primary_home_city",
-                        "primary_home_state",
-                        "primary_home_zipcode",
-                    ):
-                        u.pop(_k, None)
-                if browser_manager.get_current_stage() == "primary-home":
-                    merged = {**u, **browser_manager.build_hydration_payload(application_state)}
-
-            if browser_manager.get_current_stage() == "consent":
-                if not application_state.password:
-                    auto_pass = "WCL!2026!Agent"
-                    application_state.password = auto_pass
-                    application_state.confirm_password = auto_pass
-                    u["password"] = auto_pass
-                    u["confirm_password"] = auto_pass
-                    merged["password"] = auto_pass
-                    merged["confirm_password"] = auto_pass
-                    logger.info("Auto-generated secure password for the final stage.")
-
-            t0 = time.perf_counter()
-            await browser_manager.fill_form_fields(merged)
-            phases["fill_form_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-            t0 = time.perf_counter()
-            if browser_manager.get_current_stage() == "property":
-                await browser_manager.pull_property_fields_from_dom_into_state(
-                    application_state
-                )
-            elif browser_manager.get_current_stage() == "primary-home":
-                await browser_manager.pull_primary_home_fields_from_dom_into_state(
-                    application_state
-                )
-            phases["pull_property_dom_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-            t0 = time.perf_counter()
-            try:
-                _settle = float(os.getenv("WCL_FORM_SETTLE_SEC", "0.2").strip() or "0.2")
-            except ValueError:
-                _settle = 0.2
-            _settle = max(0.0, min(_settle, 2.0))
-            await asyncio.sleep(_settle)
-            phases["settle_sleep_ms"] = round(_settle * 1000.0, 2)
-            t0 = time.perf_counter()
-            mismatches = await browser_manager.verify_fields(merged)
-            phases["verify_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-            if mismatches:
-                mismatch_list = ", ".join(mismatches)
-                logger.warning("DOM Verification failed for fields: %s", mismatch_list)
-                _ve(
-                    f"BROWSER VERIFICATION WARNING: Fields not updated: {mismatch_list}."
-                )
-            t0 = time.perf_counter()
-            complete = await browser_manager.is_page_complete()
-            if (
-                complete
-                and browser_manager.get_current_stage() == "property"
-            ):
-                # Do not follow DOM alone to Continue. Caller must have committed both
-                # WCL property questions in state so we never advance while still asking
-                # sole/joint and primary/secondary in voice.
-                o = application_state.ownership_type
-                occ = application_state.occupancy_type
-                if o is None or occ is None:
-                    complete = False
-            if (
-                complete
-                and browser_manager.get_current_stage() == "contact"
-            ):
-                ph = application_state.mobile_phone_number
-                em = application_state.email_address
-                if ph is None or em is None:
-                    complete = False
-            phases["is_page_complete_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-            if complete:
-                logger.info("Page complete. Auto-navigating (1 jump max)...")
-                t0 = time.perf_counter()
-                nav_success = await browser_manager.click_continue()
-                phases["click_continue_ms"] = round(
-                    (time.perf_counter() - t0) * 1000, 2
-                )
-                await path2_debug_log(
-                    "path2.page_complete",
-                    **phases,
-                    nav_ok=bool(nav_success),
-                    total_ms=round((time.perf_counter() - run_t0) * 1000, 2),
-                )
-                if nav_success:
-                    current_nav += 1
-                    logger.info(
-                        "Successfully navigated. Stopping auto-advance to stay in sync with caller."
-                    )
-                    break
-                t0 = time.perf_counter()
-                second = await browser_manager.is_page_complete()
-                phases["second_is_complete_ms"] = round(
-                    (time.perf_counter() - t0) * 1000, 2
-                )
-                if not second:
-                    logger.info("Navigation confirmed via second-opinion.")
-                    current_nav += 1
-                    break
-                _ve(
-                    "BROWSER NAVIGATION WARNING: 'Continue' button clicked but page did not move."
-                )
-                await path2_debug_log("path2.nav_stuck", **phases, second_opinion=second)
-                break
-            t0 = time.perf_counter()
-            snap = await browser_manager.path2_debug_register_snapshot()
-            phases["snapshot_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-            await path2_debug_log(
-                "path2.page_incomplete",
-                **phases,
-                snapshot=snap,
-                total_ms=round((time.perf_counter() - run_t0) * 1000, 2),
-            )
-            break
-        _append_heloc_ui_transcript_snapshot()
-    except Exception as e:
-        logger.error("Browser sync failed: %s", str(e), exc_info=True)
-        await path2_debug_log("path2.browser_sync_error", err=str(e)[:300])
-
-
-async def ensure_browser_ready() -> None:
-    """Ensure the browser is running and on the correct page."""
-    if not browser_manager.is_running:
-        logger.info("Initializing browser for real-time sync...")
-        await browser_manager.start(is_demo=True)
-        await browser_manager.navigate_to_start()
-
-
-# Serialize reset so overlapping cleanup paths cannot run two browser shutdowns
-# concurrently (duplicate "Closing stale browser" / double drain).
 _reset_state_lock = asyncio.Lock()
 
 
 async def reset_state() -> None:
-    """Reset the application state and browser for a new call."""
+    """Reset the application state for a new call."""
     async with _reset_state_lock:
         await _reset_state_impl()
 
 
 async def _reset_state_impl() -> None:
-    await _await_inflight_browser_sync()
     call_state = _current_call_state()
     call_state.application_state = HelocApplicationState()
     call_state.consent_decline_round = {}
     call_state.voice_field_user_sources = {}
+    call_state.intake_published = False
     _clear_pending_low_confidence_confirmation()
     call_state.customer_prefill = {}
     call_state.prefill_confirm_pending = None
     call_state.prefill_rejected_fields = set()
     call_state.last_prefill_yes_mono = 0.0
     call_state.last_prefill_yes_fields = frozenset()
-    # If a previous browser was left running, shut it down so we start fresh
-    if browser_manager.is_running:
-        logger.info("Closing stale browser session...")
-        await browser_manager.shutdown()
     logger.info("Application state reset for new call.")
 
 
+def get_current_conversation_stage() -> str:
+    """Determine the current stage of the conversation based on captured data."""
+    cs = _current_call_state()
+    if not cs.greeting_completed:
+        return "GREETING"
+
+    state = application_state
+
+    # 1. PROPERTY: core collateral info
+    if (not state.address_line_1 or
+        not state.ownership_type or 
+        not state.occupancy_type):
+        return "PROPERTY"
+    
+    # 2. PRIMARY_HOME: only for second home/investment
+    if _occupancy_requires_primary_home_intake(state.occupancy_type):
+        if not state.primary_home_address_line_1:
+            return "PRIMARY_HOME"
+            
+    # 3. FOR_SALE
+    if state.is_currently_for_sale is None:
+        return "FOR_SALE"
+        
+    # 4. INCOME
+    if (not state.annual_pre_tax_income or 
+        not state.primary_source_of_income):
+        return "INCOME"
+        
+    # 5. PERSONAL (name collection)
+    if not state.first_name or not state.last_name:
+        return "PERSONAL"
+
+    # 5b. BIRTHDAY (date of birth — separate sub-stage once name is captured)
+    if not state.date_of_birth:
+        return "BIRTHDAY"
+        
+    # 6. CONTACT
+    if (not state.mobile_phone_number or 
+        not state.email_address):
+        return "CONTACT"
+        
+    # 7. CONSENT
+    if (not state.agreed_to_privacy_policy or 
+        not state.agreed_to_commerce_communication):
+        return "CONSENT"
+        
+    return "COMPLETED"
+
 def get_missing_fields() -> str:
     """
-    Return a short line for the LLM: browser stage + still-needed labels.
-
-    Stage defaults to property (1) when URL is unknown so the list is never
-    empty at call start.
+    Return a structured line for the LLM: current conversation stage + missing fields.
     """
     missing = []
     state = application_state
@@ -1147,13 +963,22 @@ def get_missing_fields() -> str:
     pending_low_conf = call_state.pending_low_conf_confirmation
     prefill_pending = call_state.prefill_confirm_pending
     rejected_fields = call_state.prefill_rejected_fields or set()
+    
+    current_conv_stage = get_current_conversation_stage()
+    stage_header = f"[CONVERSATION STAGE: {current_conv_stage}]"
+
+    if current_conv_stage == "GREETING":
+        return (
+            f"{stage_header} Ask next: "
+            '"Is now a good time to go through a few quick questions about your hee-lok application?"'
+        )
+
     if pending_low_conf:
         pending_values = pending_low_conf.get("values") or {}
         pending_labels = [
             _field_display_name(field_name) for field_name in pending_values.keys()
         ]
         label = ", ".join(pending_labels) or "current answer"
-        stage_header = f"[BROWSER STAGE: {browser_manager.get_current_stage().upper()}]"
         return (
             f"{stage_header} Still needed: {label}. "
             f'Ask next: "{_pending_low_conf_ask()}"'
@@ -1169,242 +994,122 @@ def get_missing_fields() -> str:
         }
         if active_values:
             label = ", ".join(_field_display_name(f) for f in active_values.keys())
-            stage_header = f"[BROWSER STAGE: {browser_manager.get_current_stage().upper()}]"
             return (
                 f"{stage_header} Still needed: {label}. "
                 f'Ask next: "{prefill_pending.get("ask")}"'
             )
         _clear_prefill_confirm_pending()
 
-    # WCL /register: picking one row from the address dropdown fills street, city, state, zip
-    # in the browser. User is never asked for city/state/zip in voice—only the street line for
-    # the search, then ownership and occupancy. (Browser still hydrates/validates those fields
-    # separately in BrowserManager.)
-    FIELD_STAGES = {
-        "address_line_1": 1,
-        "ownership_type": 1,
-        "occupancy_type": 1,
-        "primary_home_address_line_1": 2,
-        "is_currently_for_sale": 3,
-        "annual_pre_tax_income": 4,
-        "other_income": 4,
-        "primary_source_of_income": 4,
-        "first_name": 5,
-        "last_name": 5,
-        "middle_name": 5,
-        "suffix": 5,
-        "date_of_birth": 6,
-        "mobile_phone_number": 7,
-        "email_address": 7,
-        "agreed_to_privacy_policy": 8,
-        "agreed_to_commerce_communication": 8,
-        "password": 8,
-        "confirm_password": 8,
+    # Stage to field mapping for detailed intake
+    STAGE_FIELDS = {
+        "PROPERTY": ["address_line_1", "ownership_type", "occupancy_type"],
+        "PRIMARY_HOME": ["primary_home_address_line_1"],
+        "FOR_SALE": ["is_currently_for_sale"],
+        "INCOME": ["annual_pre_tax_income", "other_income", "primary_source_of_income"],
+        "PERSONAL": ["first_name", "last_name", "middle_name", "suffix"],
+        "BIRTHDAY": ["date_of_birth"],
+        "CONTACT": ["mobile_phone_number", "email_address"],
+        "CONSENT": ["agreed_to_privacy_policy", "agreed_to_commerce_communication"],
     }
 
-    # Stage name to number mapping derived from browser_manager.get_current_stage()
-    STAGE_NUMS = {
-        "property": 1,
-        "primary-home": 2,
-        "for-sale": 3,
-        "income": 4,
-        "name": 5,
-        "birthday": 6,
-        "contact": 7,
-        "consent": 8,
-        "unknown": 0,
-    }
-
-    current_stage_name = browser_manager.get_current_stage()
-    current_stage_num = STAGE_NUMS.get(current_stage_name)
-    if current_stage_num is None or current_stage_num == 0:
-        current_stage_num = 1  # property intake until URL resolves
-
-    need_primary_home = _occupancy_requires_primary_home_intake(state.occupancy_type)
-
-    # FILTERING LOGIC: If we are at a later stage, ignore MISSING fields from past stages
-    # unless they are 'required' (unfilled required fields usually block the browser anyway).
-    # For simplicity, we just filter out optional fields from past stages.
-
-    final_missing = []
-    # These internal keys match the HelocApplicationState model fields
-    model_field_to_display = {
-        "address_line_1": "property address (street)",
-        "city": "city",
-        "state": "state",
-        "zipcode": "zipcode",
-        "ownership_type": "ownership type (sole or joint owner)",
-        "occupancy_type": "occupancy type (primary, secondary, or investment)",
-        "primary_home_address_line_1": "primary home address (street)",
-        "primary_home_city": "primary home city",
-        "primary_home_state": "primary home state",
-        "primary_home_zipcode": "primary home zipcode",
-        "is_currently_for_sale": "whether property is currently for sale",
-        "annual_pre_tax_income": "annual pre-tax income",
-        "other_income": "any additional income (optional)",
-        "primary_source_of_income": "primary source of income",
-        "first_name": "first name",
-        "middle_name": "middle name or initial (optional)",
-        "last_name": "last name",
-        "suffix": "suffix (optional)",
-        "date_of_birth": "date of birth",
-        "mobile_phone_number": "mobile phone number",
-        "email_address": "email address",
-        "agreed_to_privacy_policy": (
-            "privacy policy, terms of service, and soft credit pull (first checkbox)"
-        ),
-        "agreed_to_commerce_communication": "electronic communications consent",
-        "password": "account password",
-        "confirm_password": "password confirmation",
-    }
-    # Short scripted asks per field. Keep deterministic to avoid drift.
+    # Short scripted asks per field.
     field_to_question = {
         "address_line_1": "Can you tell me the property address?",
         "ownership_type": VOICE_SCRIPT_OWNERSHIP_ASK,
         "occupancy_type": VOICE_SCRIPT_OCCUPANCY_ASK,
-        "primary_home_address_line_1": (
-            "What is the street address of your primary residence — where you live most of the year?"
-        ),
+        "primary_home_address_line_1": "What is the street address of your primary residence?",
         "is_currently_for_sale": VOICE_SCRIPT_FOR_SALE_ASK,
         "annual_pre_tax_income": "What's your annual pre-tax income?",
-        "other_income": "Any other income to include?",
-        "primary_source_of_income": "What's your main income source?",
+        "other_income": "Do you have any other income you'd like to include, like rental or investment income?",
+        "primary_source_of_income": "And what's your primary source of income — employment, self-employed, retirement, or something else?",
         "first_name": "What's your first name?",
-        "middle_name": "Middle name? Optional.",
+        "middle_name": "What's your middle name?",
         "last_name": "What's your last name?",
-        "suffix": "Any suffix like Jr or Sr? Optional.",
-        "date_of_birth": "What's your date of birth?",
-        "mobile_phone_number": "What's the best mobile number for this application?",
-        "email_address": "What's the best email for this application?",
-        "agreed_to_privacy_policy": (
-            "Do you agree to the Privacy Policy, Terms of Service, and a soft credit pull? "
-            "It will not affect your credit score."
-        ),
-        "agreed_to_commerce_communication": (
-            "Do you agree to receive electronic communications about this application?"
-        ),
-        "password": "Create password.",
-        "confirm_password": "Confirm password.",
+        "suffix": "Any suffix like Jr or Sr?",
+        "date_of_birth": "And what's your date of birth?",
+        "mobile_phone_number": "What's the best mobile number to reach you?",
+        "email_address": "And what's your email address?",
+        "agreed_to_privacy_policy": "To move forward, do you agree to our privacy policy and a soft credit pull?",
+        "agreed_to_commerce_communication": "And do you agree to receive electronic communications from us?",
     }
 
-    # STAGE-LOCKING LOGIC:
-    # We only report fields for the CURRENT stage.
-    # If the current stage is complete, we report fields for the NEXT stage only.
-    # This keeps the agent and browser in perfect lockstep.
+    # Get fields for current stage and check which are missing
+    stage_fields = STAGE_FIELDS.get(current_conv_stage, [])
+    missing_in_stage = []
+    optional_fields = {"middle_name", "suffix"}
 
-    current_stage_fields = [f for f, s in FIELD_STAGES.items() if s == current_stage_num]
+    for field in stage_fields:
+        if getattr(state, field, None) in (None, ""):
+            if field not in optional_fields:
+                missing_in_stage.append(field)
 
-    def _next_intake_stage_num(from_num: int) -> int:
-        if from_num == 1:
-            return 2 if need_primary_home else 3
-        return from_num + 1
+    # If all required fields in the current stage are filled, ask optional ones —
+    # BUT skip other_income if income source is already captured (user moved past it)
+    # and skip middle_name/suffix only when they haven't been asked at all.
+    if not missing_in_stage and current_conv_stage != "COMPLETED":
+        for field in stage_fields:
+            if getattr(state, field, None) in (None, ""):
+                # Guard: if income source is already saved, don't backtrack to other_income
+                if field == "other_income" and state.primary_source_of_income is not None:
+                    continue
+                missing_in_stage.append(field)
 
-    next_stage_num = _next_intake_stage_num(current_stage_num)
-    next_stage_fields = [f for f, s in FIELD_STAGES.items() if s == next_stage_num]
+    if not missing_in_stage and current_conv_stage != "COMPLETED":
+        # Current stage is fully done, move to next
+        return f"{stage_header} Still needed: None. [STAGE COMPLETE]"
 
-    # Get optional fields list for classifications
-    optional_fields = BrowserManager.OPTIONAL_FIELDS
+    if current_conv_stage == "COMPLETED":
+        return f"{stage_header} All fields captured. Ready to terminate."
 
-    # WCL /register: combobox + DOM fill city/state/zip — not voice-collected; must not
-    # block "stage 1 done" or appear in Still needed (also avoids async pull race).
-    # Use stage number 1, not URL name "property": at call start get_current_stage() is often
-    # "unknown" while FIELD_STAGES still maps to register intake.
-    dom_filled_at_property = frozenset({"city", "state", "zipcode"})
-    dom_filled_primary_home = frozenset(
-        {"primary_home_city", "primary_home_state", "primary_home_zipcode"}
-    )
-
-    def _dom_skip_field(fnm: str) -> bool:
-        if current_stage_num == 1 and fnm in dom_filled_at_property:
-            return True
-        if current_stage_num == 2 and fnm in dom_filled_primary_home:
-            return True
-        return False
-
-    # Check if current stage is "complete" (no required missing fields)
-    current_stage_is_done = True
-    for f in current_stage_fields:
-        if _dom_skip_field(f):
-            continue
-        if not hasattr(state, f):
-            continue
-        val = getattr(state, f)
-        if (val is None or val == "") and f not in optional_fields:
-            current_stage_is_done = False
-            break
-
-    target_fields = current_stage_fields if not current_stage_is_done else next_stage_fields
-
-    for field_name in target_fields:
-        if _dom_skip_field(field_name):
-            continue
-        if not hasattr(state, field_name):
-            continue
-        current_val = getattr(state, field_name)
-        if current_val is None or current_val == "":
-            display_name = model_field_to_display.get(field_name)
-            if display_name:
-                final_missing.append(display_name)
-
-    # Do not ask for for-sale while the browser is not on that URL yet.
-    sale_label = model_field_to_display.get("is_currently_for_sale")
-    if (
-        sale_label
-        and sale_label in final_missing
-        and browser_manager._page is not None
-    ):
-        try:
-            page_url = browser_manager._page.url or ""
-        except Exception:
-            page_url = ""
-        if "for-sale" not in page_url:
-            final_missing = [x for x in final_missing if x != sale_label]
-
-    # Primary home only appears on /register/home-address — do not prompt until DOM exists.
-    ph_label = model_field_to_display.get("primary_home_address_line_1")
-    if ph_label and ph_label in final_missing and browser_manager._page is not None:
-        try:
-            page_url = browser_manager._page.url or ""
-        except Exception:
-            page_url = ""
-        if "home-address" not in page_url:
-            final_missing = [x for x in final_missing if x != ph_label]
-
-    # Prepend stage context for the LLM
-    stage_header = f"[BROWSER STAGE: {current_stage_name.upper()}]"
-    if not final_missing:
-        if current_stage_is_done and current_stage_num >= 8:
-            return ""
+    # Format the "Still needed" labels
+    labels = [_field_display_name(f) for f in missing_in_stage]
+    still_needed_str = ", ".join(labels)
+    
+    # Get the "Ask next" question for the first missing field in this stage
+    first_missing = missing_in_stage[0]
+    # If the first missing field has a prefill candidate, ask to confirm it
+    # and register the pending confirmation so the heuristic can save state
+    # when the user says yes/no.
+    if first_missing in (call_state.customer_prefill or {}) and first_missing not in rejected_fields:
+        val = call_state.customer_prefill[first_missing]
+        disp_val = _format_prefill_value(first_missing, val)
+        
+        # Build a natural confirmation ask
+        if first_missing == "ownership_type":
+            confirm_ask = f"I see you're the {disp_val.lower()} of the property, is that correct?"
+        elif first_missing == "occupancy_type":
+            confirm_ask = f"And is this your {disp_val.lower()}, or a different type of property?"
+        elif first_missing == "is_currently_for_sale":
+            confirm_ask = f"I have that the property is {disp_val.lower()}, is that still right?"
+        elif first_missing == "address_line_1":
+            parts = [str(val)]
+            prefill = call_state.customer_prefill or {}
+            for ek in ("city", "state", "zipcode"):
+                ev = prefill.get(ek)
+                if ev:
+                    parts.append(str(ev))
+            confirm_ask = f"I have the property address on file as {', '.join(parts)}. Is that correct?"
+        else:
+            confirm_ask = f"I have your {_field_display_name(first_missing)} as {disp_val}. Is that correct?"
+        
+        # CRITICAL: Register this as a pending prefill confirmation so the
+        # heuristic layer can intercept the user's yes/no response and write
+        # the value to state. Without this, the ask repeats endlessly.
+        if not call_state.prefill_confirm_pending:
+            call_state.prefill_confirm_pending = {
+                "values": {first_missing: val},
+                "ask": confirm_ask,
+            }
+            
         return (
-            f"{stage_header} All current fields filled. Waiting for navigation. "
-            "Do NOT ask for-sale, income, or any next-page field until a later tool "
-            "result shows the new stage in \"Still needed\" (browser may be clicking Continue). "
-            "At most 3 words of hold (e.g. \"One sec\") or stay silent — no new questions."
+            f"{stage_header} Still needed: {_field_display_name(first_missing)}. "
+            f'Ask next: "{confirm_ask}"'
         )
 
-    first_missing_field: Optional[str] = None
-    for field_name in target_fields:
-        if _dom_skip_field(field_name):
-            continue
-        if not hasattr(state, field_name):
-            continue
-        current_val = getattr(state, field_name)
-        if current_val is None or current_val == "":
-            if model_field_to_display.get(field_name) in final_missing:
-                first_missing_field = field_name
-                break
+    ask_next = field_to_question.get(first_missing, f"What is your {first_missing}?")
 
-    question_hint = ""
-    if first_missing_field:
-        prefill_values = _prefill_values_for_field(first_missing_field, current_stage_num)
-        if prefill_values:
-            preset = _set_prefill_confirm_pending(prefill_values)
-        else:
-            preset = field_to_question.get(first_missing_field)
-        if preset:
-            question_hint = f' Ask next: "{preset}"'
+    return f"{stage_header} Still needed: {still_needed_str}. Ask next: \"{ask_next}\""
 
-    return f"{stage_header} Still needed: " + ", ".join(final_missing) + question_hint
 
 
 def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
@@ -1414,7 +1119,8 @@ def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
     Rendered as a transient system CustomHistoryEntry (not the user's message),
     so ``raw_user_input`` stays the true transcript.
     """
-    stage = browser_manager.get_current_stage()
+    call_state = _current_call_state()
+    stage = _CONV_STAGE_TO_BROWSER.get(get_current_conversation_stage(), "unknown")
     missing = get_missing_fields() or ""
     data = application_state.model_dump(
         mode="json",
@@ -1422,14 +1128,44 @@ def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
         exclude=_SENSITIVE_FIELDS,
     )
     captured = json.dumps(data, default=str)
-    body = (
-        "[CURRENT_INTAKE_STATE — authoritative for this turn; trust over chat memory]\n"
-        f"browser_stage={stage}\n"
-        f"captured_fields_json={captured}\n"
-        "still_needed_line:\n"
-        f"{missing}\n"
-        "[/CURRENT_INTAKE_STATE]"
+
+    # Empathy flag — LLM must not repeat acknowledgement if already shown.
+    empathy_line = (
+        "empathy_already_shown=true — do NOT repeat empathy this turn, move forward naturally."
+        if call_state.empathy_shown
+        else "empathy_already_shown=false"
     )
+
+    # Surface optional-field status so the LLM never backtracks to re-ask them.
+    optional_notes: list[str] = []
+    st = application_state
+    if st.annual_pre_tax_income is not None and st.other_income is None:
+        optional_notes.append(
+            "other_income=NOT_YET_ASKED (will auto-default to 0 if caller skips it; "
+            "do NOT ask for other income if income source is the current Ask next)"
+        )
+    if st.other_income is not None:
+        optional_notes.append(f"other_income=CAPTURED ({st.other_income})")
+    if optional_notes:
+        optional_line = "optional_fields: " + "; ".join(optional_notes)
+    else:
+        optional_line = ""
+
+    body_parts = [
+        "[CURRENT_INTAKE_STATE — authoritative for this turn; trust over chat memory]",
+        f"browser_stage={stage}",
+        f"captured_fields_json={captured}",
+        empathy_line,
+    ]
+    if optional_line:
+        body_parts.append(optional_line)
+    body_parts += [
+        "still_needed_line:",
+        missing,
+        "[/CURRENT_INTAKE_STATE]",
+    ]
+    body = "\n".join(body_parts)
+
     if len(body) > max_total_chars:
         body = (
             body[: max_total_chars - 60].rstrip()
@@ -1505,19 +1241,21 @@ DEFAULT_INTAKE_ANNUAL_PRE_TAX = 100_000
 DEFAULT_INTAKE_PRIMARY_SOURCE: IncomeSource = "Employed full-time"
 
 _DECLINE_TO_SPECIFY_PATTERNS = (
-    r"\bi\s+don'?t\s+know\b",
-    r"\bdon'?t\s+know\b",
-    r"\bdo\s+not\s+know\b",
-    r"\bi\s+don'?t\s+remember\b",
-    r"\bcan'?t\s+remember\b",
-    r"\bdo\s+not\s+remember\b",
-    r"\bi\s+am\s+not\s+sure\b",
-    r"\bi'?m\s+not\s+sure\b",
-    r"\bi\s+can'?t\s+think\b",
-    r"\bcan'?t\s+think\b",
-    r"\bcannot\s+think\b",
+    r"\bi\s+(?:don'?t|do\s+not)\s+know\b",
+    r"\bi\s+(?:don'?t|do\s+not)\s+remember\b",
+    r"\bi\s+can'?t\s+(?:remember|think|recall)\b",
     r"\bi\s+don'?t\s+have\s+(?:any\s+)?idea\b",
     r"\bno\s+idea\b",
+    r"\bpass\s+on\s+that\b",
+    r"\bi'?d\s+rather\s+not\s+say\b",
+    # "I'm not sure" / "I'm unsure" / "not certain" — same intent as don't know
+    r"\bi'?m\s+not\s+sure\b",
+    r"\bnot\s+sure\b",
+    r"\bi'?m\s+unsure\b",
+    r"\bnot\s+certain\b",
+    r"\bi'?m\s+not\s+certain\b",
+    r"\bdon'?t\s+have\s+(?:that\s+)?information\b",
+    r"\bi\s+don'?t\s+know\s+(?:the\s+)?answer\b",
 )
 
 
@@ -1800,7 +1538,10 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
             r"|\bjoynt\s+owners?\b"
             r"|\bjointed\s+owners?\b"
             r"|\bjointly\s+owned\b"
-            r"|\bjoint\s+owners?\b",
+            r"|\bjoint\s+owners?\b"
+            r"|\bco[\s-]?owners?\b"
+            r"|\bsecondary\s+owners?\b"
+            r"|\bsecond\s+owners?\b",
             seg,
         ):
             return "Joint owner"
@@ -1864,7 +1605,10 @@ def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
         r"|\bjoynt\s+owners?\b"
         r"|\bjointed\s+owners?\b"
         r"|\bjointly\s+owned\b"
-        r"|\bjoint\s+owners?\b",
+        r"|\bjoint\s+owners?\b"
+        r"|\bco[\s-]?owners?\b"        # "co-owner", "co owner"
+        r"|\bsecondary\s+owners?\b"    # "secondary owner" = co-owner in conversational use
+        r"|\bsecond\s+owners?\b",      # "second owner"
         low,
     ):
         return "Joint owner"
@@ -2038,18 +1782,22 @@ def infer_income_source_from_transcript(text: str) -> Optional[IncomeSource]:
     if re.fullmatch(r"\s*(5|five)\s*[.,!?]?\s*", low):
         return "Unemployed / furloughed"
 
-    if "full time" in low or "full-time" in low:
+    if "full time" in low or "full-time" in low or "fulltime" in low or "employee" in low or "employment" in low:
         return "Employed full-time"
-    if "part time" in low or "part-time" in low:
+    if "part time" in low or "part-time" in low or "parttime" in low:
         return "Employed part-time"
-    if "self employed" in low or "self-employed" in low:
+    if "self employed" in low or "self-employed" in low or "business owner" in low or "contractor" in low:
         return "Self-employed"
-    if "retired" in low:
+    if "retired" in low or "pension" in low or "social security" in low:
         return "Retired"
-    if "unemployed" in low or "furlough" in low:
+    if "unemployed" in low or "furlough" in low or "not working" in low:
         return "Unemployed / furloughed"
     if "alimony" in low:
         return "Alimony"
+    if "child support" in low:
+        return "Child support"
+    if "welfare" in low or "public assistance" in low:
+        return "Public assistance program"
     if "child support" in low:
         return "Child support"
     if "public assistance" in low:
@@ -2650,7 +2398,7 @@ def _spoken_digit_sequence_to_digits(text: str) -> str:
 
 def get_contact_buffer_mode() -> Optional[Literal["phone", "email"]]:
     """Contact stage: buffer STT finals while caller spells phone or email."""
-    if browser_manager.get_current_stage() != "contact":
+    if get_current_conversation_stage() != "CONTACT":
         return None
     if application_state.mobile_phone_number is None:
         return "phone"
@@ -3516,7 +3264,6 @@ async def update_application_state(
       can detect uncertainty markers like 'maybe', 'I think', 'or', etc.
     """
     global application_state
-    await _await_inflight_browser_sync()
     
     # Collect which fields were actually provided in this call
     updates = {}
@@ -3575,7 +3322,7 @@ async def update_application_state(
         "contact": {"mobile_phone_number", "email_address"},
         "consent": {"agreed_to_privacy_policy", "agreed_to_commerce_communication"},
     }
-    current_stage = browser_manager.get_current_stage()
+    current_stage = _CONV_STAGE_TO_BROWSER.get(get_current_conversation_stage(), "unknown")
     allowed_now = stage_to_allowed_fields.get(current_stage)
 
     pending_low_conf = _current_call_state().pending_low_conf_confirmation
@@ -3606,7 +3353,8 @@ async def update_application_state(
                 + (missing if missing and missing.strip() else "")
             )
 
-    if raw_user_input and browser_manager.get_current_stage() == "property":
+    _eff_conv_stage = get_current_conversation_stage()
+    if raw_user_input and _eff_conv_stage == "PROPERTY":
         if (
             _use_deterministic_address_parsing()
             and local_vars.get("address_line_1") is None
@@ -3626,7 +3374,7 @@ async def update_application_state(
                 inferred_occ = infer_occupancy_from_transcript(raw_user_input)
                 if inferred_occ:
                     local_vars["occupancy_type"] = inferred_occ
-    if raw_user_input and browser_manager.get_current_stage() == "primary-home":
+    if raw_user_input and _eff_conv_stage == "PRIMARY_HOME":
         if (
             _use_deterministic_address_parsing()
             and local_vars.get("primary_home_address_line_1") is None
@@ -3635,7 +3383,7 @@ async def update_application_state(
             inferred_ph = infer_property_address_from_transcript(raw_user_input)
             if inferred_ph:
                 local_vars["primary_home_address_line_1"] = inferred_ph
-    if raw_user_input and browser_manager.get_current_stage() == "for-sale":
+    if raw_user_input and _eff_conv_stage == "FOR_SALE":
         if local_vars.get("is_currently_for_sale") is None:
             inferred_fs = infer_for_sale_from_transcript(raw_user_input)
             if inferred_fs is not None:
@@ -3813,39 +3561,27 @@ async def update_application_state(
         )
 
     if updates:
-        ucopy = dict(updates)
-        inline_sync = (
-            _use_inline_browser_sync()
-            or _should_wait_for_address_sync(ucopy)
-            or (
-                not bool(deterministic_call)
-                and _should_force_inline_browser_sync(ucopy)
-            )
-        )
-        if inline_sync:
+        call_state = _current_call_state()
+        conv_stage = get_current_conversation_stage()
+        if conv_stage == "COMPLETED" and not call_state.intake_published:
+            call_state.intake_published = True
             try:
-                await _run_browser_sync(
-                    ucopy, validation_errors, spoken_transcript_hint=raw_user_input
+                voice_sources = dict(call_state.voice_field_user_sources or {})
+                message_id = await publish_completed_intake(
+                    _current_call_state().application_state,
+                    call_sid=call_state.call_sid,
+                    caller_from=call_state.caller_from,
+                    caller_to=call_state.caller_to,
+                    voice_field_sources=voice_sources,
+                )
+                logger.info(
+                    "Intake published to queue | message_id=%s call_sid=%s",
+                    message_id,
+                    call_state.call_sid,
                 )
             except Exception as e:
-                logger.error("Browser sync failed: %s", str(e), exc_info=True)
-        else:
-            call_state = _current_call_state()
-            task = asyncio.create_task(
-                _run_browser_sync(ucopy, None, spoken_transcript_hint=raw_user_input)
-            )
-
-            def _on_done(t: asyncio.Task) -> None:
-                if call_state.browser_sync_inflight is t:
-                    call_state.browser_sync_inflight = None
-                if t.cancelled():
-                    return
-                ex = t.exception()
-                if ex is not None and not isinstance(ex, asyncio.CancelledError):
-                    logger.error("Background browser task failed: %s", ex, exc_info=ex)
-
-            task.add_done_callback(_on_done)
-            call_state.browser_sync_inflight = task
+                call_state.intake_published = False  # allow retry on next tool call
+                logger.error("Failed to publish intake to queue: %s", e, exc_info=True)
 
     if not updates and not validation_errors:
         missing = get_missing_fields()
@@ -3921,6 +3657,9 @@ async def apply_voice_intake_heuristics_before_line(
         "yes",
         "on",
     ):
+        return _NOT_HANDLED
+
+    if not transcript or not str(transcript).strip():
         return _NOT_HANDLED
 
     def _extract_ask_next(tool_result: str) -> Optional[str]:
@@ -4005,6 +3744,9 @@ async def apply_voice_intake_heuristics_before_line(
             stage,
             extra={"event": "state.deterministic_handled", "field": field, "stage": stage},
         )
+        # Stamp cooldown so trailing STT finals from the same utterance don't
+        # bleed into confirming the next field (answer-bleeding guard).
+        call_state._preline_last_handled_at = time.monotonic()
         return HeuristicResult(
             handled=True,
             ask_next=_with_save_ack(field, ask),
@@ -4021,14 +3763,62 @@ async def apply_voice_intake_heuristics_before_line(
         return _NOT_HANDLED
     if transcript_is_status_check(text):
         return _NOT_HANDLED
-    stage = browser_manager.get_current_stage()
+
     call_state = _current_call_state()
+
+    # Answer-bleeding guard: if the preline just fired (e.g. confirmed first name),
+    # ignore STT finals that arrive within the cooldown window — they are trailing
+    # fragments of the same utterance, not deliberate answers to the next question.
+    _now = time.monotonic()
+    if _now - call_state._preline_last_handled_at < _PRELINE_COOLDOWN_SECS:
+        logger.debug(
+            "preline cooldown active — skipping | age_ms=%.0f",
+            (_now - call_state._preline_last_handled_at) * 1000,
+        )
+        return _NOT_HANDLED
+
+    _conv_stage = get_current_conversation_stage()
+    if _conv_stage == "PERSONAL":
+        _pst = application_state
+        stage = "birthday" if (_pst.first_name and _pst.last_name) else "name"
+    else:
+        stage = _CONV_STAGE_TO_BROWSER.get(_conv_stage, "unknown")
+
+    # EMOTIONAL & IDENTITY BYPASS — must run FIRST.
+    # We bypass to the LLM if the user is emotional, asking for help, or
+    # asking about the agent's identity (AI/robot).
+    lower_text = transcript.lower()
+
+    # Identity queries — let the LLM handle these directly.
+    is_identity_query = bool(re.search(
+        r"\bare\s+you\s+(?:an\s+)?(?:ai|robot|bot|person|human|real)\b|\br\s+u\s+n\s*[ai]\b|\bid\s+and\s+ai\b|\bare\s+you\s+there\b",
+        lower_text,
+    ))
+
+    # Detect "keep going" / continuation signals — user is resuming after
+    # emotional acknowledgement. These should fall through to normal flow.
+    is_continuation = bool(re.search(
+        r"\bkeep\s+going\b|\blet'?s\s+(?:keep|continue|go)\b|\bkeep\s+moving\b|\bi'?m\s+(?:fine|okay|ok|ready)\b",
+        lower_text,
+    ))
+
+    if not is_continuation and (is_identity_query or re.search(
+        r"\bsad\b|\baccident\b|\bconfused\b|\bscared\b|\bworried\b|\bstressed\b|\bupset\b|\bhurt\b|\bdepressed\b",
+        lower_text,
+    )):
+        logger.info("Heuristic bypass: emotional or identity query detected in '%s'", transcript)
+        # Only set empathy_shown if it was actually a distress keyword, not just "Are you there?"
+        if not is_identity_query:
+            call_state.empathy_shown = True
+        return _NOT_HANDLED
+
     prefill_pending = call_state.prefill_confirm_pending
     yn_for_prefill = infer_yes_no_from_transcript(text)
+    # Only enter prefill-confirmation path if there is EXPLICITLY a pending
+    # confirmation registered. Do NOT open this path just because yn is not None
+    # — that would catch ordinary off-topic yes/no utterances.
     prefill_confirmation_values = (
-        _current_prefill_confirmation_values()
-        if prefill_pending or yn_for_prefill is not None
-        else {}
+        _current_prefill_confirmation_values() if prefill_pending else {}
     )
     if prefill_confirmation_values:
         yn = yn_for_prefill
@@ -4126,6 +3916,34 @@ async def apply_voice_intake_heuristics_before_line(
                 )
                 return _fail(stage)
 
+    if stage == "greeting":
+        _lower_text = text.lower()
+
+        # Soft-decline patterns: "not now", "call me later", "I'm busy", etc.
+        # Matched before yes/no inference so they always terminate gracefully.
+        if any(p in _lower_text for p in _GREETING_SOFT_DECLINE_PATTERNS):
+            return _ok(
+                "No problem at all! Feel free to call us back whenever works better. Have a great day, goodbye!",
+                "greeting_declined",
+                stage,
+                terminate_after_tts=True,
+            )
+
+        yn = infer_yes_no_from_transcript(text)
+        if yn is True:
+            _current_call_state().greeting_completed = True
+            blob = get_missing_fields() or ""
+            ask = _ask_from_missing_line(blob) or "Great! Can you tell me the property address you'd like to apply for?"
+            return _ok(ask, "greeting_completed", stage)
+        if yn is False:
+            return _ok(
+                "No problem at all! Feel free to call us back whenever it's a better time. Have a great day, goodbye!",
+                "greeting_declined",
+                stage,
+                terminate_after_tts=True,
+            )
+        return _fail(stage)
+
     if stage == "property":
         if _use_deterministic_address_parsing() and application_state.address_line_1 is None:
             addr = infer_property_address_from_transcript(text)
@@ -4138,13 +3956,6 @@ async def apply_voice_intake_heuristics_before_line(
                         raw_user_input=text,
                         deterministic_call=True,
                     )
-                    if browser_manager.address_not_found:
-                        browser_manager.address_not_found = False
-                        return _ok(
-                            "I couldn't find that address. Could you please repeat it?",
-                            "address_line_1",
-                            stage,
-                        )
                     return _ok(_extract_ask_next(tool_result), "address_line_1", stage)
                 except Exception as e:
                     logger.warning(
@@ -4297,13 +4108,6 @@ async def apply_voice_intake_heuristics_before_line(
                         raw_user_input=text,
                         deterministic_call=True,
                     )
-                    if browser_manager.address_not_found_primary_home:
-                        browser_manager.address_not_found_primary_home = False
-                        return _ok(
-                            "I couldn't find that address. Could you please repeat your primary home street?",
-                            "primary_home_address_line_1",
-                            stage,
-                        )
                     return _ok(
                         _extract_ask_next(tool_result),
                         "primary_home_address_line_1",
@@ -4352,6 +4156,13 @@ async def apply_voice_intake_heuristics_before_line(
                         raw_user_input=text,
                         deterministic_call=True,
                     )
+                    if "Ready to terminate" in (tool_result or ""):
+                        return _ok(
+                            _COMPLETED_CLOSING_LINE,
+                            "agreed_to_privacy_policy",
+                            stage,
+                            terminate_after_tts=True,
+                        )
                     return _ok(
                         _extract_ask_next(tool_result),
                         "agreed_to_privacy_policy",
@@ -4396,6 +4207,13 @@ async def apply_voice_intake_heuristics_before_line(
                         raw_user_input=text,
                         deterministic_call=True,
                     )
+                    if "Ready to terminate" in (tool_result or ""):
+                        return _ok(
+                            _COMPLETED_CLOSING_LINE,
+                            "agreed_to_commerce_communication",
+                            stage,
+                            terminate_after_tts=True,
+                        )
                     return _ok(
                         _extract_ask_next(tool_result),
                         "agreed_to_commerce_communication",
@@ -4517,6 +4335,35 @@ async def apply_voice_intake_heuristics_before_line(
             return _fail(stage)
 
         if application_state.other_income is None:
+            # ── Priority check: if the transcript answers income SOURCE (not other income),
+            # the caller has moved past the other-income question. Auto-default other_income=0
+            # and save the income source together to prevent the repeated-question loop.
+            if application_state.annual_pre_tax_income is not None:
+                src_early = infer_income_source_from_transcript(text)
+                if src_early is not None:
+                    logger.info(
+                        "income heuristic: transcript answers income source while other_income=None "
+                        "— auto-defaulting other_income=0 and saving both",
+                        extra={"event": "state.income_source_auto_skip_other"},
+                    )
+                    try:
+                        tool_result = await update_application_state.func(
+                            None,
+                            other_income=0,
+                            primary_source_of_income=src_early,
+                            confidence_score=0.95,
+                            raw_user_input=text,
+                            deterministic_call=True,
+                        )
+                        return _ok(_extract_ask_next(tool_result), "primary_source_of_income", stage)
+                    except Exception as e:
+                        logger.warning(
+                            "apply_voice_intake_heuristics_before_line income source auto-skip failed: %s",
+                            e,
+                            exc_info=True,
+                        )
+                    return _fail(stage)
+
             if transcript_requests_intake_default(text):
                 logger.info(
                     "intake default: other_income=%s (caller declined to specify)",
@@ -4711,7 +4558,12 @@ async def apply_voice_intake_heuristics_before_line(
                 return _fail(stage)
         return _fail(stage)
 
-    if stage != "for-sale":
+    # Stage check for for-sale: use conversation stage if browser is still catching up.
+    active_stage = stage
+    if active_stage == "property" and get_current_conversation_stage() == "FOR_SALE":
+        active_stage = "for-sale"
+
+    if active_stage != "for-sale":
         return _NOT_HANDLED
     if application_state.is_currently_for_sale is not None:
         fs_echo = infer_for_sale_from_transcript(text)

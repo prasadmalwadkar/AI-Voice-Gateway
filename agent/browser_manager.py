@@ -843,15 +843,23 @@ class BrowserManager:
 
             try:
                 try:
-                    _after = float(os.getenv("WCL_ADDRESS_AFTER_TYPE_SEC", "0.35").strip() or "0.35")
+                    _after = float(os.getenv("WCL_ADDRESS_AFTER_TYPE_SEC", "0.8").strip() or "0.8")
                 except ValueError:
-                    _after = 0.35
+                    _after = 0.8
                 await asyncio.sleep(max(0.0, min(_after, 2.5)))
 
                 # Listbox shell can appear before React paints rows — poll until real options exist.
                 n = await _poll_autocomplete_option_count(page)
                 if n <= 0:
                     raise RuntimeError("no autocomplete rows populated")
+
+                # The WCL autocomplete API often appends better-matching rows 200-500ms
+                # after the first options appear. Settle briefly before scoring/clicking.
+                try:
+                    _settle = float(os.getenv("WCL_ADDRESS_SETTLE_SEC", "0.7").strip() or "0.7")
+                except ValueError:
+                    _settle = 0.7
+                await asyncio.sleep(max(0.2, min(_settle, 2.0)))
 
                 opts = page.locator(SEL_FIRST_SUGGESTION)
 
@@ -1243,14 +1251,48 @@ class BrowserManager:
                 elif tag_name == "input" and type_attr == "checkbox":
                     is_checked = await locator.is_checked()
                     should_be_checked = str(value).lower() in ["true", "yes", "1", "on"]
-                    
+
                     if should_be_checked != is_checked:
-                        logger.info(f"Dispatching click event to checkbox: {key} (target state: {should_be_checked})")
-                        # Dispatching a click event is more reliable than a click() for 
-                        # checkboxes that might have pointer-events-none or nested links 
-                        # in their associated labels.
-                        await locator.dispatch_event("click")
-                        await asyncio.sleep(0.3) # Wait for UI state sync
+                        logger.info("Checking/unchecking checkbox: %s (target=%s)", key, should_be_checked)
+                        # WCL consent checkboxes: size-0 absolute hidden inputs inside labels
+                        # that contain hyperlinks (privacy policy, terms). Clicking the label
+                        # at its center hits the link text and navigates away. JS dispatch /
+                        # element.click() produce isTrusted=false events React may ignore.
+                        #
+                        # Strategy: JS-focus the hidden input (focus() works on size-0 inputs
+                        # as long as they're not display:none/disabled), then fire a trusted
+                        # CDP keyboard Space event via page.keyboard.press(). Space on a focused
+                        # checkbox = native toggle + trusted change event → React onChange fires.
+                        clicked = False
+                        try:
+                            await locator.evaluate("el => el.focus()")
+                            await asyncio.sleep(0.05)
+                            focused = await locator.evaluate("el => document.activeElement === el")
+                            if focused:
+                                await page.keyboard.press("Space")
+                                clicked = True
+                                logger.info("Focus+Space keypress for checkbox %s (trusted CDP)", key)
+                        except Exception as e:
+                            logger.debug("Focus+Space failed for %s: %s", key, e)
+
+                        if not clicked:
+                            # Fallback: click the visual indicator span (pointer-events-none),
+                            # not the label text area — avoids clicking any embedded links.
+                            try:
+                                raw_locator = page.locator(selector)
+                                visual = page.locator("label").filter(has=raw_locator).locator(".pointer-events-none").first
+                                if await visual.count() > 0:
+                                    await visual.click(force=True, timeout=3000)
+                                    clicked = True
+                                    logger.info("Clicked visual indicator span for checkbox %s", key)
+                            except Exception as e2:
+                                logger.debug("Visual span click failed for %s: %s", key, e2)
+
+                        if not clicked:
+                            await locator.dispatch_event("click")
+                            logger.debug("Fallback dispatch_event for checkbox %s", key)
+
+                        await asyncio.sleep(0.5)
                 else:
                     await locator.fill(str(value))
 
@@ -1391,18 +1433,25 @@ class BrowserManager:
 
             try:
                 locator = page.locator(selector).first
-                if not await locator.is_visible():
-                    # If field isn't visible, we can't verify it right now
+                if await locator.count() == 0:
                     continue
 
                 actual_value = None
                 tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
                 type_attr = await locator.evaluate("el => el.type ? el.type.toLowerCase() : ''")
 
+                is_checkbox_or_radio = (
+                    tag_name == "input" and type_attr in ("checkbox", "radio")
+                )
+                # Checkboxes are often styled hidden — don't gate on visibility.
+                # For all other field types, skip if not currently visible.
+                if not is_checkbox_or_radio and not await locator.is_visible():
+                    continue
+
                 if tag_name == "select":
                     # For selects, we check the selected label
                     actual_value = await locator.evaluate("el => el.options[el.selectedIndex].text")
-                elif tag_name == "input" and type_attr in ["checkbox", "radio"]:
+                elif is_checkbox_or_radio:
                     actual_value = await locator.is_checked()
                     # Normalize expected value to bool for comparison
                     expected_value = str(expected_value).lower() in ["true", "yes", "1", "on"]
@@ -1729,17 +1778,26 @@ class BrowserManager:
                     continue
 
                 locator = page.locator(selector).first
-                if await locator.count() == 0 or not await locator.is_visible():
+                if await locator.count() == 0:
                     return False
 
                 tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
                 type_attr = await locator.evaluate("el => el.type ? el.type.toLowerCase() : ''")
 
+                # Checkboxes on WCL are styled hidden inputs — is_visible() returns
+                # False even when they are in the DOM and interactable. Only require
+                # visibility for text/select inputs; use attached-only for checkboxes.
+                is_checkbox_or_radio = (
+                    tag_name == "input" and type_attr in ("checkbox", "radio")
+                )
+                if not is_checkbox_or_radio and not await locator.is_visible():
+                    return False
+
                 if tag_name == "select":
                     val = await locator.input_value()
                     if not val or not str(val).strip():
                         return False
-                elif tag_name == "input" and type_attr in ["checkbox", "radio"]:
+                elif is_checkbox_or_radio:
                     if type_attr == "radio":
                         name = await locator.get_attribute("name")
                         group = page.locator(f"input[name='{name}']")
