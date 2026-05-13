@@ -79,10 +79,41 @@ For **Twilio**, [`app/main.py`](app/main.py) can attach known customer fields to
 ## Run the server
 
 ```bash
+# Phase 1 — voice intake (always running)
 python run.py
 ```
 
 **HTTP/WebSocket:** `GET /voice` (TwiML), `WS /media-stream`, `GET /health`, `GET /docs`, Line **`WS /ws`**, optional transcript debug socket (see [`app/main.py`](app/main.py)).
+
+## Form Filler Consumer (Phase 2)
+
+Runs **separately** from the voice server. Picks up completed intake payloads from `data/queue/pending/`, fills the WCL HELOC form with Playwright, and moves files to `completed/` or `dlq/` on failure.
+
+```bash
+# Normal headless mode (production / background)
+python -m agent.form_filler_consumer
+
+# Headed mode — watch the browser fill the form (dev/debug)
+CONSUMER_BROWSER_HEADLESS=0 python -m agent.form_filler_consumer
+
+# Check consumer health
+curl http://localhost:8001/health
+
+# Watch queue lifecycle while a call is in progress (separate terminal)
+watch -n1 "ls -la data/queue/pending/ data/queue/processing/ data/queue/completed/ data/queue/dlq/"
+```
+
+Key env vars for the consumer (set in `.env` or inline):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CONSUMER_BROWSER_HEADLESS` | `1` | Set `0` to see the browser |
+| `CONSUMER_AUTO_PASSWORD` | `WCL!2026!Agent` | Password injected into WCL form |
+| `CONSUMER_POLL_INTERVAL_SEC` | `5.0` | Seconds between queue polls |
+| `CONSUMER_HEALTH_PORT` | `8001` | Port for `/health` JSON endpoint |
+| `CONSUMER_STALE_THRESHOLD_SEC` | `1800` | Age (s) of `processing/` file before startup recovery |
+| `INTAKE_QUEUE_MAX_RETRIES` | `2` | NACK retries before DLQ |
+| `INTAKE_STATUS_CALLBACK_URL` | _(empty)_ | Optional webhook POSTed on completion/failure |
 
 ## Voice without a phone (dev)
 

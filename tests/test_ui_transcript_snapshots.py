@@ -1,7 +1,7 @@
 """HELOC transcript UI snapshots: current page vs full export."""
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -25,12 +25,9 @@ def test_heloc_ui_page_snapshot_only_current_stage(transcript_dir):
         occupancy_type="Primary property",
         is_currently_for_sale=True,
     )
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "for-sale"
-
     with patch("app.path2_transcript_debug._path2_debug_get_call", return_value="CA_snap"):
         with patch("agent.state_manager.application_state", state):
-            with patch("agent.state_manager.browser_manager", mock_browser):
+            with patch("agent.state_manager.get_current_conversation_stage", return_value="FOR_SALE"):
                 _append_heloc_ui_transcript_snapshot()
 
     paths = sorted(transcript_dir.glob("*_CA_snap.jsonl"))

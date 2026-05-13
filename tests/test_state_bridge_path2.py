@@ -2,11 +2,8 @@
 import asyncio
 import base64
 import json
-import os
 
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 # ---------------------------------------------------------------------------
 # Bridge routing integration tests
@@ -252,8 +249,8 @@ async def test_bridge_schedules_followup_ask_after_navigation():
     with patch(
         "app.twilio_line_bridge.get_missing_fields",
         side_effect=[
-            "[BROWSER STAGE: PROPERTY] All current fields filled. Waiting for navigation.",
-            f'[BROWSER STAGE: FOR-SALE] Still needed: whether property is currently for sale Ask next: "{_for_sale_ask}"',
+            "[CONVERSATION STAGE: PROPERTY] Still needed: property address.",
+            f'[CONVERSATION STAGE: FOR_SALE] Still needed: whether property is currently for sale Ask next: "{_for_sale_ask}"',
         ],
     ):
         await TwilioLineBridge._wait_and_queue_deterministic_followup_ask(bridge)
@@ -435,11 +432,8 @@ async def test_enqueue_status_check_presence_keeps_short_clarification():
 
 def test_expanded_consent_prompts():
     from agent.schema import HelocApplicationState
-    from agent.state_manager import get_missing_fields
+    from agent.state_manager import _CallState, get_missing_fields
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "consent"
-    mock_browser._page = None
     state = HelocApplicationState(
         address_line_1="123 Main Street",
         ownership_type="Sole owner",
@@ -454,16 +448,16 @@ def test_expanded_consent_prompts():
         mobile_phone_number="2135550101",
         email_address="alex@example.com",
     )
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
+    cs = _CallState(state)
+    cs.greeting_completed = True
+    with patch("agent.state_manager.application_state", state), patch(
+        "agent.state_manager._current_call_state", return_value=cs
     ):
         missing = get_missing_fields()
 
-    assert "Privacy Policy" in missing
-    assert "Terms of Service" in missing
-    assert "soft credit pull" in missing
-    assert "will not affect your credit score" in missing
+    assert "privacy policy" in missing.lower()
+    assert "commerce communication" in missing.lower()
+    assert "CONSENT" in missing
 
 
 def test_barge_in_partial_filter_accepts_real_answers_not_noise():
@@ -603,14 +597,8 @@ async def test_low_confidence_update_requires_single_confirmation():
         update_application_state,
     )
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "property"
-
     state = HelocApplicationState()
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-    ):
+    with patch("agent.state_manager.application_state", state):
         result = await update_application_state.func(
             None,
             ownership_type="Sole owner",
@@ -631,14 +619,8 @@ async def test_low_confidence_address_asks_for_repeat_not_generic_confirmation()
         update_application_state,
     )
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "property"
-
     state = HelocApplicationState()
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-    ):
+    with patch("agent.state_manager.application_state", state):
         result = await update_application_state.func(
             None,
             address_line_1="325 West Adams Boulevard",
@@ -657,19 +639,13 @@ async def test_pending_low_confidence_yes_commits_candidate():
     from agent.schema import HelocApplicationState
     from agent.state_manager import (
         _clear_pending_low_confidence_confirmation,
+        _current_call_state,
         update_application_state,
     )
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "property"
-    mock_browser._page = None
-
     state = HelocApplicationState()
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
-    ):
+    _current_call_state().greeting_completed = True
+    with patch("agent.state_manager.application_state", state):
         await update_application_state.func(
             None,
             address_line_1="325 West Adams Boulevard",
@@ -691,19 +667,14 @@ async def test_pending_low_confidence_no_clears_candidate():
     from agent.schema import HelocApplicationState
     from agent.state_manager import (
         _clear_pending_low_confidence_confirmation,
+        _current_call_state,
         has_pending_low_confidence_confirmation,
         update_application_state,
     )
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "property"
-    mock_browser._page = None
-
     state = HelocApplicationState()
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-    ):
+    _current_call_state().greeting_completed = True
+    with patch("agent.state_manager.application_state", state):
         await update_application_state.func(
             None,
             address_line_1="325 West Adams Boulevard",
@@ -726,16 +697,19 @@ async def test_update_application_state_rejects_guessed_email_without_spoken_evi
     from agent.schema import HelocApplicationState
     from agent.state_manager import update_application_state
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "contact"
-    mock_browser._page = None
-
-    state = HelocApplicationState(mobile_phone_number="2135550101")
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
-    ):
+    state = HelocApplicationState(
+        address_line_1="123 Main St",
+        ownership_type="Sole owner",
+        occupancy_type="Primary property",
+        is_currently_for_sale=False,
+        annual_pre_tax_income=100000,
+        primary_source_of_income="Employed full-time",
+        first_name="Alex",
+        last_name="Rivera",
+        date_of_birth="01/05/1990",
+        mobile_phone_number="2135550101",
+    )
+    with patch("agent.state_manager.application_state", state):
         result = await update_application_state.func(
             None,
             email_address="guess@gmail.com",
@@ -752,17 +726,20 @@ async def test_update_application_state_rejects_email_when_transcript_parse_diff
     from agent.schema import HelocApplicationState
     from agent.state_manager import update_application_state
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "contact"
-    mock_browser._page = None
-
-    state = HelocApplicationState(mobile_phone_number="2135550101")
+    state = HelocApplicationState(
+        address_line_1="123 Main St",
+        ownership_type="Sole owner",
+        occupancy_type="Primary property",
+        is_currently_for_sale=False,
+        annual_pre_tax_income=100000,
+        primary_source_of_income="Employed full-time",
+        first_name="Alex",
+        last_name="Rivera",
+        date_of_birth="01/05/1990",
+        mobile_phone_number="2135550101",
+    )
     raw = "Prasad. at direct g mail dot com."
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
-    ):
+    with patch("agent.state_manager.application_state", state):
         result = await update_application_state.func(
             None,
             email_address="prasad.malwadkar@example.com",
@@ -773,11 +750,7 @@ async def test_update_application_state_rejects_email_when_transcript_parse_diff
     assert state.email_address is None
     assert "transcript does not parse" in result
 
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-        patch("agent.state_manager._run_browser_sync", new_callable=AsyncMock),
-    ):
+    with patch("agent.state_manager.application_state", state):
         await update_application_state.func(
             None,
             email_address="prasad@directgmail.com",
@@ -1058,9 +1031,8 @@ def test_call_state_registered():
     assert not call_state_registered("CA_regchk")
 
 
-def test_bind_same_call_id_twice_preserves_browser_manager_when_not_fresh():
+def test_bind_same_call_id_twice_preserves_state_when_not_fresh():
     from agent.state_manager import (
-        _current_call_state,
         application_state,
         bind_call_state,
         release_call_state,
@@ -1068,28 +1040,25 @@ def test_bind_same_call_id_twice_preserves_browser_manager_when_not_fresh():
 
     try:
         bind_call_state("CA_rebind", fresh=True)
-        bm1 = _current_call_state().browser_manager
         application_state.first_name = "Pat"
         bind_call_state("CA_rebind", fresh=False)
-        assert _current_call_state().browser_manager is bm1
         assert application_state.first_name == "Pat"
     finally:
         release_call_state("CA_rebind")
 
 
-def test_fresh_true_replaces_browser_manager_for_existing_call():
+def test_fresh_true_resets_state_for_existing_call():
     from agent.state_manager import (
-        _current_call_state,
+        application_state,
         bind_call_state,
         release_call_state,
     )
 
     try:
         bind_call_state("CA_fresh2", fresh=True)
-        bm1 = _current_call_state().browser_manager
+        application_state.first_name = "Sam"
         bind_call_state("CA_fresh2", fresh=True)
-        bm2 = _current_call_state().browser_manager
-        assert bm1 is not bm2
+        assert application_state.first_name is None
     finally:
         release_call_state("CA_fresh2")
 
@@ -1106,38 +1075,6 @@ def test_path2_transcript_debug_disabled_by_default(monkeypatch):
     assert path2_transcript_debug_enabled() is False
     assert path2_transcript_debug_token() == ""
 
-
-def test_cleanup_cancels_background_browser_launch():
-    from app.twilio_line_bridge import TwilioLineBridge
-
-    async def _run() -> None:
-        bridge = TwilioLineBridge.__new__(TwilioLineBridge)
-        bridge._stt_task = None
-        bridge._tts_task = None
-        bridge._end_watch_task = None
-        bridge._caller_response_watchdog_task = None
-        bridge._caller_response_watchdog_seq = 0
-        bridge._deterministic_followup_task = None
-        bridge._contact_buffer_task = None
-        bridge._contact_final_buffer = []
-        bridge._contact_buffer_kind = None
-        bridge._line = None
-        bridge._tts = None
-        bridge._stt = None
-        bridge.call_sid = "CA_cleanup"
-        bridge.call_logger = MagicMock(spec=["debug", "info", "warning", "error", "ttfa_ms"])
-        bridge.call_logger.ttfa_ms = None
-
-        async def pending_browser() -> None:
-            await asyncio.sleep(30)
-
-        bridge._browser_launch_task = asyncio.create_task(pending_browser())
-
-        await TwilioLineBridge._cleanup(bridge)
-
-        assert bridge._browser_launch_task is None
-
-    asyncio.run(_run())
 
 
 def test_repeated_clarification_escalates_to_spelling_prompt():

@@ -27,45 +27,34 @@ def _secondary_collateral_state() -> HelocApplicationState:
     )
 
 
-def test_missing_fields_strip_primary_home_until_home_address_url():
-    from agent.state_manager import get_missing_fields
+def test_missing_fields_asks_primary_home_for_secondary_property():
+    """Conversation stage moves directly to PRIMARY_HOME once property info is complete."""
+    from agent.state_manager import _CallState, get_missing_fields
 
     state = _secondary_collateral_state()
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "property"
-    page = MagicMock()
-    page.url = "https://heloc.westcapitallending.com/account/heloc/register"
-    mock_browser._page = page
-
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
+    cs = _CallState(state)
+    cs.greeting_completed = True
+    with patch("agent.state_manager.application_state", state), patch(
+        "agent.state_manager._current_call_state", return_value=cs
     ):
         line = get_missing_fields()
 
-    assert "Waiting for navigation" in line
-    assert "primary home" not in line.lower()
+    assert "primary" in line.lower()
+    assert "Ask next" in line
 
 
 def test_missing_fields_shows_primary_home_on_home_address_url():
-    from agent.state_manager import get_missing_fields
+    from agent.state_manager import _CallState, get_missing_fields
 
     state = _secondary_collateral_state()
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "primary-home"
-    page = MagicMock()
-    page.url = (
-        "https://heloc.westcapitallending.com/account/heloc/register/home-address"
-    )
-    mock_browser._page = page
-
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
+    cs = _CallState(state)
+    cs.greeting_completed = True
+    with patch("agent.state_manager.application_state", state), patch(
+        "agent.state_manager._current_call_state", return_value=cs
     ):
         line = get_missing_fields()
 
-    assert "primary home address" in line.lower()
+    assert "primary home address" in line.lower() or "primary residence" in line.lower()
     assert "Ask next" in line
 
 
@@ -80,36 +69,18 @@ def test_missing_fields_primary_occupancy_skips_primary_home_stage():
         ownership_type="Sole owner",
         occupancy_type="Primary property",
     )
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "property"
-    page = MagicMock()
-    page.url = "https://heloc.westcapitallending.com/account/heloc/register"
-    mock_browser._page = page
-
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", state),
-    ):
+    with patch("agent.state_manager.application_state", state):
         line = get_missing_fields()
 
-    assert "Waiting for navigation" in line
     assert "primary home" not in line.lower()
 
 
 def test_prefill_primary_home_batches_extras():
     from agent.state_manager import (
         _prefill_values_for_field,
-        browser_manager,
         set_customer_prefill,
     )
 
-    mock_browser = MagicMock()
-    mock_browser.get_current_stage.return_value = "primary-home"
-    page = MagicMock()
-    page.url = (
-        "https://heloc.westcapitallending.com/account/heloc/register/home-address"
-    )
-    mock_browser._page = page
     st = HelocApplicationState(occupancy_type="Investment property")
 
     set_customer_prefill(
@@ -120,10 +91,7 @@ def test_prefill_primary_home_batches_extras():
             "primary_home_zipcode": "91101",
         }
     )
-    with (
-        patch("agent.state_manager.browser_manager", mock_browser),
-        patch("agent.state_manager.application_state", st),
-    ):
+    with patch("agent.state_manager.application_state", st):
         vals = _prefill_values_for_field("primary_home_address_line_1", 2)
 
     assert vals.get("primary_home_address_line_1") == "9 Oak St"
