@@ -170,9 +170,18 @@ class CartesiaSonicMulawTTS:
                         last_chunk_at = now
                         await on_mulaw_chunk(audio)
                 elif et == "error":
-                    err = getattr(event, "error", str(event))
+                    # Surface every signal Cartesia may attach so we can debug
+                    # voice-id / model mismatches instead of guessing.
+                    err_repr = (
+                        getattr(event, "error", None)
+                        or getattr(event, "message", None)
+                        or getattr(event, "detail", None)
+                        or getattr(event, "code", None)
+                        or repr(event)
+                    )
                     self._call_logger.warning(
-                        f"TTS chunk error: {err}",
+                        f"TTS chunk error: {err_repr} | model_id={model_id} "
+                        f"voice_id={voice.get('id')} after_chunks={chunks}",
                         event="cartesia.tts.chunk_error",
                     )
                     break
