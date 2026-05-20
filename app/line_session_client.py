@@ -21,14 +21,33 @@ from app.logging_config import CallLogger
 from app.path2_transcript_debug import broadcast_stt
 
 
+def _env_seconds(ms_var: str, sec_var: str, default_sec: float) -> float:
+    """Read a duration env var. Prefers ``<NAME>_MS`` (integer ms) over the
+    legacy ``<NAME>_SEC`` (float seconds). Returns seconds.
+    """
+    ms_raw = os.getenv(ms_var)
+    if ms_raw is not None and ms_raw.strip():
+        try:
+            return float(ms_raw) / 1000.0
+        except ValueError:
+            pass
+    sec_raw = os.getenv(sec_var)
+    if sec_raw is not None and sec_raw.strip():
+        try:
+            return float(sec_raw)
+        except ValueError:
+            pass
+    return default_sec
+
+
 class LineSessionClient:
     """Async client for the Line VoiceAgentApp websocket protocol."""
 
     # Re-ask same pending question without replaying long scripted prompts.
-    BRIEF_REPEAT_PROMPT = "Could you say that one more time?"
+    BRIEF_REPEAT_PROMPT = "Sorry, didn't quite catch that — one more time?"
     # Short hold line when model/tool work is still in-flight; avoid false "missed that".
-    BUSY_HOLD_PROMPT = "One sec while I process that."
-    STATUS_ACK_PREFIX = "I'm here. Let's keep going."
+    BUSY_HOLD_PROMPT = "One sec while I get that."
+    STATUS_ACK_PREFIX = "I'm here — let's keep going."
 
     def __init__(
         self,
@@ -68,24 +87,55 @@ class LineSessionClient:
             0.25,
             float(os.getenv("LINE_TOOL_ASK_FALLBACK_SEC", "0.35")),
         )
-        # Long enough that slow LLM tails (e.g. ~2.5s TTFT) do not replay the
-        # previous question after tool-ask fallback TTS already spoke the next ask.
+        # After a tool-ask fallback TTS speaks, we mute incoming LLM tokens for
+        # this window to avoid double-asking. 6s was too long — it killed FAQ
+        # answers landing just after the no-response watchdog. 1.5s is enough
+        # to absorb a stale LLM tail from a previous turn without swallowing
+        # the next legitimate response.
+        # LINE_POST_FALLBACK_MUTE_MS preferred; SEC kept for backwards compat.
         self._post_fallback_mute_model_sec = max(
             0.5,
-            float(os.getenv("LINE_POST_FALLBACK_MUTE_SEC", "6.0")),
+            _env_seconds(
+                "LINE_POST_FALLBACK_MUTE_MS",
+                "LINE_POST_FALLBACK_MUTE_SEC",
+                1.5,
+            ),
         )
         self._mute_model_text_until = 0.0
         self._last_tool_ask: str = ""
         self._awaiting_turn_response = False
         self._turn_watchdog_task: Optional[asyncio.Task[None]] = None
+        # Busy-hold ("One sec while I get that.") fires after this long. The
+        # caller hears an audible ack at this point, so silence afterwards is
+        # tolerable. 2500ms is a sweet spot: rarely fires on clean answers,
+        # quick enough that the caller doesn't think the line dropped.
+        # Either LINE_TURN_WATCHDOG_MS (preferred) or LINE_TURN_WATCHDOG_SEC works.
         self._turn_watchdog_sec = max(
             0.8,
-            float(os.getenv("LINE_TURN_WATCHDOG_SEC", "2")),
+            _env_seconds("LINE_TURN_WATCHDOG_MS", "LINE_TURN_WATCHDOG_SEC", 2.5),
         )
-        # Hard guard for empty LLM turns (no tool_call + no message).
+        # Hard safety net for genuinely empty LLM turns (no tool_call + no
+        # message). 4000ms = busy-hold (2500ms) + ~1500ms of follow-up wait.
+        # LINE_NO_RESPONSE_WATCHDOG_MS (preferred) or LINE_NO_RESPONSE_WATCHDOG_SEC.
         self._no_response_watchdog_sec = max(
             1.2,
-            float(os.getenv("LINE_NO_RESPONSE_WATCHDOG_SEC", "3.4")),
+            _env_seconds(
+                "LINE_NO_RESPONSE_WATCHDOG_MS",
+                "LINE_NO_RESPONSE_WATCHDOG_SEC",
+                4.0,
+            ),
+        )
+        # When busy-hold fires, push the hard re-ask out by this much extra so
+        # slow LLM FAQ replies (4-8s TTFT) actually land instead of being
+        # clobbered. Caller already heard the busy-hold ack, so the extra wait
+        # feels like the agent is thinking, not dead.
+        self._post_busy_hold_extension_sec = max(
+            1.0,
+            _env_seconds(
+                "LINE_POST_BUSY_HOLD_EXTENSION_MS",
+                "LINE_POST_BUSY_HOLD_EXTENSION_SEC",
+                5.0,
+            ),
         )
         self._ask_dedup_window_sec = max(
             0.8,
@@ -180,6 +230,12 @@ class LineSessionClient:
             return current_ask
 
         if current_ask and self._text_contains_mismatched_question(t, current_ask):
+            return current_ask
+
+        # LLM hallucinated an answer instead of repeating the pending ask.
+        # Saw in production: pending ask was "Is the property currently listed for
+        # sale?" and the model spoke "No, it is not for sale." — a fabricated answer.
+        if current_ask and self._text_is_hallucinated_answer(t, current_ask):
             return current_ask
         return t
 
@@ -276,8 +332,12 @@ class LineSessionClient:
     def _text_contains_mismatched_question(text: str, current_ask: str) -> bool:
         if "?" not in text:
             return False
+        # Multi-sentence replies are the FAQ pattern: the LLM gave context +
+        # pivot question. Don't substitute — the caller deserves the answer.
+        sentences = [s for s in re.split(r"(?<=[.?!])\s+", text) if s.strip()]
+        if len(sentences) >= 2:
+            return False
         ca = current_ask.strip().rstrip("?").lower()
-        sentences = re.split(r"(?<=[.?!])\s+", text)
         for s in sentences:
             s_stripped = s.strip()
             if "?" not in s_stripped:
@@ -287,6 +347,40 @@ class LineSessionClient:
                 return False
             return True
         return False
+
+    _DECLARATIVE_ANSWER_OPENERS = (
+        "yes", "yeah", "yep", "no", "nope",
+        "it is", "it's", "it isn't", "it is not",
+        "you are", "you're", "you do", "you have", "you've",
+        "i am", "i'm", "i have", "i've", "i do",
+        "we are", "we're", "we have", "we've",
+        "they are", "they're",
+        "your name", "your first", "your last", "your address", "your income",
+        "the property", "the answer", "the value",
+        "that is", "that's", "this is", "this property",
+    )
+
+    @classmethod
+    def _text_is_hallucinated_answer(cls, text: str, current_ask: str) -> bool:
+        """True when model returned a self-contained answer instead of asking.
+
+        The deterministic state machine — not the model — knows the caller's
+        actual data. If the pending ask is a question and the model speaks a
+        short, question-free reply that opens with an answer marker (yes/no/
+        \"it is …\"), it has fabricated the answer and we must re-ask instead.
+        """
+        if not current_ask or not current_ask.endswith("?"):
+            return False
+        t = text.strip()
+        if not t or "?" in t:
+            return False
+        # Acknowledgement-only ("Got it.", "Sure.", "Thanks.") is fine — the
+        # caller hears the ack and we will append the next ask separately.
+        words = t.lower().split()
+        if len(words) > 18:
+            return False
+        low = t.lower().lstrip()
+        return any(low.startswith(opener) for opener in cls._DECLARATIVE_ANSWER_OPENERS)
 
     async def _debounced_flush(self) -> None:
         try:
@@ -742,8 +836,13 @@ class LineSessionClient:
         # Broad fallback: short reply to an unknown question is often an answer — but
         # never for enumerated choice asks: STT noise ("sad", "um") must not skip
         # watchdog / look like a valid sole-vs-joint reply (see path2 logs).
+        # Also never for caller questions (starts with interrogative word) — those
+        # are clarifying questions for the LLM, not answers.
+        _QUESTION_WORDS = ("which", "what", "why", "how", "when", "where", "who")
         if "?" in a and len(u.split()) <= 4:
             if any(m in a for m in LineSessionClient._CHOICE_ASK_MARKERS):
+                return False
+            if u.split()[0] in _QUESTION_WORDS:
                 return False
             return True
         return False
@@ -768,8 +867,37 @@ class LineSessionClient:
                 f"Line watchdog busy-hold emitted (pending ask was): {ask[:80]}",
                 event="line.session.turn_watchdog",
             )
+            # The caller just heard an audible "One sec while I get that." —
+            # extend the no-response watchdog by another window so a slow LLM
+            # FAQ reply (3-7s TTFT) isn't destroyed by an immediate re-ask.
+            self._extend_no_response_watchdog(self._post_busy_hold_extension_sec)
         except asyncio.CancelledError:
             raise
+
+    def _extend_no_response_watchdog(self, extra_sec: float) -> None:
+        """Cancel current no-response watchdog and restart it with a longer delay.
+
+        Used after busy-hold fires: caller heard an ack, so we can afford to wait
+        a few more seconds for the actual LLM reply instead of re-asking.
+        """
+        if (
+            self._no_response_watchdog_task is None
+            or self._no_response_watchdog_task.done()
+        ):
+            return
+        self._no_response_watchdog_task.cancel()
+
+        async def _delayed_no_response() -> None:
+            try:
+                await asyncio.sleep(extra_sec)
+                await self._no_response_watchdog()
+            except asyncio.CancelledError:
+                raise
+
+        self._no_response_watchdog_task = asyncio.create_task(
+            _delayed_no_response(),
+            name="line_no_response_watchdog_extended",
+        )
 
     async def _no_response_watchdog(self) -> None:
         """
@@ -853,17 +981,21 @@ class LineSessionClient:
         ask_hint: Optional[str] = None,
         user_transcript: Optional[str] = None,
     ) -> bool:
-        """Acknowledge status / confusion checks; repeat Ask next verbatim when requested."""
+        """Acknowledge status / presence pings + repeats; never imply we missed audio."""
         base = (ask_hint or self._last_tool_ask or "").strip()
         self._ask_spoken_this_turn = False
-        if (
-            user_transcript
-            and transcript_seeks_question_repeat(user_transcript)
-            and base
-        ):
+        seeks_repeat = bool(
+            user_transcript and transcript_seeks_question_repeat(user_transcript)
+        )
+        if seeks_repeat and base:
+            # "Say that again" → just re-ask verbatim, no preamble.
             response = base
         elif base:
-            response = self._clarification_for_ask(base)
+            # Presence ping ("hello? you there?") → warm ack + re-ask. The
+            # caller wasn't unclear; we just need to confirm we're alive and
+            # remind them what's pending. NEVER "Sorry, I missed that" here —
+            # the caller will assume there's a hearing problem.
+            response = f"{self.STATUS_ACK_PREFIX} {base}"
         else:
             response = self.BRIEF_REPEAT_PROMPT
         return await self._enqueue_ask_if_needed(
@@ -878,7 +1010,13 @@ class LineSessionClient:
             return (
                 "Sorry, I missed that. Could you repeat your primary home street address?"
             )
-        if "property address" in low or "street address" in low:
+        if (
+            "property address" in low
+            or "street address" in low
+            or "address of the property" in low
+            or "property you're applying" in low
+            or "address for financing" in low
+        ):
             return "Sorry, I missed part of that. Could you repeat the property address?"
         if "ownership type" in low or "sole or joint" in low:
             return "Sorry, I missed that. Are you the sole owner, or is it joint?"
@@ -897,7 +1035,11 @@ class LineSessionClient:
             )
         if "currently for sale" in low or "for sale" in low:
             return "Sorry, I missed that. Is the property currently listed for sale?"
-        if "annual pre-tax income" in low or "annual income" in low:
+        if (
+            "annual pre-tax income" in low
+            or "annual income" in low
+            or "income before taxes" in low
+        ):
             return "Could you say the annual income amount one more time?"
         if "other income" in low:
             return "Could you repeat that? You can say an amount or none."

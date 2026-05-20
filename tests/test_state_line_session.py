@@ -137,8 +137,10 @@ async def test_send_user_transcript_status_ping_repeats_current_ask_without_llm(
 
     await client.send_user_transcript("Hello, you there?")
 
+    # Presence ping ("Hello, you there?") gets warm ack + verbatim re-ask,
+    # not the "I missed that" clarification — caller didn't mishear us.
     client._enqueue_ask_if_needed.assert_awaited_once_with(
-        "Could you say your last name one more time?",
+        f"{LineSessionClient.STATUS_ACK_PREFIX} Last name?",
         event="line.session.status_check_response",
     )
     client._ws.send.assert_not_called()
