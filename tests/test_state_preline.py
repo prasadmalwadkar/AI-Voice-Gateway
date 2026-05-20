@@ -51,10 +51,8 @@ async def test_preline_income_garble_passes_low_confidence_for_confirmation():
         patch.dict(os.environ, {"PATH2_ENABLE_PRELINE_HEURISTICS": "1"}),
     ):
         mock_tool.func = AsyncMock(return_value=tool_return)
-        from agent.state_manager import (
-            _INCOME_AMBIGUOUS_STT_CONFIDENCE,
-            apply_voice_intake_heuristics_before_line,
-        )
+        from agent.deterministic_parsers import _INCOME_AMBIGUOUS_STT_CONFIDENCE
+        from agent.state_manager import apply_voice_intake_heuristics_before_line
 
         await apply_voice_intake_heuristics_before_line("one one five million")
 
@@ -239,7 +237,9 @@ def test_prefill_initial_ask_greets_first_name_for_missing_address():
         patch("agent.state_manager.application_state", mock_state),
     ):
         set_customer_prefill({"first_name": "Prasad"})
-        assert get_initial_intake_ask() == "Hi Prasad, can you tell me your property address?"
+        assert get_initial_intake_ask() == (
+            "Hi Prasad — what's your property address for financing?"
+        )
 
 
 def test_prefill_initial_ask_greets_first_name_for_on_file_address():
@@ -305,12 +305,12 @@ def test_prefill_initial_ask_when_missing_line_has_no_quoted_ask():
         set_customer_prefill({"first_name": "Pat"})
         assert (
             get_initial_intake_ask()
-            == "Hi Pat, can you tell me your property address?"
+            == "Hi Pat — what's your property address for financing?"
         )
 
 
 def test_on_file_confirmation_yes_passes_non_answer_gate():
-    from agent.state_manager import looks_like_answer_for_current_field
+    from agent.deterministic_parsers import looks_like_answer_for_current_field
 
     missing = (
         '[CONVERSATION STAGE: PROPERTY] Still needed: ownership type. '
@@ -355,10 +355,8 @@ async def test_preline_occupancy_garbled_final_not_commentary_reprompt():
 async def test_preline_occupancy_low_confidence_reprompt():
     """Deepgram-low final on occupancy ask → scripted reprompt, no tool."""
     from agent.schema import HelocApplicationState
-    from agent.state_manager import (
-        OCCUPANCY_LOW_CONF_REPROMPT,
-        apply_voice_intake_heuristics_before_line,
-    )
+    from agent.deterministic_parsers import OCCUPANCY_LOW_CONF_REPROMPT
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
 
     mock_state = HelocApplicationState(
         address_line_1="123 LN",
@@ -374,7 +372,7 @@ async def test_preline_occupancy_low_confidence_reprompt():
         mock_tool.func = AsyncMock()
         result = await apply_voice_intake_heuristics_before_line(
             "Henry Home.",
-            stt_confidence=0.35,
+            stt_confidence=0.50,
         )
 
     assert result.handled is True
@@ -740,10 +738,8 @@ async def test_preline_heuristic_empty_transcript():
 async def test_preline_partial_phone_reprompt_skips_tool():
     """5–9 digits in contact stage → deterministic reprompt, no state update."""
     from agent.schema import HeuristicResult, HelocApplicationState
-    from agent.state_manager import (
-        PARTIAL_MOBILE_PHONE_REPROMPT,
-        apply_voice_intake_heuristics_before_line,
-    )
+    from agent.deterministic_parsers import PARTIAL_MOBILE_PHONE_REPROMPT
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
 
     mock_state = HelocApplicationState()
 
@@ -793,10 +789,8 @@ async def test_preline_contact_email_i_dont_know_forwards_to_line_keeps_prefill(
 async def test_preline_contact_spoken_nine_digit_spell_reprompt():
     """Word-only digit spell producing 9 digits → partial reprompt (not silent LLM fail)."""
     from agent.schema import HelocApplicationState
-    from agent.state_manager import (
-        PARTIAL_MOBILE_PHONE_REPROMPT,
-        apply_voice_intake_heuristics_before_line,
-    )
+    from agent.deterministic_parsers import PARTIAL_MOBILE_PHONE_REPROMPT
+    from agent.state_manager import apply_voice_intake_heuristics_before_line
 
     mock_state = HelocApplicationState()
 
@@ -931,7 +925,7 @@ async def test_preline_primary_home_address_with_filler():
 
 async def test_preline_dob_partial_reprompts_for_year():
     from agent.schema import HelocApplicationState
-    from agent.state_manager import PARTIAL_DOB_REPROMPT
+    from agent.deterministic_parsers import PARTIAL_DOB_REPROMPT
     import agent.state_manager as sm
 
     # first_name + last_name set → PERSONAL sub-stage resolves to "birthday"
@@ -975,7 +969,7 @@ async def test_preline_other_income_yes_asks_amount():
 
 async def test_preline_phone_nine_digits_with_filler_reprompt():
     from agent.schema import HelocApplicationState
-    from agent.state_manager import PARTIAL_MOBILE_PHONE_REPROMPT
+    from agent.deterministic_parsers import PARTIAL_MOBILE_PHONE_REPROMPT
     import agent.state_manager as sm
 
     mock_state = HelocApplicationState()

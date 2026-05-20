@@ -689,7 +689,7 @@ async def test_pending_low_confidence_no_clears_candidate():
 
     assert state.address_line_1 is None
     assert has_pending_low_confidence_confirmation() is False
-    assert "Can you tell me the property address?" in result
+    assert "what's your property address for financing?" in result.lower()
     _clear_pending_low_confidence_confirmation()
 
 
@@ -820,7 +820,7 @@ def test_build_intake_llm_context_string_shape():
     application_state.first_name = "Pat"
     s = build_intake_llm_context_string(max_total_chars=8000)
     assert "[CURRENT_INTAKE_STATE" in s
-    assert "browser_stage=" in s
+    assert "intake_stage=" in s
     assert "captured_fields_json" in s
     assert "still_needed_line" in s
     assert "Pat" in s
@@ -983,10 +983,9 @@ def test_caller_response_watchdog_queues_repeat(monkeypatch):
 
         await TwilioLineBridge._caller_response_watchdog(bridge, 0)
 
+        from app.twilio_line_bridge import CALLER_RESPONSE_WATCHDOG_PREFIX
         queued = bridge._line.tts_queue.get_nowait()
-        assert queued == (
-            "I may have missed you there. Could you say that one more time?"
-        )
+        assert queued == CALLER_RESPONSE_WATCHDOG_PREFIX
         bridge.call_logger.info.assert_called_once()
 
     asyncio.run(_run())

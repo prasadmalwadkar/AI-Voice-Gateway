@@ -49,15 +49,70 @@ from agent.schema import (
     IncomeSource,
     STRICT_EMAIL_REGEX,
 )
-# BrowserManager removed from hot path — used only by form_filler_consumer.
+# New deterministic parsers module for decoupling voice from logic.
+from agent.deterministic_parsers import (
+    normalize_answer_scaffold,
+    infer_ownership_from_transcript,
+    infer_occupancy_from_transcript,
+    infer_occupancy_with_optional_recovery,
+    infer_for_sale_from_transcript,
+    infer_income_source_from_transcript,
+    infer_annual_income_meta,
+    _INCOME_AMBIGUOUS_STT_CONFIDENCE,
+    infer_annual_income_from_transcript,
+    infer_other_income_from_transcript,
+    infer_dob_from_transcript,
+    infer_partial_dob_month_day,
+    infer_phone_from_transcript,
+    _spoken_digit_sequence_to_digits,
+    infer_email_from_transcript,
+    infer_property_address_from_transcript,
+    infer_property_city_state_from_transcript,
+    build_address_autocomplete_type_query,
+    infer_name_fields_from_transcript,
+    infer_yes_no_from_transcript,
+    detect_uncertainty,
+    looks_like_answer_for_current_field,
+    transcript_is_status_check,
+    transcript_is_dnc,
+    transcript_is_intake_decline,
+    transcript_seeks_question_repeat,
+    transcript_requests_intake_default,
+    UNCERTAINTY_MARKERS,
+    PARTIAL_DOB_REPROMPT,
+    PARTIAL_MOBILE_PHONE_REPROMPT,
+    _stt_confidence_triggers_reprompt,
+    _name_slot_focus_from_missing,
+    _use_deterministic_address_parsing,
+    _transcript_supports_saved_dob,
+    _spoken_letters_to_word,
+    CONFIDENCE_THRESHOLD,
+    ADDRESS_CONFIDENCE_THRESHOLD,
+    ADDRESS_CONFIDENCE_FIELDS,
+    HIGH_CONFIDENCE_FIELDS,
+    DEFAULT_INTAKE_OWNERSHIP,
+    DEFAULT_INTAKE_OCCUPANCY,
+    DEFAULT_INTAKE_FOR_SALE,
+    DEFAULT_INTAKE_OTHER_INCOME,
+    DEFAULT_INTAKE_ANNUAL_PRE_TAX,
+    DEFAULT_INTAKE_PRIMARY_SOURCE,
+    VOICE_SCRIPT_OWNERSHIP_ASK,
+    VOICE_SCRIPT_OCCUPANCY_ASK,
+    VOICE_SCRIPT_FOR_SALE_ASK,
+    OCCUPANCY_LOW_CONF_REPROMPT,
+    OWNERSHIP_LOW_CONF_REPROMPT,
+    FOR_SALE_LOW_CONF_REPROMPT,
+    _GREETING_SOFT_DECLINE_PATTERNS,
+)
+
 # Import queue publisher for completed intake payloads.
 from agent.queue_publisher import publish_completed_intake
 
 logger = logging.getLogger("voip.state")
 
-# Maps conversation stages (logic-based) to the browser-stage strings used
+# Maps conversation stages (logic-based) to the internal identifiers used
 # throughout the file for stage gating and heuristics. Browser is no longer
-# running in the voice path — this replaces browser_manager.get_current_stage().
+# running in the voice path.
 _COMPLETED_CLOSING_LINE = (
     "Great, that's everything we need. Your application has been submitted and "
     "someone from West Capital Lending will be in touch soon. Thanks for your time, goodbye!"
@@ -67,16 +122,7 @@ _COMPLETED_CLOSING_LINE = (
 # Prevents trailing STT finals from the same utterance from confirming the *next* field.
 _PRELINE_COOLDOWN_SECS = 1.5
 
-# GREETING soft-decline keyword patterns — matched before yes/no inference.
-_GREETING_SOFT_DECLINE_PATTERNS = (
-    "not now", "not a good time", "bad time", "not the right time",
-    "call back", "call later", "call me later", "call me back",
-    "not free", "busy right now", "i'm busy", "catch me later",
-    "another time", "can i call", "can you call", "reach me later",
-    "not ready", "not interested",
-)
-
-_CONV_STAGE_TO_BROWSER: dict[str, str] = {
+_CONV_STAGE_TO_INTAKE_ID: dict[str, str] = {
     "PROPERTY": "property",
     "PRIMARY_HOME": "primary-home",
     "FOR_SALE": "for-sale",
@@ -89,21 +135,6 @@ _CONV_STAGE_TO_BROWSER: dict[str, str] = {
     "COMPLETED": "completed",
 }
 
-# Canonical scripted voice lines (field_to_question + deterministic pre-Line).
-VOICE_SCRIPT_OWNERSHIP_ASK = "Are you the sole owner, or is it jointly owned?"
-VOICE_SCRIPT_OCCUPANCY_ASK = (
-    "Is this your primary home, a second home, or an investment property?"
-)
-VOICE_SCRIPT_FOR_SALE_ASK = "Is the property currently listed for sale?"
-OCCUPANCY_LOW_CONF_REPROMPT = (
-    "Sorry, I didn't catch that. Say primary home, second home, or investment property."
-)
-OWNERSHIP_LOW_CONF_REPROMPT = (
-    "Sorry, I didn't catch that. Are you the sole owner, or is it jointly owned?"
-)
-FOR_SALE_LOW_CONF_REPROMPT = (
-    "Sorry, I didn't catch that. Is the property listed for sale — yes or no?"
-)
 
 # =============================================================================
 # Per-call state lives in a ContextVar so overlapping calls in one server process
@@ -541,8 +572,15 @@ def get_initial_intake_ask() -> Optional[str]:
 
     greeting = f"Hi {first_name}, " if first_name else ""
 
-    if not ask or ask in {"What is the property address?", "Can you tell me the property address?"}:
-        return f"{greeting}can you tell me your property address?" if first_name else None
+    _PROPERTY_ASKS = {
+        "What is the property address?",
+        "Can you tell me the property address?",
+        "What's your property address for financing?",
+    }
+    if not ask or ask in _PROPERTY_ASKS:
+        if first_name:
+            return f"Hi {first_name} — what's your property address for financing?"
+        return None
     if first_name and ask.startswith("I have "):
         return greeting + ask
     if first_name and not ask.strip().lower().startswith("hi "):
@@ -612,6 +650,49 @@ def _extract_inline_answer_after_no(
 def has_pending_low_confidence_confirmation() -> bool:
     """True when a low-confidence candidate is waiting for repeat/confirm handling."""
     return bool(_current_call_state().pending_low_conf_confirmation)
+
+
+def _ask_from_missing_line(missing_line: str) -> str:
+    m = re.search(r'Ask next:\s*"([^"]+)"', missing_line or "")
+    if not m:
+        return ""
+    return (m.group(1) or "").strip()
+
+
+def looks_like_answer_for_current_field(text: str, missing_line: str) -> bool:
+    """True when a transcript plausibly answers the current `Ask next` field."""
+    if not text or not str(text).strip():
+        return False
+    ask = _ask_from_missing_line(missing_line).lower()
+    low = text.lower()
+    
+    # Ownership ask?
+    if "sole or joint" in ask:
+        return bool(infer_ownership_from_transcript(low))
+    # Occupancy ask?
+    if "is this your primary" in ask:
+        return bool(infer_occupancy_from_transcript(low))
+    # For-sale ask?
+    if "currently listed for sale" in ask or "currently for sale" in ask:
+        return infer_yes_no_from_transcript(low) is not None
+    # Income ask?
+    if "annual pre-tax income" in ask:
+        return bool(infer_annual_income_from_transcript(low))
+    # Birthday ask?
+    if "date of birth" in ask:
+        return bool(infer_dob_from_transcript(low))
+    # Personal info (name/phone/email)?
+    if "your first name" in ask or "your last name" in ask:
+        return len(low.split()) >= 1
+    if "phone number" in ask:
+        return bool(infer_phone_from_transcript(low))
+    if "email address" in ask:
+        return bool(infer_email_from_transcript(low))
+    # Property address? Require both a street number and a street name token.
+    if "property address" in ask or "street address" in ask:
+        return bool(infer_property_address_from_transcript(low))
+    # Default: assume anything else might be an answer
+    return True
 
 
 def _field_display_name(field_name: str) -> str:
@@ -686,57 +767,6 @@ def _clear_pending_low_confidence_confirmation() -> None:
     _current_call_state().pending_low_conf_confirmation = None
 
 
-# Fields shown on one browser step — transcript ``ui`` lines use only these per ``current_stage``.
-_HELOC_UI_PAGE_FIELDS_BY_STAGE: dict[str, frozenset[str]] = {
-    "greeting": frozenset(),
-    "unknown": frozenset(
-        {
-            "address_line_1",
-            "city",
-            "state",
-            "zipcode",
-            "ownership_type",
-            "occupancy_type",
-        }
-    ),
-    "property": frozenset(
-        {
-            "address_line_1",
-            "city",
-            "state",
-            "zipcode",
-            "ownership_type",
-            "occupancy_type",
-        }
-    ),
-    "primary-home": frozenset(
-        {
-            "primary_home_address_line_1",
-            "primary_home_city",
-            "primary_home_state",
-            "primary_home_zipcode",
-        }
-    ),
-    "for-sale": frozenset({"is_currently_for_sale"}),
-    "income": frozenset(
-        {
-            "annual_pre_tax_income",
-            "other_income",
-            "primary_source_of_income",
-        }
-    ),
-    "name": frozenset({"first_name", "middle_name", "last_name", "suffix"}),
-    "birthday": frozenset({"date_of_birth"}),
-    "contact": frozenset({"mobile_phone_number", "email_address"}),
-    "consent": frozenset(
-        {
-            "agreed_to_privacy_policy",
-            "agreed_to_commerce_communication",
-            "agreed_to_credit_pull",
-        }
-    ),
-}
-
 # End-of-call snapshot: all captured applicant-facing fields (passwords never exported).
 _HELOC_UI_FULL_EXPORT_KEYS: tuple[str, ...] = (
     "address_line_1",
@@ -766,31 +796,6 @@ _HELOC_UI_FULL_EXPORT_KEYS: tuple[str, ...] = (
     "agreed_to_commerce_communication",
     "agreed_to_credit_pull",
 )
-
-
-def _heloc_ui_snap_string_values(keys: frozenset[str]) -> dict[str, str]:
-    """Build string map for transcript; omit None / empty strings; booleans as True/False."""
-    st = application_state
-    snap: dict[str, str] = {}
-    for key in keys:
-        if key in _SENSITIVE_FIELDS:
-            continue
-        v = getattr(st, key, None)
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            snap[key] = "True" if v else "False"
-        elif isinstance(v, str):
-            t = v.strip()
-            if t:
-                snap[key] = t
-        elif isinstance(v, int):
-            snap[key] = str(v)
-        else:
-            t = str(v).strip()
-            if t:
-                snap[key] = t
-    return snap
 
 
 def _heloc_ui_full_transcript_snapshot() -> dict[str, str]:
@@ -829,27 +834,6 @@ def _maybe_record_voice_field_user_source(
 
 def export_voice_field_user_sources_for_call() -> dict[str, str]:
     return dict(sorted((_current_call_state().voice_field_user_sources or {}).items()))
-
-
-def _append_heloc_ui_transcript_snapshot() -> None:
-    """Append one NDJSON line: fields visible on the current browser stage only."""
-    try:
-        from app.conversation_transcript import append_transcript_ui_fields
-    except ImportError:
-        return
-    stage = _CONV_STAGE_TO_BROWSER.get(get_current_conversation_stage(), "unknown")
-    keys = _HELOC_UI_PAGE_FIELDS_BY_STAGE.get(stage) or _HELOC_UI_PAGE_FIELDS_BY_STAGE[
-        "unknown"
-    ]
-    snap = _heloc_ui_snap_string_values(keys)
-    if not snap:
-        return
-    try:
-        append_transcript_ui_fields(
-            None, snap, scope="page", browser_stage=stage
-        )
-    except Exception:
-        logger.debug("append_transcript_ui_fields failed", exc_info=True)
 
 
 def append_heloc_ui_transcript_final_snapshot(call_sid: str | None = None) -> None:
@@ -953,6 +937,18 @@ def get_current_conversation_stage() -> str:
         
     return "COMPLETED"
 
+def get_contact_buffer_mode() -> Optional[str]:
+    """Return 'email' or 'phone' if we're in CONTACT stage and actively asking
+    for that field, or None if not in the CONTACT stage."""
+    if get_current_conversation_stage() != "CONTACT":
+        return None
+    state = application_state
+    if not state.mobile_phone_number:
+        return "phone"
+    if not state.email_address:
+        return "email"
+    return None
+
 def get_missing_fields() -> str:
     """
     Return a structured line for the LLM: current conversation stage + missing fields.
@@ -1012,23 +1008,24 @@ def get_missing_fields() -> str:
         "CONSENT": ["agreed_to_privacy_policy", "agreed_to_commerce_communication"],
     }
 
-    # Short scripted asks per field.
+    # Short scripted asks per field. Phrased to feel like a real conversation —
+    # warm openers for first-touch questions, casual follow-ups thereafter.
     field_to_question = {
-        "address_line_1": "Can you tell me the property address?",
+        "address_line_1": "What's your property address for financing?",
         "ownership_type": VOICE_SCRIPT_OWNERSHIP_ASK,
         "occupancy_type": VOICE_SCRIPT_OCCUPANCY_ASK,
-        "primary_home_address_line_1": "What is the street address of your primary residence?",
+        "primary_home_address_line_1": "And where do you currently live? Just the street address is fine.",
         "is_currently_for_sale": VOICE_SCRIPT_FOR_SALE_ASK,
-        "annual_pre_tax_income": "What's your annual pre-tax income?",
-        "other_income": "Do you have any other income you'd like to include, like rental or investment income?",
-        "primary_source_of_income": "And what's your primary source of income — employment, self-employed, retirement, or something else?",
+        "annual_pre_tax_income": "Roughly, what's your annual income before taxes?",
+        "other_income": "Any other income to factor in — rental, investment, retirement, anything like that?",
+        "primary_source_of_income": "And how do you earn most of that — employment, self-employed, retirement, or something else?",
         "first_name": "What's your first name?",
-        "middle_name": "What's your middle name?",
-        "last_name": "What's your last name?",
+        "middle_name": "Do you have a middle name?",
+        "last_name": "And your last name?",
         "suffix": "Any suffix like Jr or Sr?",
         "date_of_birth": "And what's your date of birth?",
-        "mobile_phone_number": "What's the best mobile number to reach you?",
-        "email_address": "And what's your email address?",
+        "mobile_phone_number": "What's the best phone number to reach you on?",
+        "email_address": "And the best email for documents?",
         "agreed_to_privacy_policy": "To move forward, do you agree to our privacy policy and a soft credit pull?",
         "agreed_to_commerce_communication": "And do you agree to receive electronic communications from us?",
     }
@@ -1120,7 +1117,7 @@ def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
     so ``raw_user_input`` stays the true transcript.
     """
     call_state = _current_call_state()
-    stage = _CONV_STAGE_TO_BROWSER.get(get_current_conversation_stage(), "unknown")
+    stage = _CONV_STAGE_TO_INTAKE_ID.get(get_current_conversation_stage(), "unknown")
     missing = get_missing_fields() or ""
     data = application_state.model_dump(
         mode="json",
@@ -1153,7 +1150,7 @@ def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
 
     body_parts = [
         "[CURRENT_INTAKE_STATE — authoritative for this turn; trust over chat memory]",
-        f"browser_stage={stage}",
+        f"intake_stage={stage}",
         f"captured_fields_json={captured}",
         empathy_line,
     ]
@@ -1179,2019 +1176,35 @@ def build_intake_llm_context_string(*, max_total_chars: int = 6000) -> str:
 # confidence is below this, the tool instructs re-confirmation before
 # moving to the next question.
 # =============================================================================
-CONFIDENCE_THRESHOLD = 0.85
-# Address is recovered via autocomplete + DOM sync; allow slightly lower score
-# so callers don't get stuck in repeat loops on noisy 8 kHz STT.
-ADDRESS_CONFIDENCE_THRESHOLD = 0.75
-ADDRESS_CONFIDENCE_FIELDS = {
-    "address_line_1",
-    "city",
-    "state",
-    "zipcode",
-    "primary_home_address_line_1",
-    "primary_home_city",
-    "primary_home_state",
-    "primary_home_zipcode",
-}
+# Constants and parsers moved to agent/deterministic_parsers.py.
 
-# Fields that require explicit high-confidence consent (legal compliance).
-# Vague responses like "sure" or "I guess" are not sufficient.
-HIGH_CONFIDENCE_FIELDS = {
-    "agreed_to_privacy_policy",
-    "agreed_to_commerce_communication",
-}
 
-# =============================================================================
-# Uncertainty Markers — deterministic safety net for speech ambiguity.
-#
-# Even if the LLM self-reports high confidence, these words in the user's
-# raw speech indicate the caller was unsure. When detected, the tool
-# blocks the save and returns PENDING status, forcing re-confirmation.
-#
-# Example: "My address is 325 West Adams Blvd, or maybe it was East Adams"
-#          → "maybe" and "or" detected → PENDING, not saved.
-# =============================================================================
-UNCERTAINTY_MARKERS = [
-    "maybe",
-    "or maybe",
-    "i think",
-    "not sure",
-    "forgot",
-    "i forget",
-    "i guess",
-    "actually",
-    "not certain",
-    "probably",
-    "might be",
-    "could be",
-    "i believe",
-    "wait",
-    "hold on",
-    "let me check",
-]
 
-# Path2 pre-line: only when transcript_requests_intake_default() matches — not when
-# infer merely fails. raw_user_input omitted on default saves so uncertainty scan
-# does not block.
-DEFAULT_INTAKE_OWNERSHIP: OwnershipType = "Sole owner"
-DEFAULT_INTAKE_OCCUPANCY: OccupancyType = "Primary property"
-DEFAULT_INTAKE_FOR_SALE = False
-DEFAULT_INTAKE_OTHER_INCOME = 0
-DEFAULT_INTAKE_ANNUAL_PRE_TAX = 100_000
-DEFAULT_INTAKE_PRIMARY_SOURCE: IncomeSource = "Employed full-time"
 
-_DECLINE_TO_SPECIFY_PATTERNS = (
-    r"\bi\s+(?:don'?t|do\s+not)\s+know\b",
-    r"\bi\s+(?:don'?t|do\s+not)\s+remember\b",
-    r"\bi\s+can'?t\s+(?:remember|think|recall)\b",
-    r"\bi\s+don'?t\s+have\s+(?:any\s+)?idea\b",
-    r"\bno\s+idea\b",
-    r"\bpass\s+on\s+that\b",
-    r"\bi'?d\s+rather\s+not\s+say\b",
-    # "I'm not sure" / "I'm unsure" / "not certain" — same intent as don't know
-    r"\bi'?m\s+not\s+sure\b",
-    r"\bnot\s+sure\b",
-    r"\bi'?m\s+unsure\b",
-    r"\bnot\s+certain\b",
-    r"\bi'?m\s+not\s+certain\b",
-    r"\bdon'?t\s+have\s+(?:that\s+)?information\b",
-    r"\bi\s+don'?t\s+know\s+(?:the\s+)?answer\b",
-)
 
 
-def transcript_requests_intake_default(text: str) -> bool:
-    """True only for explicit decline / don't-know phrasing (then apply default)."""
-    if not text or not str(text).strip():
-        return False
-    low = text.lower()
-    # Hedging ("not sure about that address") — not the same as declining the question.
-    if "not sure about" in low:
-        return False
-    return any(re.search(p, low) for p in _DECLINE_TO_SPECIFY_PATTERNS)
 
 
-_SPEECH_FILLER_RE = re.compile(
-    r"^[\s.,!?]*(yeah|yep|yea|yah|okay|ok|sure|right|"
-    r"uh+|u+m+|ah+|er+|well|hmm+|oh|hey|hi|like)[\s.,!?]+",
-    re.IGNORECASE,
-)
 
-
-def normalize_answer_scaffold(text: str) -> str:
-    """Remove natural answer lead-ins + speech fillers before deterministic field inference."""
-    if not text or not str(text).strip():
-        return ""
-    s = re.sub(r"\s+", " ", str(text).strip())
-    # Strip leading speech fillers repeatedly (handles "Yeah. Um, ...")
-    # Don't strip "yes"/"no" — they are valid answers for y/n questions.
-    for _ in range(4):
-        m = _SPEECH_FILLER_RE.match(s)
-        if not m:
-            break
-        remainder = s[m.end():].strip()
-        if not remainder:
-            break
-        s = remainder
-    s = re.sub(
-        r"^\s*(?:"
-        r"it'?s|it\s+is|this\s+is|"
-        r"i\s+am|i'?m|"
-        r"my\s+answer\s+is|the\s+answer\s+is|"
-        r"that\s+would\s+be|it\s+would\s+be|"
-        r"i\s+would\s+say|probably|i\s+think"
-        r")\s+",
-        "",
-        s,
-        flags=re.IGNORECASE,
-    )
-    return s.strip()
-
-
-def transcript_is_status_check(text: str) -> bool:
-    """Presence / status pings should never be parsed as applicant data."""
-    if not text or not str(text).strip():
-        return False
-    if transcript_seeks_question_repeat(text):
-        return True
-    t = str(text).strip().lower()
-    t = re.sub(r"[^\w\s?']", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    patterns = (
-        r"\b(you there|are you there|still there|hello)\b",
-        r"\b(you good|are you good|are we good|still with me)\b",
-        r"\b(can you hear me|do you hear me|did you hear me)\b",
-        r"\b(what'?s next|next question|go ahead|continue)\b",
-        r"\b(what'?s the question|what is the question|which question)\b",
-        r"\b(repeat|say that again|say again|come again)\b",
-        r"\b(i didn'?t hear|didn'?t catch|what did you say)\b",
-        r"\b(i'?m lost|i'?m confused|what do you need|what do i do)\b",
-        r"\b(pardon|excuse me|sorry what)\b",
-        r"\b(thank you|thanks)\b",
-    )
-    return any(re.search(p, t) for p in patterns)
-
-
-def transcript_seeks_question_repeat(text: str) -> bool:
-    """True when the caller wants the current question repeated (vs a pure presence ping)."""
-    if not text or not str(text).strip():
-        return False
-    t = normalize_answer_scaffold(text).lower()
-    t = re.sub(r"[^\w\s']", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return False
-    if re.fullmatch(r"(are you there|still there|you there)(\s+there)?(\?)?", t):
-        return False
-    if re.fullmatch(r"(hello|hey|hi)(\s+there)?(\?)?", t):
-        return False
-    if re.fullmatch(r"(thank you|thanks)(\s+you)?(\?)?", t):
-        return False
-    patterns = (
-        r"\bwhat'?s\s+the\s+question\b",
-        r"\bwhat\s+is\s+the\s+question\b",
-        r"\bwhich\s+question\b",
-        r"\bwhat\s+question\b",
-        r"\bwhat\s+(?:exactly\s+)?(?:do\s+you\s+need|are\s+you\s+asking)\b",
-        r"\bwhat\s+info(?:rmation)?\s+(?:do\s+you\s+need|should\s+i\s+give)\b",
-        r"\bwhat\s+details\s+do\s+you\s+need\b",
-        r"\b(remind\s+me|tell\s+me\s+again)\b",
-        r"^\s*repeat\s*\??\s*$",
-        r"\brepeat\s+(please|that)\b",
-        r"\b(repeat|say)\s+(?:that|the\s+question|it)\s+again\b",
-        r"\bsay\s+again\b",
-        r"\bcome\s+again\b",
-        r"\bpardon\b",
-        r"\bexcuse\s+me\b",
-        r"\bsorry\s*,?\s*what\b",
-        r"\bwhat\s+did\s+you\s+say\b",
-        r"\bi\s+didn'?t\s+(?:catch|hear|get|understand)\s+(?:that|it)\b",
-        r"\bi\s+m\s+(?:lost|confused)\b",
-        r"\bwhat\s+do\s+i\s+(?:need\s+to\s+)?(?:say|answer)\b",
-        r"\bwhat\s+should\s+i\s+say\b",
-        r"\bwhat'?s\s+next\b",
-        r"\bnext\s+question\b",
-        r"\bgo\s+ahead\b",
-        r"\bcontinue\b",
-    )
-    return any(re.search(p, t) for p in patterns)
-
-
-def _is_obvious_non_answer(text: str) -> bool:
-    if not text or not str(text).strip():
-        return True
-    t = normalize_answer_scaffold(text).lower()
-    t = re.sub(r"[^\w\s']", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return True
-    patterns = (
-        r"^(sorry|sorry about that|my bad)$",
-        r"^(that'?s all|that is all|all set|never mind|nevermind)$",
-        r"^(good day|bye|goodbye)$",
-        r"^(thank you|thanks)$",
-        r"^(love in the list|lost in the list|waste items delivered)$",
-    )
-    return any(re.fullmatch(p, t) for p in patterns)
-
-
-def _ask_from_missing_line(missing_line: str) -> str:
-    m = re.search(r'Ask next:\s*"([^"]+)"', missing_line or "")
-    if not m:
-        return ""
-    return (m.group(1) or "").strip()
-
-
-def looks_like_answer_for_current_field(text: str, missing_line: str) -> bool:
-    """True when a transcript plausibly answers the current `Ask next` field."""
-    if not text or not str(text).strip():
-        return False
-    if transcript_is_status_check(text) or _is_obvious_non_answer(text):
-        return False
-
-    ask = _ask_from_missing_line(missing_line).lower()
-    if not ask:
-        return True
-
-    normalized = normalize_answer_scaffold(text)
-    low = normalized.lower()
-    bare = re.sub(r"[^\w\s']", " ", low)
-    bare = re.sub(r"\s+", " ", bare).strip()
-
-    if (
-        "on file" in ask
-        or "is that correct" in ask
-        or "is that still correct" in ask
-    ):
-        return infer_yes_no_from_transcript(normalized) is not None
-
-    if "property address" in ask:
-        if infer_property_address_from_transcript(normalized):
-            return True
-        if any(ch.isdigit() for ch in bare):
-            return True
-        address_patterns = (
-            r"\blos\s+angeles\b",
-            r"\bcalifornia\b",
-            r"\bstreet\b",
-            r"\bst\b",
-            r"\bavenue\b",
-            r"\bave\b",
-            r"\bboulevard\b",
-            r"\bblvd\b",
-            r"\broad\b",
-            r"\brd\b",
-            r"\bdrive\b",
-            r"\bdr\b",
-            r"\blane\b",
-            r"\bln\b",
-            r"\bcourt\b",
-            r"\bct\b",
-            r"\bparkway\b",
-            r"\bpkwy\b",
-            r"\bplace\b",
-            r"\bpl\b",
-        )
-        return any(re.search(p, bare) for p in address_patterns)
-
-    if "ownership type" in ask or "sole or joint" in ask:
-        if infer_ownership_from_transcript(normalized):
-            return True
-        return bool(
-            re.search(
-                r"\b(sole|soul|sol|joint|owner|one|two|won|too|loner|lonas|alone)\b",
-                bare,
-            )
-        )
-
-    if (
-        "property type" in ask
-        or "primary, secondary, or investment" in ask
-        or ("primary home" in ask and "second home" in ask)
-    ):
-        return infer_occupancy_from_transcript(normalized) is not None
-
-    if "currently for sale" in ask or "for sale" in ask:
-        return infer_for_sale_from_transcript(normalized) is not None
-
-    if "annual pre-tax income" in ask or "annual income" in ask:
-        return infer_annual_income_from_transcript(normalized) is not None
-
-    if "other income" in ask:
-        return infer_other_income_from_transcript(normalized) is not None
-
-    if "primary income source" in ask or "income source" in ask:
-        return infer_income_source_from_transcript(normalized) is not None
-
-    if "first name" in ask:
-        return bool(
-            infer_name_fields_from_transcript(
-                normalized, need_first=True, need_last=False, slot_focus="first"
-            )
-        )
-
-    if "last name" in ask:
-        return bool(
-            infer_name_fields_from_transcript(
-                normalized, need_first=False, need_last=True, slot_focus="last"
-            )
-        )
-
-    if "date of birth" in ask:
-        return infer_dob_from_transcript(normalized) is not None
-
-    if "mobile phone" in ask or "phone" in ask:
-        return infer_phone_from_transcript(normalized) is not None
-
-    if "email" in ask:
-        return infer_email_from_transcript(normalized) is not None
-
-    if "privacy policy" in ask or "electronic communications" in ask or "agree" in ask:
-        return infer_yes_no_from_transcript(normalized) is not None
-
-    return True
-
-
-def infer_ownership_from_transcript(text: str) -> Optional[OwnershipType]:
-    """Map common STT garbles of 'sole/joint owner' to enum when LLM omits ownership_type."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    # ink-whisper / phone: "Sole" → "Stole" as a short final; check each clause
-    for part in re.split(r"[.!?\n]+", text):
-        seg = part.strip().lower()
-        if not seg:
-            continue
-        seg_n = seg.rstrip(".,!?")
-        # Numeric shortcut mode for noisy telephony turns.
-        if re.fullmatch(r"(1|one|won|when)", seg_n):
-            return "Sole owner"
-        if re.fullmatch(r"(2|two|too|to)", seg_n):
-            return "Joint owner"
-        if re.search(r"\bjoint\b", seg):
-            return "Joint owner"
-        # Joint STT garbles (prefer owner-phrased to avoid spurious "join" matches).
-        if re.search(
-            r"\bjoin(?:ed|t)?\s+owners?\b"
-            r"|\bjoist\s+owners?\b"
-            r"|\bjoynt\s+owners?\b"
-            r"|\bjointed\s+owners?\b"
-            r"|\bjointly\s+owned\b"
-            r"|\bjoint\s+owners?\b"
-            r"|\bco[\s-]?owners?\b"
-            r"|\bsecondary\s+owners?\b"
-            r"|\bsecond\s+owners?\b",
-            seg,
-        ):
-            return "Joint owner"
-        if re.search(r"\bfull\s+owners?\b", seg):
-            return "Sole owner"
-        if re.fullmatch(r"stole\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"soul\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"sool.*", seg):
-            return "Sole owner"
-        if re.fullmatch(r"so,?\s*loner\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"so\s+alone\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"soul\s+or\s+not\.?", seg):
-            return "Sole owner"
-        # 8 kHz + ink-whisper: "sole" often transcribes as "phone" / "foam"
-        if re.fullmatch(r"(phone|foam)\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"toll\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"(soon|sown|sewn|zone|sol)\.?", seg):
-            return "Sole owner"
-        if re.fullmatch(r"so\s+on\.?", seg):
-            return "Sole owner"
-        # ink-whisper: "sole owner" → "Soul bonus." / similar
-        if re.search(r"\bsoul\s+bonus\b", seg):
-            return "Sole owner"
-    low = text.lower()
-    if re.fullmatch(r"\s*(1|one|won|when)\s*[.,!?]?\s*", low):
-        return "Sole owner"
-    if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
-        return "Joint owner"
-    if re.search(r"\bjoint\b", low):
-        return "Joint owner"
-    if re.search(
-        r"\b(sole|soul|soil|solo)\s*owners?\b"
-        r"|\bfull\s+owners?\b"
-        r"|so\s+alone"
-        r"|so,?\s*loner"
-        r"|stole\s*,?\s*stole"
-        r"|\bstole\s+owners?\b"
-        r"|\bso\s+owners?\b"
-        r"|\btool\s*owners?\b"
-        r"|sotool"
-        r"|\btoll\s+owners?\b"
-        r"|\bfoam\s+owners?\b"
-        r"|\bsold\s+owners?\b"
-        r"|\bsool\b"
-        r"|\bsoul\s+or\s+not\b"
-        r"|\bstore\s+owners?\b"
-        r"|\bstored\s+owner\b"
-        r"|\bstore\s+owner\b",
-        low,
-    ):
-        return "Sole owner"
-    if re.search(
-        r"\bjoin(?:ed|t)?\s+owners?\b"
-        r"|\bjoist\s+owners?\b"
-        r"|\bjoynt\s+owners?\b"
-        r"|\bjointed\s+owners?\b"
-        r"|\bjointly\s+owned\b"
-        r"|\bjoint\s+owners?\b"
-        r"|\bco[\s-]?owners?\b"        # "co-owner", "co owner"
-        r"|\bsecondary\s+owners?\b"    # "secondary owner" = co-owner in conversational use
-        r"|\bsecond\s+owners?\b",      # "second owner"
-        low,
-    ):
-        return "Joint owner"
-    return None
-
-
-def infer_occupancy_from_transcript(text: str) -> Optional[OccupancyType]:
-    """Map common STT phrasing to occupancy when LLM omits occupancy_type."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    for part in re.split(r"[.!?\n]+", text):
-        seg = part.strip().lower()
-        if not seg:
-            continue
-        seg_n = seg.rstrip(".,!?")
-        if re.fullmatch(r"(1|one|won|when)", seg_n):
-            return "Primary property"
-        if re.fullmatch(r"(2|two|too|to)", seg_n):
-            return "Secondary property"
-        if re.fullmatch(r"(3|three|tree|free)", seg_n):
-            return "Investment property"
-    low = text.lower()
-    if re.fullmatch(r"\s*(1|one|won|when)\s*[.,!?]?\s*", low):
-        return "Primary property"
-    if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
-        return "Secondary property"
-    if re.fullmatch(r"\s*(3|three|tree|free)\s*[.,!?]?\s*", low):
-        return "Investment property"
-    if re.search(
-        r"\b(investment|investor|rental\s+property|rental\s+home|income\s+property|"
-        r"non[- ]?owner\s+occupied|landlord|flip\s+(?:house|property))\b",
-        low,
-    ):
-        return "Investment property"
-    if re.search(
-        r"\bsecondary\b"
-        r"|\bsec+ondary\b"
-        r"|\bsecond\s+home\b"
-        r"|\bsecond\s+property\b"
-        r"|\bvacation\s+home\b"
-        r"|\bvacation\s+house\b"
-        r"|\bweekend\s+home\b"
-        r"|\bski\s+(?:house|home)\b",
-        low,
-    ):
-        return "Secondary property"
-    if re.search(
-        r"\bprimary\s+property\b"
-        r"|\bprimary\b"
-        r"|\bprimer\b"
-        r"|\bprime\s+home\b"
-        r"|\bfirst\s+home\b"
-        r"|\bmain\s+home\b"
-        r"|\bmain\s+residence\b"
-        r"|\bowner\s*[- ]?\s*occupied\b",
-        low,
-    ):
-        return "Primary property"
-    return None
-
-
-def _stt_confidence_triggers_reprompt(conf: Optional[float]) -> bool:
-    """True when provider confidence is in [0,1] and below env threshold."""
-    if conf is None:
-        return False
-    try:
-        f = float(conf)
-    except (TypeError, ValueError):
-        return False
-    if f < 0.0 or f > 1.0:
-        return False
-    try:
-        thresh = float(os.getenv("PATH2_STT_LOW_CONFIDENCE_REPROMPT_MAX", "0.52"))
-    except ValueError:
-        thresh = 0.52
-    return f < thresh
-
-
-def infer_occupancy_with_optional_recovery(
-    text: str,
-    recovery: Optional[str],
-) -> tuple[str, Optional[OccupancyType]]:
-    """
-    Parse occupancy from final transcript, then recovery partial, then concatenations.
-    Returns (effective_text_for_raw_user_input, occupancy or None).
-    """
-    t = (text or "").strip()
-    r = (recovery or "").strip()
-    seen: list[str] = []
-    for cand in (t, r, f"{r} {t}".strip(), f"{t} {r}".strip()):
-        if not cand or cand in seen:
-            continue
-        seen.append(cand)
-        occ = infer_occupancy_from_transcript(cand)
-        if occ is not None:
-            return cand, occ
-    return t, None
-
-
-def infer_for_sale_from_transcript(text: str) -> Optional[bool]:
-    """Map short yes/no STT to is_currently_for_sale when the model omits the tool field."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    for part in re.split(r"[.!?\n]+", text):
-        seg = part.strip().lower()
-        if not seg:
-            continue
-        seg_n = seg.rstrip(".,!?")
-        if re.fullmatch(r"(1|one|won|when)", seg_n):
-            return True
-        if re.fullmatch(r"(2|two|too|to)", seg_n):
-            return False
-    t = text.strip().lower().rstrip(".,!?")
-    if not t:
-        return None
-    if re.fullmatch(r"(1|one|won|when)", t):
-        return True
-    if re.fullmatch(r"(2|two|too|to)", t):
-        return False
-    if re.fullmatch(
-        r"(yes|yeah|yep|yup|correct|true|indeed|absolutely|certainly|definitely|sure|of course|it is|uh\s*-?\s*huh)",
-        t,
-    ):
-        return True
-    if re.fullmatch(r"(no|nope|nah|negative|false|naw|not|it'?s not|not really)", t):
-        return False
-    if len(t) <= 28 and re.match(r"^(yes|yeah|yep|yup|it is)\b", t):
-        return True
-    if len(t) <= 32 and re.match(r"^(no|nope|nah|it'?s not)\b", t):
-        return False
-    return None
-
-
-def infer_income_source_from_transcript(text: str) -> Optional[IncomeSource]:
-    """Map common spoken variants (without punctuation/dashes) to IncomeSource enum."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    for part in re.split(r"[.!?\n]+", text):
-        seg = part.strip().lower()
-        if not seg:
-            continue
-        seg_n = seg.rstrip(".,!?")
-        if re.fullmatch(r"(1|one|won|when)", seg_n):
-            return "Employed full-time"
-        if re.fullmatch(r"(2|two|too|to)", seg_n):
-            return "Employed part-time"
-        if re.fullmatch(r"(3|three|tree|free)", seg_n):
-            return "Self-employed"
-        if re.fullmatch(r"(4|four|for)", seg_n):
-            return "Retired"
-        if re.fullmatch(r"(5|five)", seg_n):
-            return "Unemployed / furloughed"
-    low = text.lower()
-    if re.fullmatch(r"\s*(1|one|won|when)\s*[.,!?]?\s*", low):
-        return "Employed full-time"
-    if re.fullmatch(r"\s*(2|two|too|to)\s*[.,!?]?\s*", low):
-        return "Employed part-time"
-    if re.fullmatch(r"\s*(3|three|tree|free)\s*[.,!?]?\s*", low):
-        return "Self-employed"
-    if re.fullmatch(r"\s*(4|four|for)\s*[.,!?]?\s*", low):
-        return "Retired"
-    if re.fullmatch(r"\s*(5|five)\s*[.,!?]?\s*", low):
-        return "Unemployed / furloughed"
-
-    if "full time" in low or "full-time" in low or "fulltime" in low or "employee" in low or "employment" in low:
-        return "Employed full-time"
-    if "part time" in low or "part-time" in low or "parttime" in low:
-        return "Employed part-time"
-    if "self employed" in low or "self-employed" in low or "business owner" in low or "contractor" in low:
-        return "Self-employed"
-    if "retired" in low or "pension" in low or "social security" in low:
-        return "Retired"
-    if "unemployed" in low or "furlough" in low or "not working" in low:
-        return "Unemployed / furloughed"
-    if "alimony" in low:
-        return "Alimony"
-    if "child support" in low:
-        return "Child support"
-    if "welfare" in low or "public assistance" in low:
-        return "Public assistance program"
-    if "child support" in low:
-        return "Child support"
-    if "public assistance" in low:
-        return "Public assistance program"
-    if "separate maintenance" in low:
-        return "Separate maintenance payments"
-    # Bare "employed" without qualifier — default to full-time (most common).
-    if re.search(r"\bemployed\b", low):
-        return "Employed full-time"
-    return None
-
-
-_WORD_NUMS: dict[str, int] = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
-    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
-    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
-    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
-    "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
-    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
-    "eighty": 80, "ninety": 90,
-    "a": 1,
-}
-
-
-def _spoken_number_to_int(text: str) -> Optional[int]:
-    """Convert English spoken number phrase to int.
-
-    Handles: "two hundred fifty thousand", "eighty thousand",
-    "one point five million", "a hundred thousand", etc.
-    Returns None on failure.
-    """
-    tokens = re.split(r"[\s,]+", text.strip().lower())
-    # Strip punctuation per-token so inputs like "million." still parse.
-    tokens = [re.sub(r"[^a-z0-9]", "", t) for t in tokens if t]
-    tokens = [t for t in tokens if t]
-    if not tokens:
-        return None
-
-    # Handle "point" for decimals before multiplier: "one point five million"
-    point_idx = None
-    for i, t in enumerate(tokens):
-        if t == "point":
-            point_idx = i
-            break
-
-    if point_idx is not None and point_idx > 0:
-        whole_part = _spoken_number_to_int(" ".join(tokens[:point_idx]))
-        frac_tokens = tokens[point_idx + 1:]
-        if not frac_tokens or whole_part is None:
-            return None
-        # fraction digit(s) before multiplier
-        mult_idx = None
-        for i, t in enumerate(frac_tokens):
-            if t in ("thousand", "million", "billion"):
-                mult_idx = i
-                break
-        if mult_idx is not None:
-            frac_word_part = frac_tokens[:mult_idx]
-            mult_word = frac_tokens[mult_idx]
-            multiplier = {"thousand": 1_000, "million": 1_000_000}.get(mult_word, 1)
-            frac_val = _spoken_number_to_int(" ".join(frac_word_part))
-            if frac_val is None:
-                return None
-            frac_digits = len(str(frac_val))
-            result = (whole_part + frac_val / (10 ** frac_digits)) * multiplier
-            return int(result)
-        return None
-
-    total = 0
-    current = 0
-    has_value = False
-    _TENS = frozenset({20, 30, 40, 50, 60, 70, 80, 90})
-
-    for t in tokens:
-        if t in _WORD_NUMS:
-            v = _WORD_NUMS[t]
-            # Shorthand: "one fifty" = 150, "two thirty" = 230.
-            # When current is 1-9 and next word is a tens (20-90), treat as X*100+Y.
-            if v in _TENS and 1 <= current <= 9:
-                current = current * 100 + v
-            else:
-                current += v
-            has_value = True
-        elif t == "hundred":
-            current = max(current, 1) * 100
-            has_value = True
-        elif t == "thousand":
-            current = max(current, 1) * 1_000
-            total += current
-            current = 0
-            has_value = True
-        elif t == "k":
-            current = max(current, 1) * 1_000
-            total += current
-            current = 0
-            has_value = True
-        elif t == "million":
-            current = max(current, 1) * 1_000_000
-            total += current
-            current = 0
-            has_value = True
-        elif t in ("and", "dollars", "dollar", "bucks", "per", "year", "annually"):
-            continue
-        else:
-            return None  # unknown token — bail
-
-    if not has_value:
-        return None
-    total += current
-    return total if total > 0 else None
-
-
-# Spoken-income heuristics can exceed 100M (e.g. "two two five million" → 225M).
-_MAX_INFERRED_ANNUAL_INCOME = 999_999_999
-# Below CONFIDENCE_THRESHOLD so update_application_state requires explicit confirmation.
-_INCOME_AMBIGUOUS_STT_CONFIDENCE = 0.82
-
-
-def infer_annual_income_meta(text: str) -> tuple[Optional[int], bool]:
-    """Return (annual income in USD or None, fragile_stt_repair).
-
-    ``fragile_stt_repair`` is True when the value depended on a brittle
-    spoken-money rule (``one one five``→1.5M or digit-style ``two two
-    five``+million→225M). Callers should pass ``confidence_score`` of
-    ``_INCOME_AMBIGUOUS_STT_CONFIDENCE`` (below ``CONFIDENCE_THRESHOLD``) so the
-    user confirms before save.
-    """
-    if not text or not str(text).strip():
-        return (None, False)
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return (None, False)
-    low = text.lower().strip()
-    # Keep decimal dot in numeric forms (1.5m), but remove sentence punctuation.
-    low = low.replace(",", " ")
-    low = re.sub(r"(?<!\d)\.(?!\d)", " ", low)
-    low = re.sub(r"[?!]", " ", low)
-    low = re.sub(r"\s+", " ", low).strip()
-    # Common STT garble on phone audio: "one million" -> "one medium".
-    low = re.sub(r"\b(medium|millian|millon)\b", "million", low)
-    # Common STT garble: "my annual" -> "manual".
-    low = re.sub(r"\bmanual\b", "annual", low)
-    stripped = low
-    stripped = re.sub(
-        r"\b(my|the|our|this|that|it)\b",
-        " ",
-        stripped,
-    )
-    stripped = re.sub(
-        r"\b(annual|yearly|year)\s+(pre\s*-?\s*tax|pretax)?\s*income\b",
-        " ",
-        stripped,
-    )
-    stripped = re.sub(
-        r"\b(pre\s*-?\s*tax|pretax|income|salary|is|it'?s|about|around|"
-        r"could\s+be|would\s+be|might\s+be|maybe|probably|per\s+annum|"
-        r"per\s+year|a\s+year|annually)\b",
-        " ",
-        stripped,
-    )
-    stripped = re.sub(r"\s+", " ", stripped).strip()
-
-    _millionish = r"(?=\s*(?:million|\bm\b|\bk\b))"
-
-    # "two two five million" / "… m" / "… k" = three digit words then multiplier
-    # (225M / 225K). Do NOT treat as dropped "point" (that would be 2.5M — wrong).
-    if re.search(rf"\btwo\s+two\s+five\b{_millionish}", low):
-        if re.search(r"\btwo\s+two\s+five\s+million\b", low) or re.search(
-            r"\btwo\s+two\s+five\s+m\b", low
-        ):
-            val = 225 * 1_000_000
-        elif re.search(r"\btwo\s+two\s+five\s+k\b", low):
-            val = 225 * 1_000
-        else:
-            val = None
-        if val is not None and 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
-            return (val, True)
-
-    # STT drops "point": "one one five million" -> sums 1+1+5 then × million (wrong).
-    one_one_five_point_sub = False
-    if re.search(rf"\bone\s+one\s+five\b{_millionish}", low):
-        one_one_five_point_sub = True
-        low = re.sub(rf"\bone\s+one\s+five\b{_millionish}", "one point five", low)
-
-    # --- suffix shorthand: "1M", "1.5m", "80K", "80 k" ---
-    m = re.search(r"(\d+(?:\.\d+)?)\s*m\b", low)
-    if m:
-        val = int(float(m.group(1)) * 1_000_000)
-        if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
-            return (val, one_one_five_point_sub)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*k\b", low)
-    if m:
-        val = int(float(m.group(1)) * 1_000)
-        if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
-            return (val, one_one_five_point_sub)
-    m = re.fullmatch(r"([a-z\s-]+)\s+k\b", low)
-    if m:
-        spoken_k = _spoken_number_to_int(m.group(1).replace("-", " "))
-        if spoken_k is not None:
-            val = spoken_k * 1_000
-            if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
-                return (val, one_one_five_point_sub)
-
-    # --- raw digit string: "1-0-0-0-0-0" / "1000000" / "100000" ---
-    digits_only = re.sub(r"\D", "", low)
-    if digits_only:
-        try:
-            val = int(digits_only)
-            if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
-                return (val, one_one_five_point_sub)
-        except ValueError:
-            pass
-
-    # --- spoken digit-sequence: "one zero zero zero zero zero" ---
-    digit_word_map = {
-        "zero": "0",
-        "oh": "0",
-        "o": "0",
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-    }
-    wtokens = [re.sub(r"[^a-z0-9]", "", t) for t in stripped.split()]
-    if wtokens and all(t in digit_word_map for t in wtokens):
-        seq = "".join(digit_word_map[t] for t in wtokens).lstrip("0") or "0"
-        try:
-            val = int(seq)
-            if 0 < val <= _MAX_INFERRED_ANNUAL_INCOME:
-                return (val, one_one_five_point_sub)
-        except ValueError:
-            pass
-
-    # --- spoken words: "eighty thousand", "one point five million" ---
-    spoken = _spoken_number_to_int(low) or _spoken_number_to_int(stripped)
-    if spoken is not None and spoken >= 1_000 and spoken <= _MAX_INFERRED_ANNUAL_INCOME:
-        return (spoken, one_one_five_point_sub)
-
-    # --- contextual bare number: "eighty" -> 80_000 in HELOC income context ---
-    # Small bare numbers (1-999) likely mean thousands.
-    if spoken is not None and 1 <= spoken <= 999:
-        scaled = spoken * 1_000
-        if 0 < scaled <= _MAX_INFERRED_ANNUAL_INCOME:
-            return (scaled, one_one_five_point_sub)
-
-    return (None, False)
-
-
-def infer_annual_income_from_transcript(text: str) -> Optional[int]:
-    """Map spoken annual income to integer dollars.
-
-    Handles: raw digits ("100000"), suffix shorthand ("80K", "1.5M"),
-    spoken words ("eighty thousand", "two hundred fifty thousand"),
-    and contextual bare numbers ("eighty" -> 80000 in HELOC context).
-    """
-    value, _meta = infer_annual_income_meta(text)
-    return value
-
-
-def infer_other_income_from_transcript(text: str) -> Optional[int]:
-    """Infer optional other income; map clear negatives to 0."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    low = text.lower().strip()
-    normalized = re.sub(r"[^\w\s]", " ", low)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    # Repeated negatives from 8kHz STT like "no, no" should still map to zero.
-    if re.fullmatch(r"(no|nope|none|nothing|zero|0)(\s+(no|nope|none|nothing|zero|0))*", normalized):
-        return 0
-    if normalized in {
-        "no other income",
-        "no any other income",
-        "none",
-        "nope",
-        "no",
-        "zero",
-        "0",
-        "nothing",
-    }:
-        return 0
-    # Spoken negatives that omit bare "no" (STT / natural phrasing).
-    _other_income_negative_phrases = (
-        "not at this moment",
-        "not at the moment",
-        "not right now",
-        "not currently",
-        "nothing right now",
-        "nothing else right now",
-        "no additional income",
-        "dont have any other",
-        "don't have any other",
-        "do not have any other",
-        "dont have other",
-        "don't have other",
-        "no other",
-        "not any other",
-    )
-    if any(p in normalized for p in _other_income_negative_phrases):
-        return 0
-    # Fold apostrophes so "don't" / "I'm" style STT matches phrase list entries.
-    apostrophe_fold = re.sub(r"[''`]", "", normalized)
-    if any(p in apostrophe_fold for p in _other_income_negative_phrases):
-        return 0
-    if "dont have any other" in apostrophe_fold or "do not have any other" in apostrophe_fold:
-        return 0
-    # Punctuation strip splits "don't" → "don t" before apostrophe removal.
-    contraction_fold = re.sub(r"\bdon\s+t\b", "dont", normalized, flags=re.IGNORECASE)
-    contraction_fold = re.sub(r"\bdo\s+not\b", "donot", contraction_fold, flags=re.IGNORECASE)
-    if "dont have any other" in contraction_fold or "donot have any other" in contraction_fold:
-        return 0
-    return infer_annual_income_from_transcript(text)
-
-
-_MONTH_NAMES: dict[str, int] = {
-    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
-    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6,
-    "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
-    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
-}
-_MONTH_PAT = "|".join(_MONTH_NAMES.keys())
-
-# Regex fragments for infer_partial_dob_month_day (must match previous inlined patterns exactly).
-_DOB_PARTIAL_SPOKEN_ORDINALS_ALT_RE = (
-    "first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
-    "eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|"
-    "seventeenth|eighteenth|nineteenth|twentieth|"
-    "twenty\\s*-?\\s*first|twenty\\s*-?\\s*second|twenty\\s*-?\\s*third|"
-    "twenty\\s*-?\\s*fourth|twenty\\s*-?\\s*fifth|twenty\\s*-?\\s*sixth|"
-    "twenty\\s*-?\\s*seventh|twenty\\s*-?\\s*eighth|twenty\\s*-?\\s*ninth|"
-    "thirtieth|thirty\\s*-?\\s*first"
-)
-_DOB_PARTIAL_CARDINAL_DAY_WORDS_RE = (
-    r"one|two|three|four|five|six|seven|eight|nine|ten|"
-    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
-    r"eighteen|nineteen|twenty|twenty\s*-?\s*(?:one|two|three|four|five|six|seven|eight|nine)|"
-    r"thirty|thirty\s*-?\s*one"
-)
-_DOB_SPOKEN_YEAR_PREFIX_RE = "eighteen|nineteen|twenty"
-
-_ORDINAL_WORDS: dict[str, str] = {
-    "first": "one",
-    "second": "two",
-    "third": "three",
-    "fourth": "four",
-    "fifth": "five",
-    "sixth": "six",
-    "seventh": "seven",
-    "eighth": "eight",
-    "ninth": "nine",
-    "tenth": "ten",
-    "eleventh": "eleven",
-    "twelfth": "twelve",
-    "thirteenth": "thirteen",
-    "fourteenth": "fourteen",
-    "fifteenth": "fifteen",
-    "sixteenth": "sixteen",
-    "seventeenth": "seventeen",
-    "eighteenth": "eighteen",
-    "nineteenth": "nineteen",
-    "twentieth": "twenty",
-    "thirtieth": "thirty",
-}
-
-
-def _parse_spoken_day(value: str) -> Optional[int]:
-    cleaned = re.sub(r"[^a-z0-9\s-]", " ", value.lower())
-    cleaned = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", cleaned)
-    cleaned = cleaned.replace("-", " ")
-    tokens = [
-        _ORDINAL_WORDS.get(token, token)
-        for token in re.split(r"\s+", cleaned.strip())
-        if token
-    ]
-    if not tokens:
-        return None
-    if len(tokens) == 1 and tokens[0].isdigit():
-        day = int(tokens[0])
-    else:
-        day = _spoken_number_to_int(" ".join(tokens))
-    if day is not None and 1 <= day <= 31:
-        return day
-    return None
-
-
-def _parse_spoken_year(value: str) -> Optional[int]:
-    cleaned = re.sub(r"[^a-z0-9\s-]", " ", value.lower()).replace("-", " ")
-    tokens = [t for t in re.split(r"\s+", cleaned.strip()) if t]
-    if not tokens:
-        return None
-    digits = "".join(t for t in tokens if t.isdigit())
-    if len(digits) == 4 and all(t.isdigit() for t in tokens):
-        year = int(digits)
-        return year if 1900 <= year <= 2010 else None
-    if len(tokens) == 1 and tokens[0].isdigit():
-        year = int(tokens[0])
-        return year if 1900 <= year <= 2010 else None
-
-    if len(tokens) >= 2:
-        prefix = _spoken_number_to_int(tokens[0])
-        suffix = _spoken_number_to_int(" ".join(tokens[1:]))
-        if prefix in {19, 20} and suffix is not None and 0 <= suffix <= 99:
-            year = prefix * 100 + suffix
-            if 1900 <= year <= 2010:
-                return year
-
-    year = _spoken_number_to_int(" ".join(tokens))
-    if year is not None and 1900 <= year <= 2010:
-        return year
-    return None
-
-
-def infer_dob_from_transcript(text: str) -> Optional[str]:
-    """Parse DOB from numeric (MM/DD/YYYY) or spoken ('January 5th 1990') forms."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-
-    # Numeric: 01/05/1990 or 01-05-1990
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", text)
-    if m:
-        mm, dd, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
-            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
-
-    low = text.lower().strip()
-    # Deepgram/phone garble: "first Jan ..." can arrive as "first ten ...".
-    low = re.sub(
-        rf"\b(first|1st)\s+ten\s+(?={_DOB_SPOKEN_YEAR_PREFIX_RE}|\d{{4}}\b)",
-        r"\1 jan ",
-        low,
-    )
-
-    # Spoken: "January 5th 1990", "march 15 1985"
-    m = re.search(
-        rf"\b({_MONTH_PAT})\s+(\d{{1,2}})\s*(?:st|nd|rd|th)?\s*,?\s*(\d{{4}})\b",
-        low,
-    )
-    if m:
-        mm = _MONTH_NAMES[m.group(1)]
-        dd, yyyy = int(m.group(2)), int(m.group(3))
-        if 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
-            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
-
-    # Reversed: "5th January 1990"
-    m = re.search(
-        rf"\b(\d{{1,2}})\s*(?:st|nd|rd|th)?\s+({_MONTH_PAT})\s+(\d{{4}})\b",
-        low,
-    )
-    if m:
-        dd = int(m.group(1))
-        mm = _MONTH_NAMES[m.group(2)]
-        yyyy = int(m.group(3))
-        if 1 <= dd <= 31 and 1900 <= yyyy <= 2010:
-            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
-
-    # Fully spoken: "January first nineteen ninety two"
-    m = re.search(
-        rf"\b({_MONTH_PAT})\s+([a-z0-9\s-]+?)\s+((?:{_DOB_SPOKEN_YEAR_PREFIX_RE}|\d{{4}})\b[a-z0-9\s-]*)",
-        low,
-    )
-    if m:
-        mm = _MONTH_NAMES[m.group(1)]
-        dd = _parse_spoken_day(m.group(2))
-        yyyy = _parse_spoken_year(m.group(3))
-        if dd is not None and yyyy is not None:
-            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
-
-    # Fully spoken reversed: "first January nineteen ninety two"
-    m = re.search(
-        rf"\b([a-z0-9\s-]+?)\s+({_MONTH_PAT})\s+((?:{_DOB_SPOKEN_YEAR_PREFIX_RE}|\d{{4}})\b[a-z0-9\s-]*)",
-        low,
-    )
-    if m:
-        dd = _parse_spoken_day(m.group(1))
-        mm = _MONTH_NAMES[m.group(2)]
-        yyyy = _parse_spoken_year(m.group(3))
-        if dd is not None and yyyy is not None:
-            return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
-
-    return None
-
-
-PARTIAL_DOB_REPROMPT = (
-    "Could you also include the year? For example, month, day, and four-digit year."
-)
-
-
-def infer_partial_dob_month_day(text: str) -> bool:
-    if not text or not str(text).strip():
-        return False
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return False
-    low = text.lower().strip()
-
-    if re.search(rf"\b({_MONTH_PAT})\s+\d{{1,2}}\s*(?:st|nd|rd|th)?\s*\.?$", low):
-        return True
-    if re.search(rf"\b\d{{1,2}}\s*(?:st|nd|rd|th)?\s+({_MONTH_PAT})\s*\.?$", low):
-        return True
-    if re.search(
-        rf"\b({_MONTH_PAT})\s+(?:{_DOB_PARTIAL_SPOKEN_ORDINALS_ALT_RE})\s*\.?$", low
-    ):
-        return True
-    if re.search(
-        rf"\b(?:{_DOB_PARTIAL_SPOKEN_ORDINALS_ALT_RE})\s+(?:of\s+)?({_MONTH_PAT})\s*\.?$", low
-    ):
-        return True
-
-    if re.fullmatch(rf"in\s+({_MONTH_PAT})\s*\.?", low):
-        return True
-    if re.fullmatch(rf"({_MONTH_PAT})\s*\.?", low):
-        return True
-
-    dm = re.search(
-        rf"\b(?:{_DOB_PARTIAL_CARDINAL_DAY_WORDS_RE})\s+(?:{_MONTH_PAT})\b", low
-    )
-    if dm:
-        tail = low[dm.end() :].strip().strip(".!?")
-        if not tail:
-            return True
-        if re.match(r"^(?:19|20)\d{2}\b", tail):
-            return False
-        if re.match(rf"^(?:{_DOB_SPOKEN_YEAR_PREFIX_RE})\b", tail):
-            return False
-        return True
-
-    return False
-
-
-PARTIAL_MOBILE_PHONE_REPROMPT = (
-    "Please say your full 10-digit mobile phone number."
-)
-
-
-def infer_phone_from_transcript(text: str) -> Optional[str]:
-    """Parse US phone from spoken digits."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    d = re.sub(r"\D", "", text)
-    if len(d) == 11 and d.startswith("1"):
-        d = d[1:]
-    if len(d) == 10:
-        return d
-    spoken = _spoken_digit_sequence_to_digits(text)
-    if len(spoken) == 11 and spoken.startswith("1"):
-        spoken = spoken[1:]
-    if len(spoken) == 10:
-        return spoken
-    return None
-
-
-def _spoken_digit_sequence_to_digits(text: str) -> str:
-    digit_word_map = {
-        "zero": "0",
-        "oh": "0",
-        "o": "0",
-        "one": "1",
-        "won": "1",
-        "two": "2",
-        "too": "2",
-        "to": "2",
-        "three": "3",
-        "four": "4",
-        "for": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "ate": "8",
-        "nine": "9",
-    }
-    cleaned = normalize_answer_scaffold(text)
-    cleaned = re.sub(r"\b(area|code|phone|number|is|my|mobile|cell)\b", " ", cleaned.lower())
-    tokens = re.findall(r"[a-z]+|\d", cleaned)
-    digits: list[str] = []
-    for token in tokens:
-        if token.isdigit():
-            digits.append(token)
-        elif token in digit_word_map:
-            digits.append(digit_word_map[token])
-        else:
-            return ""
-    return "".join(digits)
-
-
-def get_contact_buffer_mode() -> Optional[Literal["phone", "email"]]:
-    """Contact stage: buffer STT finals while caller spells phone or email."""
-    if get_current_conversation_stage() != "CONTACT":
-        return None
-    if application_state.mobile_phone_number is None:
-        return "phone"
-    if application_state.email_address is None:
-        return "email"
-    return None
-
-
-_SPOKEN_EMAIL_NUM_AUX = frozenset({"hundred", "thousand", "million", "and"})
-# Tokens handled by ``_spoken_digit_sequence_to_digits`` (single-digit spell-out only).
-_SPOKEN_EMAIL_SPELL_DIGIT_WORDS = frozenset(
-    {
-        "zero",
-        "oh",
-        "o",
-        "one",
-        "won",
-        "two",
-        "too",
-        "to",
-        "three",
-        "four",
-        "for",
-        "five",
-        "six",
-        "seven",
-        "eight",
-        "ate",
-        "nine",
-    }
-)
-
-
-def _chunk_is_digit_spell_only(tokens: list[str]) -> bool:
-    """True when every token is a single-digit spoken word (not eighty, twelve, …)."""
-    if not tokens:
-        return False
-    for t in tokens:
-        tok = re.sub(r"[^a-z0-9]", "", (t or "").lower())
-        if not tok:
-            return False
-        if tok.isdigit():
-            if len(tok) != 1:
-                return False
-            continue
-        if tok not in _SPOKEN_EMAIL_SPELL_DIGIT_WORDS:
-            return False
-    return True
-
-
-def _token_is_spoken_email_number_piece(t: str) -> bool:
-    tok = re.sub(r"[^a-z0-9]", "", (t or "").lower())
-    if not tok:
-        return False
-    if tok.isdigit():
-        return True
-    return tok in _WORD_NUMS or tok in _SPOKEN_EMAIL_NUM_AUX
-
-
-def _expand_spoken_numbers_in_email_segment(segment: str) -> str:
-    """
-    Turn spoken numbers in an email local-part into digits before '@' / space stripping.
-
-    Examples: ``eighty four`` → ``84``; digit-by-digit ``eight four`` → ``84``.
-    """
-    segment = (segment or "").strip().replace("-", " ")
-    if not segment:
-        return segment
-    tokens = re.findall(r"\S+", segment)
-    out: list[str] = []
-    i = 0
-    n = len(tokens)
-    while i < n:
-        if not _token_is_spoken_email_number_piece(tokens[i]):
-            out.append(tokens[i])
-            i += 1
-            continue
-        max_span = min(14, n - i)
-        replaced = False
-        for length in range(max_span, 0, -1):
-            chunk = tokens[i : i + length]
-            if not all(_token_is_spoken_email_number_piece(t) for t in chunk):
-                continue
-            phrase = " ".join(chunk)
-            num_val: Optional[int] = None
-            digit_run = ""
-
-            if _chunk_is_digit_spell_only(chunk):
-                digit_run = _spoken_digit_sequence_to_digits(phrase)
-                if digit_run:
-                    out.append(digit_run)
-                    i += length
-                    replaced = True
-                    break
-                num_val = _spoken_number_to_int(phrase)
-            else:
-                num_val = _spoken_number_to_int(phrase)
-                if num_val is None:
-                    digit_run = _spoken_digit_sequence_to_digits(phrase)
-
-            if num_val is not None:
-                out.append(str(num_val))
-                i += length
-                replaced = True
-                break
-            if digit_run:
-                out.append(digit_run)
-                i += length
-                replaced = True
-                break
-        if not replaced:
-            out.append(tokens[i])
-            i += 1
-    return " ".join(out)
-
-
-def _normalize_spoken_email_domain(rhs: str) -> str:
-    """Collapse ``g mail dot``, ``yahoo dot co dot uk``, ``gmail period com``, etc."""
-    s = (rhs or "").strip().lower()
-    if not s:
-        return s
-    changed = True
-    while changed:
-        changed = False
-        ns = re.sub(r"\s+(?:dot|period)\s+", ".", s)
-        if ns != s:
-            s = ns
-            changed = True
-    s = re.sub(r"\s+(?:dot|period)\s*$", "", s).strip()
-    s = re.sub(r"\s+", "", s)
-    if s and "." not in s:
-        s = f"{s}.com"
-    return s
-
-
-def _normalize_spoken_email_local(lhs: str) -> str:
-    expanded = _expand_spoken_numbers_in_email_segment((lhs or "").strip())
-    raw_l = expanded.strip().lower()
-    raw_l = (
-        raw_l.replace(" dot ", ".")
-        .replace(" period ", ".")
-        .replace(" underscore ", "_")
-        .replace(" dash ", "-")
-        .replace(" hyphen ", "-")
-    )
-    return raw_l.replace(" ", "")
-
-
-def _normalize_spoken_email_separator_phrases(raw: str) -> str:
-    """Map spoken @-synonyms so split/join sees a single `` at `` delimiter."""
-    s = re.sub(r"\s+", " ", (raw or "").strip())
-    low = s.lower()
-    low = re.sub(r"\bat\s+the\s+rate\b", " at ", low)
-    low = re.sub(r"\bat\s+sign\b", " at ", low)
-    return low
-
-
-def infer_email_from_transcript(text: str) -> Optional[str]:
-    """Parse email from typed form or spoken 'at'/'dot' variants."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    raw = _normalize_spoken_email_separator_phrases(text.strip().lower())
-    if " at " in raw:
-        left, right = raw.split(" at ", 1)
-        local = _normalize_spoken_email_local(left).rstrip(".")
-        normalized = f"{local}@{_normalize_spoken_email_domain(right)}"
-    elif "@" in raw:
-        lp, rp = raw.split("@", 1)
-        local = _normalize_spoken_email_local(lp).rstrip(".")
-        normalized = f"{local}@{_normalize_spoken_email_domain(rp)}"
-    else:
-        return None
-
-    normalized = normalized.rstrip(".,;:!?")
-    if STRICT_EMAIL_REGEX.match(normalized):
-        return normalized
-    return None
-
-
-def _normalize_email_for_tool_compare(addr: str) -> str:
-    return (addr or "").strip().lower().rstrip(".")
-
-
-def _email_save_matches_transcript(raw_user_input: Optional[str], saved: str) -> bool:
-    """Require parsed spoken email to match saved value — stops LLM invented addresses."""
-    if not raw_user_input or not saved:
-        return False
-    parsed = infer_email_from_transcript(raw_user_input)
-    if not parsed:
-        return False
-    return _normalize_email_for_tool_compare(parsed) == _normalize_email_for_tool_compare(
-        str(saved)
-    )
 
 
 def _spoken_email_evidence(raw_user_input: Optional[str]) -> bool:
-    """True when caller speech plausibly contained an email — blocks LLM-invented addresses."""
-    if not raw_user_input or not str(raw_user_input).strip():
+    """True if the raw transcript contains a plausible email utterance (@ or spoken at…dot)."""
+    if not raw_user_input:
         return False
-    low = str(raw_user_input).strip().lower()
+    low = raw_user_input.lower()
     if "@" in low:
         return True
-    if " at " in low:
-        return True
-    if re.search(r"\bat\s+the\s+rate\b", low):
-        return True
-    if re.search(r"\bat\s+sign\b", low):
-        return True
-    if re.search(r"\bat\s+[\w.+-]+\s+dot\s+", low):
-        return True
-    return False
+    return bool(re.search(r"\bat\b.*\bdot\b", low))
 
 
-def _spoken_dob_year_in_transcript(raw_user_input: str, yyyy: int) -> bool:
-    """True when transcript plausibly mentions ``yyyy`` (digits or spoken)."""
-    if yyyy < 1900 or yyyy > 2010:
-        return True
-    raw = str(raw_user_input).strip()
-    if str(yyyy) in raw:
-        return True
-    low = normalize_answer_scaffold(raw).lower()
-    low = re.sub(r"[^\w\s]", " ", low)
-    low = re.sub(r"\s+", " ", low).strip()
-    words = low.split()
-    for i in range(len(words)):
-        for j in range(i + 1, min(i + 8, len(words) + 1)):
-            frag = " ".join(words[i:j])
-            if _parse_spoken_year(frag) == yyyy:
-                return True
-    yy = yyyy % 100
-    yy_pat = rf"\b{yy:02d}\b|\b{yy}\b"
-    if re.search(yy_pat, low):
-        century = yyyy // 100
-        if century == 19 and re.search(r"\bnineteen\b", low):
-            return True
-        if century == 20 and re.search(r"\btwenty\b", low):
-            return True
-    return False
-
-
-def _month_tokens_present_for_dob(mm: int, low_sp: str) -> bool:
-    keys = [k for k, v in _MONTH_NAMES.items() if v == mm]
-    return any(re.search(rf"\b{re.escape(k)}\b", low_sp) for k in keys)
-
-
-def _day_token_evidence_for_dob(dd: int, low_for_day: str) -> bool:
-    tokens = [t for t in re.split(r"\s+", low_for_day) if t]
-    for tok in tokens:
-        m = re.match(r"^(\d{1,2})(?:st|nd|rd|th)?$", tok, re.I)
-        if m and int(m.group(1)) == dd:
-            return True
-        if _parse_spoken_day(tok) == dd:
-            return True
-    return False
-
-
-def _transcript_supports_saved_dob(raw_user_input: Optional[str], dob: str) -> bool:
-    """Block LLM/tool hallucinated DOB when speech lacks month, day, and year cues."""
-    if not raw_user_input or not str(raw_user_input).strip() or not dob:
+def _email_save_matches_transcript(raw_user_input: Optional[str], email: str) -> bool:
+    """True if the email the LLM wants to save matches what the deterministic parser
+    extracts from the raw transcript."""
+    parsed = infer_email_from_transcript(raw_user_input or "")
+    if parsed is None:
         return False
-    parts = dob.strip().split("/")
-    if len(parts) != 3:
-        return True
-    try:
-        mm, dd, yyyy = int(parts[0]), int(parts[1]), int(parts[2])
-    except ValueError:
-        return True
-
-    raw = str(raw_user_input).strip()
-    scaffolded = normalize_answer_scaffold(raw) or raw
-    low_sp = scaffolded.lower()
-    low_sp = re.sub(r"\s+", " ", re.sub(r"[^\w\s/\.-]", " ", low_sp)).strip()
-
-    for sep in ("/", "-", "."):
-        esc = re.escape(sep)
-        if re.search(
-            rf"\b{mm}\s*{esc}\s*{dd}\s*{esc}\s*{yyyy}\b",
-            low_sp,
-        ) or re.search(
-            rf"\b{mm:02d}\s*{esc}\s*{dd:02d}\s*{esc}\s*{yyyy}\b",
-            low_sp,
-        ):
-            return True
-
-    if not _month_tokens_present_for_dob(mm, low_sp):
-        return False
-    if not _spoken_dob_year_in_transcript(raw, yyyy):
-        return False
-
-    low_for_day = re.sub(r"\b(?:19|20)\d{2}\b", " ", low_sp)
-    low_for_day = re.sub(r"\s+", " ", low_for_day).strip()
-    return _day_token_evidence_for_dob(dd, low_for_day)
-
-
-def infer_property_address_from_transcript(text: str) -> Optional[str]:
-    """
-    Parse likely street line from noisy STT.
-    Requires leading street number to avoid accidental captures.
-    """
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    low = text.lower().strip()
-    # Normalize punctuation/noise around the leading street number.
-    low = re.sub(r"[^\w\s,.-]", " ", low)
-    low = re.sub(r"\s+", " ", low).strip()
-    had_comma = "," in low
-    low_number_scan = re.sub(r"[,.-]+", " ", low)
-    low_number_scan = re.sub(r"\s+", " ", low_number_scan).strip()
-    words_to_digits = re.match(
-        r"^((?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|"
-        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
-        r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
-        r"hundred)\s+){1,8})([a-z].*)$",
-        low_number_scan,
-    )
-    if words_to_digits:
-        g1 = words_to_digits.group(1).strip()
-        g2 = (words_to_digits.group(2) or "").strip()
-        merged_phrase = g1
-        tail = g2
-        if g2:
-            parts2 = g2.split()
-            if parts2:
-                first_w = re.sub(r"[^a-z0-9]", "", parts2[0]).lower()
-                if first_w in _WORD_NUMS:
-                    combined = _spoken_number_to_int(f"{g1} {first_w}".strip())
-                    head_only = _spoken_number_to_int(g1)
-                    if combined is not None and (
-                        head_only is None or combined != head_only
-                    ):
-                        merged_phrase = f"{g1} {first_w}".strip()
-                        tail = " ".join(parts2[1:]).strip()
-        digit_seq = _spoken_digit_sequence_to_digits(
-            merged_phrase.replace("-", " ")
-        )
-        if digit_seq:
-            number = int(digit_seq)
-        else:
-            number = _spoken_number_to_int(merged_phrase.replace("-", " "))
-        if number is not None:
-            low = f"{number} {tail}".strip()
-    low = re.sub(r"\s+", " ", low).strip()
-    low = re.sub(r"\b(uh|um|ah|er|like)\b", " ", low)
-    low = re.sub(r"\s+", " ", low).strip()
-    if re.search(r"\b(lost|list|students|items|below|where)\b", low):
-        return None
-    m = re.match(r"^\s*(\d{1,6})[\s,.-]+([a-z0-9\s.-]{3,})", low)
-    if not m:
-        return None
-    num = m.group(1)
-    rest = m.group(2)
-    rest = re.split(r",|\bin\s+[a-z]+\b|\bcalifornia\b|\bca\b", rest, maxsplit=1)[0].strip()
-    if not rest:
-        return None
-    rest = re.sub(r"\bblvd\b", "boulevard", rest)
-    rest = re.sub(r"\bave\b", "avenue", rest)
-    rest = re.sub(r"\brd\b", "road", rest)
-    rest = re.sub(r"\bdr\b", "drive", rest)
-    rest = re.sub(r"\bln\b", "lane", rest)
-    rest = re.sub(r"\bct\b", "court", rest)
-    rest = re.sub(r"\bpkwy\b", "parkway", rest)
-    rest = re.sub(r"\bst\b", "street", rest)
-    ordinal_word_to_num = {
-        "first": "1st",
-        "second": "2nd",
-        "third": "3rd",
-        "fourth": "4th",
-        "fifth": "5th",
-        "sixth": "6th",
-        "seventh": "7th",
-        "eighth": "8th",
-        "ninth": "9th",
-        "tenth": "10th",
-        "eleventh": "11th",
-        "twelfth": "12th",
-        "thirteenth": "13th",
-        "fourteenth": "14th",
-        "fifteenth": "15th",
-        "sixteenth": "16th",
-        "seventeenth": "17th",
-        "eighteenth": "18th",
-        "nineteenth": "19th",
-        "twentieth": "20th",
-    }
-    for w, n in ordinal_word_to_num.items():
-        rest = re.sub(rf"\b{w}\b", n, rest)
-    rest = re.sub(r"\s+", " ", rest).strip(" .,-")
-    if had_comma:
-        street_line = re.match(
-            r"^(.+?\b(?:street|avenue|boulevard|road|drive|lane|court|parkway|place)\b)",
-            rest,
-        )
-        if street_line:
-            rest = street_line.group(1).strip()
-    if re.fullmatch(r"(los angeles|california|ca)", rest):
-        return None
-    if len(rest) < 3:
-        return None
-    rest_l = rest.lower()
-    if re.fullmatch(
-        r"(zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|"
-        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
-        r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)",
-        rest_l,
-    ):
-        return None
-    formatted_tokens: list[str] = []
-    for token in rest.split():
-        if re.search(r"\d", token):
-            formatted_tokens.append(token.lower())
-        else:
-            formatted_tokens.append(token.capitalize())
-    return f"{num} {' '.join(formatted_tokens)}"
-
-
-_STATE_NAME_TO_ABBR = {
-    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
-    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
-    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
-    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
-    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
-    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
-    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
-    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
-    "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH",
-    "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI",
-    "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
-    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
-    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
-}
-
-
-def _state_abbr_from_text(text: str) -> Optional[str]:
-    normalized = re.sub(r"[^a-zA-Z\s]", " ", text or "")
-    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
-    for name, abbr in _STATE_NAME_TO_ABBR.items():
-        if re.search(rf"\b{re.escape(name)}\b", normalized):
-            return abbr
-    m = re.search(r"\b([A-Z]{2})\b\s*$", (text or "").strip().upper())
-    if m and m.group(1) in set(_STATE_NAME_TO_ABBR.values()):
-        return m.group(1)
-    return None
-
-
-def infer_property_city_state_from_transcript(text: str) -> dict[str, str]:
-    if not text or not str(text).strip():
-        return {}
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return {}
-    out: dict[str, str] = {}
-
-    parts = [p.strip(" .") for p in re.split(r",", str(text)) if p.strip(" .")]
-    if len(parts) >= 2:
-        city_part = parts[1]
-        state_from_city_part = _state_abbr_from_text(city_part)
-        city = city_part
-        if state_from_city_part:
-            out["state"] = state_from_city_part
-            city = re.sub(r"\b[A-Z]{2}\b", " ", city, flags=re.IGNORECASE)
-            for state_name in _STATE_NAME_TO_ABBR:
-                city = re.sub(rf"\b{re.escape(state_name)}\b", " ", city, flags=re.IGNORECASE)
-        city = re.sub(r"\b\d{5}\b", " ", city)
-        city = re.sub(r"[^a-zA-Z\s.-]", " ", city)
-        city = re.sub(r"\s+", " ", city).strip(" .-")
-        if city and not _state_abbr_from_text(city):
-            out["city"] = city.title()
-        if len(parts) >= 3:
-            state = _state_abbr_from_text(parts[2])
-            if state:
-                out["state"] = state
-
-    if "state" not in out:
-        state = _state_abbr_from_text(str(text))
-        if state:
-            out["state"] = state
-    return out
-
-
-def build_address_autocomplete_type_query(
-    street_line: Optional[str],
-    spoken_transcript_hint: Optional[str],
-) -> Optional[str]:
-    street = (street_line or "").strip()
-    if not street:
-        return None
-    sh = (spoken_transcript_hint or "").strip()
-    if not sh:
-        return street
-    hints = infer_property_city_state_from_transcript(sh)
-    tail = " ".join(
-        x.strip()
-        for x in (hints.get("city"), hints.get("state"))
-        if x and str(x).strip()
-    )
-    if tail:
-        return f"{street} {tail}".strip()
-    return street
-
-
-def _name_slot_focus_from_missing(missing_blob: str) -> Optional[str]:
-    """If get_missing_fields() includes Ask next, map to first- or last-name-only intake."""
-    ask = _ask_from_missing_line(missing_blob)
-    if not ask:
-        return None
-    q = ask.lower()
-    if "first name" in q:
-        return "first"
-    if "last name" in q:
-        return "last"
-    return None
-
-
-def infer_name_fields_from_transcript(
-    text: str,
-    *,
-    need_first: bool,
-    need_last: bool,
-    slot_focus: Optional[str] = None,
-) -> dict[str, str]:
-    """
-    Parse simple spoken legal name replies for NAME stage safety net.
-
-    Conservative by design:
-    - Accept one clean token for first or last name.
-    - Accept two clean tokens as first+last when both missing (unless slot_focus or dup rule).
-    - Reject obvious non-name utterances ("but it's sad", "yes", "primary", etc.).
-
-    slot_focus:
-    - ``"first"``: only fill first name (e.g. Ask next is \"First name?\" even if user says
-      two words — second word is ignored for this save so we still ask last name).
-    - ``"last"``: only fill last name (e.g. \"Last name?\"); two tokens → use second token.
-    - ``None``: use need_first / need_last only.
-
-    Duplicate tokens (e.g. STT \"Prasad? Prasad?\"): never set first and last to the same
-    string in one shot — return first name only when both slots are still needed.
-    """
-    if not text or not str(text).strip():
-        return {}
-
-    if transcript_is_status_check(text):
-        return {}
-    raw_s = text.strip().lower()
-    explicit_name = bool(
-        re.match(
-            r"^\W*(my\s+(?:full\s+)?name\s+is|name\s+is|i\s+am|i'?m|this\s+is)\b",
-            raw_s,
-        )
-    )
-    s = normalize_answer_scaffold(text).lower()
-    if not s:
-        return {}
-    spelled = _spoken_letters_to_word(s)
-    if spelled:
-        if slot_focus == "first" and need_first:
-            return {"first_name": spelled}
-        if slot_focus == "last" and need_last:
-            return {"last_name": spelled}
-        if need_first and not need_last:
-            return {"first_name": spelled}
-        if need_last and not need_first:
-            return {"last_name": spelled}
-    # Hard-reject common off-topic/garbled phrases seen on PSTN STT for name turns.
-    # This avoids writing junk like "Whatever" / "Brother" into legal name fields.
-    if re.search(
-        r"\b("
-        r"whatever|brother|sister|mother|father|"
-        r"thank(s| you)?|god|word|"
-        r"good|hear|there|hello|hi|"
-        r"not\s+sure|sure|repeat"
-        r")\b",
-        s,
-    ):
-        return {}
-    if (
-        re.match(r"^\W*my\b", s)
-        and not re.match(r"^\W*(my name is|name is|i am|im)\b", s)
-    ):
-        return {}
-    s = re.sub(r"^(my name is|name is|i am|im|it's|it is|this is)\s+", "", s)
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z'-]{0,30}", s)
-    if not tokens:
-        return {}
-    if len(tokens) > 2:
-        return {}
-    if re.search(r"\d", s):
-        return {}
-
-    stop = {
-        "yes",
-        "no",
-        "primary",
-        "secondary",
-        "investment",
-        "owner",
-        "sole",
-        "joint",
-        "million",
-        "thousand",
-        "income",
-        "address",
-        "hello",
-        "hi",
-        "sad",
-        "but",
-        "whatever",
-        "brother",
-        "sister",
-        "mother",
-        "father",
-        "god",
-        "word",
-        "thanks",
-        "thank",
-    }
-    if any(t.lower() in stop for t in tokens):
-        return {}
-
-    # STT echo / repetition: do not treat as first+last with identical strings.
-    if len(tokens) == 2 and tokens[0].lower() == tokens[1].lower():
-        t = tokens[0].title()
-        if need_first and need_last:
-            return {"first_name": t}
-        if need_first:
-            return {"first_name": t}
-        if need_last:
-            return {"last_name": t}
-        return {}
-
-    # Align with scripted Ask next so one question does not capture both names.
-    if slot_focus == "first" and need_first:
-        if len(tokens) == 1:
-            return {"first_name": tokens[0].title()}
-        if len(tokens) == 2:
-            return {"first_name": tokens[0].title()}
-        return {}
-
-    if slot_focus == "last" and need_last:
-        if len(tokens) == 1:
-            return {"last_name": tokens[0].title()}
-        if len(tokens) == 2:
-            return {"last_name": tokens[1].title()}
-        return {}
-
-    out: dict[str, str] = {}
-    if len(tokens) == 1:
-        t = tokens[0].title()
-        if need_first:
-            out["first_name"] = t
-        elif need_last:
-            out["last_name"] = t
-        return out
-
-    # len == 2
-    t1, t2 = tokens[0].title(), tokens[1].title()
-    if need_first and need_last:
-        if not explicit_name:
-            out["first_name"] = t1
-            return out
-        out["first_name"] = t1
-        out["last_name"] = t2
-    elif need_first:
-        out["first_name"] = t1
-    elif need_last:
-        out["last_name"] = t2
-    return out
-
-
-def _spoken_letters_to_word(text: str) -> Optional[str]:
-    """Join slow spelled names: 'P R A S A D' -> 'Prasad'."""
-    if not text or not str(text).strip():
-        return None
-    letter_words = {
-        "a": "a",
-        "ay": "a",
-        "b": "b",
-        "be": "b",
-        "bee": "b",
-        "c": "c",
-        "see": "c",
-        "sea": "c",
-        "d": "d",
-        "dee": "d",
-        "e": "e",
-        "ee": "e",
-        "f": "f",
-        "eff": "f",
-        "g": "g",
-        "gee": "g",
-        "h": "h",
-        "aitch": "h",
-        "i": "i",
-        "eye": "i",
-        "j": "j",
-        "jay": "j",
-        "k": "k",
-        "kay": "k",
-        "l": "l",
-        "el": "l",
-        "m": "m",
-        "em": "m",
-        "n": "n",
-        "en": "n",
-        "o": "o",
-        "oh": "o",
-        "p": "p",
-        "pee": "p",
-        "q": "q",
-        "cue": "q",
-        "queue": "q",
-        "r": "r",
-        "are": "r",
-        "s": "s",
-        "ess": "s",
-        "t": "t",
-        "tea": "t",
-        "tee": "t",
-        "u": "u",
-        "you": "u",
-        "v": "v",
-        "vee": "v",
-        "w": "w",
-        "doubleyou": "w",
-        "x": "x",
-        "ex": "x",
-        "y": "y",
-        "why": "y",
-        "z": "z",
-        "zee": "z",
-        "zed": "z",
-    }
-    cleaned = re.sub(r"\b(letter|letters|spelled|spell|is)\b", " ", text.lower())
-    tokens = re.findall(r"[a-z]+", cleaned)
-    letters = [letter_words.get(token) for token in tokens]
-    if not letters or any(letter is None for letter in letters):
-        return None
-    if len(letters) < 2 or len(letters) > 30:
-        return None
-    return "".join(letters).title()
-
-
-def infer_yes_no_from_transcript(text: str) -> Optional[bool]:
-    """Map short affirmation/negation utterances to bool."""
-    if not text or not str(text).strip():
-        return None
-    text = normalize_answer_scaffold(text)
-    if not text:
-        return None
-    t = text.strip().lower().rstrip(".,!?")
-    compact = re.sub(r"[^\w\s']", " ", t)
-    compact = re.sub(r"\s+", " ", compact).strip()
-    repeated_tokens = compact.split()
-    if repeated_tokens and len(set(repeated_tokens)) == 1:
-        t = repeated_tokens[0]
-    if re.search(
-        r"\b(yes|yeah|yep|yup|correct|right|agree|agreed|absolutely|definitely|sure)\b",
-        compact,
-    ) and not re.search(
-        r"\b(no|nope|nah|don't|do not|not really|negative|disagree)\b",
-        compact,
-    ):
-        return True
-    if re.search(r"\b(no|nope|nah|negative|disagree)\b", compact):
-        return False
-    if t in {
-        "yes", "yeah", "yep", "yup", "correct", "right",
-        "i agree", "agree", "sure", "of course", "absolutely",
-        "definitely", "certainly",
-    }:
-        return True
-    if t in {"no", "nope", "nah", "not really", "i don't think so", "negative"}:
-        return False
-    return None
-
-
-def detect_uncertainty(raw_input: str) -> list[str]:
-    """
-    Scan raw user speech for hedging / uncertainty language.
-    
-    Returns a list of matched markers found in the input.
-    Empty list means the user sounded confident.
-    """
-    if not raw_input:
-        return []
-    
-    lowered = raw_input.lower()
-    return [marker for marker in UNCERTAINTY_MARKERS if marker in lowered]
+    return parsed.lower() == email.lower()
 
 
 # =============================================================================
@@ -3322,8 +1335,18 @@ async def update_application_state(
         "contact": {"mobile_phone_number", "email_address"},
         "consent": {"agreed_to_privacy_policy", "agreed_to_commerce_communication"},
     }
-    current_stage = _CONV_STAGE_TO_BROWSER.get(get_current_conversation_stage(), "unknown")
+    current_stage = _CONV_STAGE_TO_INTAKE_ID.get(get_current_conversation_stage(), "unknown")
     allowed_now = stage_to_allowed_fields.get(current_stage)
+    # Caller may correct an earlier field after we have advanced ("Wait, the address
+    # is wrong"). Accept fields owned by any *prior* stage; still block fields from
+    # *future* stages (those would be LLM hallucinating ahead of the script).
+    _stage_order = ("property", "primary-home", "for-sale", "income", "name", "birthday", "contact", "consent")
+    if allowed_now is not None and current_stage in _stage_order:
+        cur_idx = _stage_order.index(current_stage)
+        prior_field_owners: set[str] = set()
+        for s in _stage_order[: cur_idx + 1]:
+            prior_field_owners.update(stage_to_allowed_fields.get(s, set()))
+        allowed_now = prior_field_owners
 
     pending_low_conf = _current_call_state().pending_low_conf_confirmation
     if pending_low_conf and any(
@@ -3355,21 +1378,28 @@ async def update_application_state(
 
     _eff_conv_stage = get_current_conversation_stage()
     if raw_user_input and _eff_conv_stage == "PROPERTY":
-        if (
-            _use_deterministic_address_parsing()
-            and local_vars.get("address_line_1") is None
-            and application_state.address_line_1 is None
-        ):
+        # Snapshot PRE-TURN state — local_vars already contains whatever the
+        # caller (or LLM tool call) is trying to save this turn, so it can't be
+        # used to decide "which question were we asking".
+        _pre_address_saved = application_state.address_line_1 is not None
+        _pre_ownership_saved = application_state.ownership_type is not None
+        _pre_occupancy_saved = application_state.occupancy_type is not None
+
+        # Address parser runs only when address is still missing pre-turn.
+        if _use_deterministic_address_parsing() and not _pre_address_saved:
             inferred_addr = infer_property_address_from_transcript(raw_user_input)
             if inferred_addr:
                 local_vars["address_line_1"] = inferred_addr
-        if local_vars.get("ownership_type") is None and local_vars.get(
-            "occupancy_type"
-        ) is None:
+        # NEVER infer ownership/occupancy from the same utterance that gave the
+        # address — the ownership parser is loose (matches \bone\b, \b1\b) and
+        # addresses are full of those tokens (e.g. "It's one two three West
+        # Adams" → "Sole owner" is wrong). Only attempt these inferences when
+        # address was ALREADY saved before this turn started.
+        if _pre_address_saved and not _pre_ownership_saved:
             inferred_o = infer_ownership_from_transcript(raw_user_input)
             if inferred_o:
                 local_vars["ownership_type"] = inferred_o
-        if local_vars.get("occupancy_type") is None:
+        if _pre_address_saved and not _pre_occupancy_saved:
             if local_vars.get("ownership_type") is None:
                 inferred_occ = infer_occupancy_from_transcript(raw_user_input)
                 if inferred_occ:
@@ -3414,7 +1444,7 @@ async def update_application_state(
             conf_ask = _pending_low_conf_ask()
             return (
                 f"Update PENDING — uncertainty detected ({markers_list}). "
-                f"Ask the caller to confirm: {conf_ask}"
+                f'Ask next: "{conf_ask}"'
             )
     
     low_conf_pending = []
@@ -3676,12 +1706,12 @@ async def apply_voice_intake_heuristics_before_line(
         if field == "occupancy_type":
             return (
                 "I'm assuming primary home for now. "
-                "Is the property currently listed for sale?"
+                + VOICE_SCRIPT_FOR_SALE_ASK
             )
         if field == "is_currently_for_sale":
             return (
                 "I'm assuming it is not listed for sale for now. "
-                "What's your annual pre-tax income?"
+                "Roughly, what's your annual income before taxes?"
             )
         if field == "annual_pre_tax_income":
             return (
@@ -3782,7 +1812,31 @@ async def apply_voice_intake_heuristics_before_line(
         _pst = application_state
         stage = "birthday" if (_pst.first_name and _pst.last_name) else "name"
     else:
-        stage = _CONV_STAGE_TO_BROWSER.get(_conv_stage, "unknown")
+        stage = _CONV_STAGE_TO_INTAKE_ID.get(_conv_stage, "unknown")
+
+    # DNC takes top priority at any stage — caller is asking us not to call
+    # again. Firm goodbye, no callback offer, terminate immediately. This must
+    # run before the emotional/identity bypass below so a DNC isn't routed to
+    # the LLM where it might be mishandled.
+    if transcript_is_dnc(text):
+        return _ok(
+            "Understood. You won't receive any more calls from us. Take care.",
+            "dnc_request",
+            stage,
+            terminate_after_tts=True,
+        )
+
+    # Mid-intake decline ("I changed my mind", "let me think about it",
+    # "I want to stop", "not available", "call back later", etc.) past the
+    # GREETING stage — graceful goodbye + terminate. The GREETING branch below
+    # handles greeting-stage soft declines separately so we don't double-fire.
+    if stage not in ("greeting", "completed", "unknown") and transcript_is_intake_decline(text):
+        return _ok(
+            "Of course, no problem. We can pick this up another time. Take care!",
+            "mid_intake_decline",
+            stage,
+            terminate_after_tts=True,
+        )
 
     # EMOTIONAL & IDENTITY BYPASS — must run FIRST.
     # We bypass to the LLM if the user is emotional, asking for help, or
@@ -3933,7 +1987,7 @@ async def apply_voice_intake_heuristics_before_line(
         if yn is True:
             _current_call_state().greeting_completed = True
             blob = get_missing_fields() or ""
-            ask = _ask_from_missing_line(blob) or "Great! Can you tell me the property address you'd like to apply for?"
+            ask = _ask_from_missing_line(blob) or "Great, let's get started — what's your property address for financing?"
             return _ok(ask, "greeting_completed", stage)
         if yn is False:
             return _ok(
@@ -4021,9 +2075,7 @@ async def apply_voice_intake_heuristics_before_line(
         if application_state.occupancy_type is None:
             miss = get_missing_fields() or ""
             ask_m = (_ask_from_missing_line(miss) or "").lower()
-            occ_q = ("primary home" in ask_m and "second home" in ask_m) or (
-                "investment property" in ask_m and "second home" in ask_m
-            )
+            occ_q = "property type" in ask_m or "primary" in ask_m or "secondary" in ask_m or "investment" in ask_m
             if occ_q and _stt_confidence_triggers_reprompt(stt_confidence):
                 return _ok(OCCUPANCY_LOW_CONF_REPROMPT, "occupancy_type", stage)
             if transcript_requests_intake_default(text):
