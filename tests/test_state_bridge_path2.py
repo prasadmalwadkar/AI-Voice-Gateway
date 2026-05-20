@@ -281,7 +281,10 @@ def test_status_check_utterance_short_circuit_match():
         assert fn("Are we good?") is True
         assert fn("Still with me?") is True
         assert fn("what's next?") is True
-        assert fn("go ahead") is True
+        # "go ahead" / "continue" are CONSENT (handled by infer_yes_no_from_transcript),
+        # NOT presence pings — they must not short-circuit to status-check.
+        assert fn("go ahead") is False
+        assert fn("continue") is False
         assert fn("thank you") is True
         assert fn("thanks") is True
         assert fn("my last name is Smith") is False
@@ -301,16 +304,6 @@ def test_status_check_utterance_short_circuit_match():
     assert lsc("what info do you need from me") is True
     assert lsc("325 West Adams Boulevard") is False
     assert lsc("sole owner") is False
-
-
-def test_bridge_allows_llm_fallback_for_supported_current_asks():
-    from app.twilio_line_bridge import TwilioLineBridge
-
-    income_missing = (
-        '[BROWSER STAGE: INCOME] Still needed: annual pre-tax income '
-        'Ask next: "What\'s your annual pre-tax income?"'
-    )
-    assert TwilioLineBridge._allow_llm_fallback_for_current_ask(income_missing) is True
 
 
 def test_looks_like_answer_for_current_field_rejects_non_answer():
@@ -364,9 +357,11 @@ async def test_enqueue_status_check_response_includes_current_ask():
     client.tts_queue = asyncio.Queue()
 
     assert await client.enqueue_status_check_response() is True
+    # Presence-ping path: warm ack + re-ask the pending question verbatim.
+    # Never "Sorry, I missed that" — the caller didn't mishear, they pinged.
     assert (
         client.tts_queue.get_nowait()
-        == "Could you say your date of birth again: month, day, and year?"
+        == f"{LineSessionClient.STATUS_ACK_PREFIX} What is your date of birth?"
     )
 
 
@@ -424,9 +419,10 @@ async def test_enqueue_status_check_presence_keeps_short_clarification():
         await client.enqueue_status_check_response(user_transcript="Are you there?")
         is True
     )
+    # Presence ping: warm ack + verbatim re-ask, not "I missed that".
     assert (
         client.tts_queue.get_nowait()
-        == "Could you say the mobile number one more time, all ten digits?"
+        == f"{LineSessionClient.STATUS_ACK_PREFIX} {ask}"
     )
 
 

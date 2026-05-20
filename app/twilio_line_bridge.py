@@ -24,7 +24,6 @@ from agent.state_manager import (
     store_call_metadata,
     get_contact_buffer_mode,
     get_missing_fields,
-    has_pending_low_confidence_confirmation,
     infer_email_from_transcript,
     infer_phone_from_transcript,
     infer_yes_no_from_transcript,
@@ -32,7 +31,6 @@ from agent.state_manager import (
     release_call_state,
     reset_state,
     transcript_is_status_check,
-    transcript_requests_intake_default,
 )
 from app.cartesia_stt_client import CartesiaInkSTTSession
 from app.cartesia_tts_mulaw import CartesiaSonicMulawTTS
@@ -75,6 +73,15 @@ TTS_DRAIN_SECS = max(0.0, float(os.getenv("TWILIO_TTS_DRAIN_SECS", "0.25")))
 TWILIO_PLAYBACK_TAIL_SECS = max(
     0.0, float(os.getenv("TWILIO_PLAYBACK_TAIL_SECS", "3.0"))
 )
+# Longer tail used ONLY for the terminal goodbye message. Twilio's playback
+# buffer can hold 1-2s past when we send the last chunk; the standard tail
+# (3s) is borderline for ~5s messages and the last word ("goodbye!") was
+# getting clipped on hangup. 5s gives Twilio plenty of room to flush even
+# under network jitter, without affecting mid-call barge-in responsiveness.
+TWILIO_TERMINAL_PLAYBACK_TAIL_SECS = max(
+    TWILIO_PLAYBACK_TAIL_SECS,
+    float(os.getenv("TWILIO_TERMINAL_PLAYBACK_TAIL_SECS", "5.0")),
+)
 CONTACT_PHONE_BUFFER_SECS = max(
     0.0, float(os.getenv("TWILIO_CONTACT_PHONE_BUFFER_SECS", "2.0"))
 )
@@ -102,6 +109,14 @@ TERMINAL_PLAYBACK_MAX_WAIT_SEC = float(
 TERMINAL_IDLE_STABLE_TICKS = max(
     3, int(float(os.getenv("TERMINAL_IDLE_STABLE_MS", "220")) / 50)
 )
+# Extra silence held open AFTER the playback-tail and idle-stable checks pass,
+# before we close the Twilio media stream. Prevents the final word of the
+# goodbye message from being clipped by the Twilio stop-event. Combined with
+# TWILIO_TERMINAL_PLAYBACK_TAIL_SECS (5s) this gives ~6.5s of cushion after
+# the last chunk leaves us — well beyond typical Twilio buffer + jitter.
+TERMINAL_HANGUP_EXTRA_DRAIN_SEC = max(
+    0.0, float(os.getenv("TERMINAL_HANGUP_EXTRA_DRAIN_SEC", "1.5"))
+)
 DETERMINISTIC_FOLLOWUP_POLL_SEC = 0.25
 DETERMINISTIC_FOLLOWUP_MAX_WAIT_SEC = 8.0
 CALLER_RESPONSE_WATCHDOG_SECS = max(
@@ -111,9 +126,15 @@ CALLER_RESPONSE_WATCHDOG_CONSENT_SECS = max(
     CALLER_RESPONSE_WATCHDOG_SECS,
     float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_CONSENT_SECS", "18.0")),
 )
+# Greeting plays on a cold open — caller is still orienting themselves and may
+# have missed a few seconds. Give them longer before nudging.
+CALLER_RESPONSE_WATCHDOG_GREETING_SECS = max(
+    CALLER_RESPONSE_WATCHDOG_SECS,
+    float(os.getenv("TWILIO_CALLER_RESPONSE_WATCHDOG_GREETING_SECS", "16.0")),
+)
 CALLER_RESPONSE_WATCHDOG_PREFIX = os.getenv(
     "TWILIO_CALLER_RESPONSE_WATCHDOG_PREFIX",
-    "I may have missed you there. Could you say that one more time?",
+    "Sorry, I might've lost you for a second — are you still there?",
 ).strip()
 PIPELINE_DEBUG_ENABLED = os.getenv("TWILIO_PIPELINE_DEBUG", "1").strip().lower() in (
     "1",
@@ -252,6 +273,10 @@ class TwilioLineBridge:
         self._last_barge_at = 0.0
         self._barge_in_accept_final_until = 0.0
         self._deterministic_answer_guard_until = 0.0
+        # Set when the deterministic preline accepts a final — survives the next
+        # TTS dequeue so trailing STT residue ("That's correct.") from the same
+        # caller utterance is rejected even after the next ask starts speaking.
+        self._deterministic_residue_guard_until = 0.0
         self._ending_call = False
         self._current_tts_text = ""
         self._caller_response_prompt = ""
@@ -444,7 +469,13 @@ class TwilioLineBridge:
             if q_empty and not self._playback_audio_active():
                 stable += 1
                 if stable >= TERMINAL_IDLE_STABLE_TICKS:
+                    # Extra safety drain so the LAST sentence ("...goodbye!")
+                    # doesn't get clipped by Twilio's media-stream close. The
+                    # playback_tail already accounts for Twilio's buffer, but
+                    # adding ~0.6s here costs nothing on a hangup and prevents
+                    # callers from hearing "...goodby—" with a chopped tail.
                     await asyncio.sleep(max(TTS_DRAIN_SECS, 0.15))
+                    await asyncio.sleep(TERMINAL_HANGUP_EXTRA_DRAIN_SEC)
                     self.call_logger.info(
                         "Terminal outbound idle — stopping bridge tasks",
                         event="path2.terminal_playback_drained",
@@ -563,7 +594,58 @@ class TwilioLineBridge:
     def _caller_response_watchdog_delay_sec(prompt: str) -> float:
         if _path2_text_has_consent_marker(prompt, _PATH2_CONSENT_WATCHDOG_MARKERS):
             return CALLER_RESPONSE_WATCHDOG_CONSENT_SECS
+        if TwilioLineBridge._prompt_is_greeting(prompt):
+            return CALLER_RESPONSE_WATCHDOG_GREETING_SECS
         return CALLER_RESPONSE_WATCHDOG_SECS
+
+    _EMAIL_PARTIAL_TRAILING_RE = re.compile(
+        r"\b(?:at|dot|underscore|dash|hyphen)\s*[.,]?\s*$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _email_fragment_is_partial(cls, merged: str) -> bool:
+        """True when the spoken email transcript clearly isn't done yet.
+
+        Catches "prasad at gmail dot" (waiting for TLD), "joe at" (waiting for
+        domain), as well as the literal "@" case where the parser can't
+        finalize an email yet.
+        """
+        m = (merged or "").strip()
+        if not m:
+            return False
+        # Literal @ but parser can't extract a full address yet.
+        if "@" in m and not infer_email_from_transcript(m):
+            return True
+        # Spoken-style trailing connector word — the caller is mid-spelling.
+        return bool(cls._EMAIL_PARTIAL_TRAILING_RE.search(m))
+
+    _CONFIRMATION_RESIDUE_RE = re.compile(
+        r"^(?:(?:yeah|yes|yep|yup|no|nope|nah|sure|correct|right|exactly|"
+        r"of course|absolutely|sounds good|that(?:'s| is) (?:correct|right|true)|"
+        r"that(?:'s| is) it|okay|ok|alright)[\s,.!?]*)+$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _text_is_confirmation_residue(cls, text: str) -> bool:
+        """True for short confirmation tails that bleed in after a deterministic save."""
+        t = re.sub(r"\s+", " ", (text or "").strip())
+        if not t or len(t.split()) > 5:
+            return False
+        return bool(cls._CONFIRMATION_RESIDUE_RE.match(t))
+
+    @staticmethod
+    def _prompt_is_greeting(prompt: str) -> bool:
+        p = (prompt or "").lower()
+        if not p:
+            return False
+        return (
+            "is now a good time" in p
+            or "this is alex" in p
+            or "digital ai assistant" in p
+            or "digital assistant" in p
+        )
 
     @staticmethod
     def _looks_like_meaningful_barge_in(
@@ -700,11 +782,7 @@ class TwilioLineBridge:
         merged = re.sub(r"\s+", " ", " ".join(parts)).strip()
         if self._contact_buffer_kind == "email":
             base = CONTACT_EMAIL_BUFFER_SECS
-            if (
-                merged
-                and "@" in merged
-                and not infer_email_from_transcript(merged)
-            ):
+            if merged and self._email_fragment_is_partial(merged):
                 return CONTACT_EMAIL_BUFFER_PARTIAL_SECS
             return base
         base = CONTACT_PHONE_BUFFER_SECS
@@ -975,6 +1053,22 @@ class TwilioLineBridge:
             )
             return
 
+        # Drop trailing fragments of the same utterance even after the next TTS
+        # has started ("Yes" then 700ms later "That's correct" — the second
+        # arrives after the new question began speaking).
+        residue_until = getattr(self, "_deterministic_residue_guard_until", 0.0)
+        if now < residue_until and self._text_is_confirmation_residue(text):
+            self._log_pipeline_debug(
+                f"Dropped final as confirmation residue | text='{text[:120]}'",
+                event="path2.stt.residue_skip",
+            )
+            await broadcast_stt(
+                kind="user_final_residue_skip",
+                text=text,
+                call_sid=self.call_sid,
+            )
+            return
+
         self._log_pipeline_debug(
             f"Handling STT final | text='{text[:160]}'",
             event="path2.stt.final_handle_start",
@@ -1020,11 +1114,22 @@ class TwilioLineBridge:
                     user_transcript=text,
                 )
                 return
-            result = await apply_voice_intake_heuristics_before_line(
-                text,
-                stt_confidence=stt_confidence,
-                stt_recovery_text=occ_recovery or None,
-            )
+            try:
+                result = await apply_voice_intake_heuristics_before_line(
+                    text,
+                    stt_confidence=stt_confidence,
+                    stt_recovery_text=occ_recovery or None,
+                )
+            except Exception as preline_err:
+                self.call_logger.warning(
+                    "Preline heuristic error — falling back to LLM | error=%s",
+                    preline_err,
+                    exc_info=True,
+                    extra={"event": "path2.preline.error_llm_fallback"},
+                )
+                if self._line:
+                    await self._line.send_user_transcript(text)
+                return
             if result.handled and self._line:
                 self._log_pipeline_debug(
                     (
@@ -1044,6 +1149,11 @@ class TwilioLineBridge:
                     },
                 )
                 self._deterministic_answer_guard_until = (
+                    time.monotonic() + ANSWER_GUARD_SECS
+                )
+                # Residue guard outlives the next TTS dequeue, but only fires
+                # for short confirmation residues (yes / no / that's correct).
+                self._deterministic_residue_guard_until = (
                     time.monotonic() + ANSWER_GUARD_SECS
                 )
                 self._cancel_deterministic_followup_task()
@@ -1073,24 +1183,12 @@ class TwilioLineBridge:
                     total_ms=round((time.perf_counter() - t0) * 1000, 2),
                 )
             else:
-                if (
-                    ask_from_missing
-                    and self._line
-                    and not has_pending_low_confidence_confirmation()
-                    and not transcript_requests_intake_default(text)
-                    and not looks_like_answer_for_current_field(text, missing_snapshot)
-                    and not self._allow_llm_fallback_for_current_ask(missing_snapshot)
-                ):
-                    self._log_pipeline_debug(
-                        (
-                            "Non-answer clarification before Line/LLM "
-                            f"| text='{text[:120]}' ask='{ask_from_missing}'"
-                        ),
-                        event="path2.non_answer.clarify",
-                    )
-                    self._line.inject_ask_next_hint(ask_from_missing, schedule_fallback=False)
-                    await self._line.enqueue_clarification_for_current_ask()
-                    return
+                # LLM-first fallback: anything deterministic didn't handle goes
+                # straight to the LLM. The old non-answer clarification gate
+                # (canned "Sorry, I missed that" responses for off-script
+                # input) was removed — Rule 12 in SYSTEM_PROMPT now handles
+                # off-topic / frustrated / confused callers with proper
+                # redirect-back-to-current-question behavior.
                 self._log_pipeline_debug(
                     "Deterministic did not handle final; forwarding to Line/LLM",
                     event="path2.stt.final_to_llm",
@@ -1157,37 +1255,6 @@ class TwilioLineBridge:
     @staticmethod
     def _extract_ask_next(text: str) -> Optional[str]:
         return _ask_from_missing_line(text) or None
-
-    @staticmethod
-    def _allow_llm_fallback_for_current_ask(missing: str) -> bool:
-        ask = (TwilioLineBridge._extract_ask_next(missing) or "").lower()
-        if not ask:
-            return True
-        markers = (
-            "property address",
-            "ownership type",
-            "sole owner",
-            "joint",
-            "primary, secondary, or investment",
-            "primary home",
-            "primary residence",
-            "currently listed for sale",
-            "annual pre-tax income",
-            "other income",
-            "income source",
-            "first name",
-            "last name",
-            "date of birth",
-            "mobile",
-            "phone",
-            "email",
-            "agree",
-            "consent",
-            "on file",
-            "is that correct",
-            "is that still correct",
-        )
-        return any(m in ask for m in markers)
 
     def _cancel_deterministic_followup_task(self) -> None:
         t = self._deterministic_followup_task
@@ -1277,18 +1344,31 @@ class TwilioLineBridge:
                     # Let Twilio finish buffered playback before opening mic turn.
                     await asyncio.sleep(TTS_DRAIN_SECS)
                 lat = self._last_agent_audio_time
-                if TWILIO_PLAYBACK_TAIL_SECS > 0 and lat >= utterance_t0_mono - 1.0:
-                    self._playback_tail_until = lat + TWILIO_PLAYBACK_TAIL_SECS
+                # Use the longer terminal tail for the goodbye message so the
+                # last word ("...goodbye!") isn't clipped by Twilio's stream
+                # close. Standard tail applies to every other utterance.
+                is_terminal_utterance = (
+                    getattr(self, "_ending_call", False)
+                    or (text or "").strip() == DETERMINISTIC_GOODBYE_TEXT.strip()
+                )
+                effective_tail_secs = (
+                    TWILIO_TERMINAL_PLAYBACK_TAIL_SECS
+                    if is_terminal_utterance
+                    else TWILIO_PLAYBACK_TAIL_SECS
+                )
+                if effective_tail_secs > 0 and lat >= utterance_t0_mono - 1.0:
+                    self._playback_tail_until = lat + effective_tail_secs
                     self._log_pipeline_debug(
                         (
                             f"Playback tail armed | until_mono={self._playback_tail_until:.3f} "
-                            f"after_last_chunk_mono={lat:.3f} tail_s={TWILIO_PLAYBACK_TAIL_SECS}"
+                            f"after_last_chunk_mono={lat:.3f} tail_s={effective_tail_secs}"
+                            f"{' (terminal)' if is_terminal_utterance else ''}"
                         ),
                         event="path2.tts.playback_tail",
                     )
-                elif TWILIO_PLAYBACK_TAIL_SECS > 0:
+                elif effective_tail_secs > 0:
                     self._playback_tail_until = time.monotonic() + min(
-                        TWILIO_PLAYBACK_TAIL_SECS, 1.0
+                        effective_tail_secs, 1.0
                     )
                 self._agent_playing = False
                 self._agent_playing_started_at = 0.0
