@@ -8,7 +8,7 @@ Set `TWILIO_VOICE_MODE` to anything other than `path2`, `line`, or `local` to us
 
 Default stack (Twilio or orchestrator → same `/media-stream` bridge). **`Line /ws`** and **`LlmAgent`** run in the **same FastAPI process** as [`run.py`](run.py); [`LineSessionClient`](app/line_session_client.py) opens an outbound WebSocket to that endpoint.
 
-The bridge may run **pre-line heuristics** that update application state before sending a user turn to Line ([`apply_voice_intake_heuristics_before_line`](agent/state_manager.py)). **Alternate `TWILIO_VOICE_MODE`:** [`TwilioBridge`](app/twilio_bridge.py) sends µ-law to Cartesia’s hosted agent only.
+The bridge may run **pre-line heuristics** that update application state before sending a user turn to Line ([`apply_voice_intake_heuristics_before_line`](agent/state_manager.py)). All deterministic transcript parsers — phone, email, DOB, occupancy, ownership, income slang, DNC patterns, etc. — now live in a dedicated module: [`agent/deterministic_parsers.py`](agent/deterministic_parsers.py). State manager imports them. **Alternate `TWILIO_VOICE_MODE`:** [`TwilioBridge`](app/twilio_bridge.py) sends µ-law to Cartesia’s hosted agent only.
 
 ### High-level architecture
 
@@ -51,13 +51,22 @@ Create **`.env`** in the repo root (never commit). Common variables:
 | `DEEPGRAM_STT_MODEL` | Deepgram Flux model when provider is `deepgram`; default `flux-general-en` |
 | `DEEPGRAM_STT_EOT_THRESHOLD`, `DEEPGRAM_STT_EAGER_EOT_THRESHOLD`, `DEEPGRAM_STT_EOT_TIMEOUT_MS` | Deepgram Flux end-of-turn tuning |
 | `DEEPGRAM_STT_KEYTERMS` | Optional comma-separated Deepgram keyterms, e.g. domain words or names |
-| `CARTESIA_TTS_SPEED`, `CARTESIA_TTS_VOLUME` | Sonic tuning ([`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)) |
-| `TWILIO_CALLER_RESPONSE_WATCHDOG_SECS` | Seconds to wait after an agent prompt before repeating it if no user final is handled; default `10.0` |
+| `CARTESIA_TTS_SPEED`, `CARTESIA_TTS_VOLUME` | Sonic tuning ([`app/cartesia_tts_mulaw.py`](app/cartesia_tts_mulaw.py)). Repo default `CARTESIA_TTS_SPEED=0.93` for an unhurried phone cadence. |
+| `CARTESIA_TTS_VOICE_ID` | Sonic voice id. Some voice ids are not compatible with newer Sonic models — verify in Cartesia dashboard. Chunk errors are logged with `model_id` / `voice_id` for diagnosis. |
+| `TWILIO_CALLER_RESPONSE_WATCHDOG_SECS` | Seconds to wait after an agent prompt before repeating it if no user final is handled; default `10.0`. |
+| `TWILIO_CALLER_RESPONSE_WATCHDOG_GREETING_SECS` | Longer watchdog for the cold-open greeting only (default `16.0`) — caller is still orienting on a fresh call. |
+| `TWILIO_TERMINAL_PLAYBACK_TAIL_SECS` | Playback tail used **only** when delivering the terminal goodbye (default `5.0`). Prevents Twilio from clipping the last word on hangup. Mid-call utterances still use `TWILIO_PLAYBACK_TAIL_SECS` (default `3.0`). |
+| `TERMINAL_HANGUP_EXTRA_DRAIN_SEC` | Extra silence held open after the playback-tail and idle checks pass on hangup (default `1.5`). |
 | `TWILIO_PREFILL_BY_PHONE_JSON` | Optional JSON string: map **caller phone** (digits, `+1…`, etc.) → object of HELOC field keys (`address_line_1`, `first_name`, …). Used on `GET /voice` / `POST /voice` to prefill before Line starts. |
 | `TWILIO_PREFILL_BY_PHONE_FILE` | Optional filesystem path to the **same** JSON shape when the env var above is empty (e.g. `data/prefill/customers.json` locally; file is gitignored). |
 | `PATH2_WAIT_FOR_ADDRESS_SYNC` | Default `1`: after `address_line_1` updates on the property stage, state may wait for browser sync. Set `0`/`false`/`no` to skip that wait. |
-| `PATH2_DETERMINISTIC_ADDRESS` | Default `0`. Set `1`/`true`/`yes` to use deterministic address parsing in state (see `agent/state_manager.py`). |
-| `LINE_POST_FALLBACK_MUTE_SEC` | After tool-ask **fallback** TTS, seconds to drop late LLM text (default **6**; see [`app/line_session_client.py`](app/line_session_client.py)). |
+| `PATH2_DETERMINISTIC_ADDRESS` | Default `1` (deterministic address parsing on). Set `0`/`false`/`no` to disable. See [`agent/deterministic_parsers.py`](agent/deterministic_parsers.py). |
+| `LINE_TURN_WATCHDOG_MS` / `_SEC` | When the LLM is silent, busy-hold ("One sec…") fires after this long (default `2500ms` / `2.5s`). |
+| `LINE_NO_RESPONSE_WATCHDOG_MS` / `_SEC` | Hard re-ask if LLM never produces text (default `4000ms` / `4.0s`). Extended automatically by `LINE_POST_BUSY_HOLD_EXTENSION_MS` once busy-hold fires. |
+| `LINE_POST_BUSY_HOLD_EXTENSION_MS` / `_SEC` | After busy-hold ack speaks, push the hard re-ask out by this much so slow FAQ replies have room to land (default `5000ms` / `5.0s`). |
+| `LINE_POST_FALLBACK_MUTE_MS` / `_SEC` | After tool-ask **fallback** TTS, drop late LLM text fragments for this window (default `1500ms` / `1.5s`; see [`app/line_session_client.py`](app/line_session_client.py)). |
+
+> **MS-suffix convention**: every Line watchdog accepts either a `<NAME>_MS` env var (integer milliseconds, preferred) or the legacy `<NAME>_SEC` (float seconds). MS wins if both are set. See `_env_seconds` in [`app/line_session_client.py`](app/line_session_client.py).
 
 Optional observability:
 

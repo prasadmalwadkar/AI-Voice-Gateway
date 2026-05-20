@@ -329,8 +329,8 @@ MAX_TOKENS = 120
 # that's still pennies, and the win in FAQ-matching accuracy is significant.
 # To revert for cheapest mode: GEMINI_MODEL=gemini/gemini-2.5-flash-lite
 # Auto-fallback on transient error switches primary → fallback mid-call (history preserved).
-_DEFAULT_PRIMARY_MODEL = "gemini/gemini-2.5-flash"
-_DEFAULT_FALLBACK_MODEL = "gemini/gemini-2.5-flash-lite"
+_DEFAULT_PRIMARY_MODEL = "gemini/gemini-2.5-flash-lite"
+_DEFAULT_FALLBACK_MODEL = "gemini/gemini-2.5-flash"
 
 # Transient or primary-model issues — retry / fallback instead of tearing down Line /ws.
 # NotFoundError: wrong model id on primary → switch to GEMINI_FALLBACK_MODEL.
